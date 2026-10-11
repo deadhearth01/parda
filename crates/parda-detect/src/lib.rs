@@ -8,3 +8,8 @@ pub trait Detector: Send + Sync {
 
 pub mod rules;
 pub use rules::RuleDetector;
+
+pub mod allow;
+pub mod dictionary;
+pub use allow::AllowList;
+pub use dictionary::{DictionaryDetector, PersonBlock, RulesFile, Term, expand_person};
