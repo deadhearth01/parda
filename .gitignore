@@ -7,3 +7,7 @@
 .DS_Store
 *.swp
 /.superpowers/
+/training/.venv/
+/training/data/
+/training/runs/
+/training/out/

@@ -1,0 +1,9 @@
+# Training / export toolchain for the parda-pii model (Python 3.11).
+torch==2.8.*
+gliner==0.2.*
+transformers>=4.51,<5
+onnx>=1.17
+onnxruntime>=1.22
+onnxscript
+cairosvg
+pytest
