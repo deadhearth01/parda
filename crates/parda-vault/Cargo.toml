@@ -1,0 +1,39 @@
+[package]
+name = "parda-vault"
+description = "Encrypted reversible mapping store and deterministic surrogate generator for parda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+parda-core.workspace = true
+rusqlite.workspace = true
+chacha20poly1305.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+zeroize.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, features = ["sync-secret-service", "crypto-rust"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
