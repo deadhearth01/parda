@@ -1,0 +1,122 @@
+# Hand-written evaluation sentences (NOT produced by training/datagen templates).
+# Format: one example per line; entities marked as [[value|Kind]]; region tag first: IN | GL | NEG
+IN	Can you draft a polite reminder to [[Venkatesh Iyer|Person]] about the pending invoice?
+IN	bhai [[Gurpreet|Person]] ko bol dena ki kal meeting 4 baje hai
+IN	Summarise this complaint from [[Mohammed Faizal Shaikh|Person]], who lives at [[Flat 12B, Sea Breeze Apartments, Bandra West, Mumbai 400050|Address]].
+IN	[[Lakshmi Narayanan|Person]] and her husband [[Ramesh|Person]] want to open a joint account.
+IN	Please reply to [[Ananya Chatterjee|Person]] in Bengali, she prefers that.
+IN	The tenant, [[Sandeep Kulkarni|Person]], has not paid rent since August.
+IN	Write a recommendation letter for my student [[Aisha Begum|Person]] who topped the class.
+IN	[[Harpreet Kaur Sandhu|Person]] called twice about the refund for order 88213.
+IN	Translate to Hindi: "Dear [[Mr. Prakash Rao|Person]], your appointment is confirmed."
+IN	mera naam [[Ravi Teja|Person]] hai aur main Hyderabad se hoon
+IN	Ask [[Dr. Meenakshi Sundaram|Person]] whether the MRI report is ready.
+IN	Reminder: [[Joseph D'Souza|Person]] from accounts needs the GST invoices.
+IN	[[Kavya Reddy|Person]] wants to know why her EMI went up this month.
+IN	Please check if [[Arjun Malhotra|Person]] is free for the client call on Friday.
+IN	Need a birthday message for my nani, [[Kamla Devi|Person]], turning 80.
+IN	[[Rohit|Person]] bhaiya ka phone switched off aa raha hai since morning
+IN	Forward this to [[Shabnam Ansari|Person]] and cc [[Imran Qureshi|Person]].
+IN	Our new intern [[Tenzin Dorjee|Person]] joins from Gangtok on Monday.
+IN	The Aadhaar update for [[Biswajit Mohanty|Person]] is stuck at the enrolment centre.
+IN	[[Priyanka Deshpande|Person]] ne bola tha report Monday tak bhej degi
+IN	Prepare a legal notice on behalf of [[Cyrus Mistry|Person]] to the builder.
+IN	[[Nandini Pillai|Person]] from Kochi booked two tickets under her name.
+IN	Hi team, [[Abhishek Jain|Person]] will handle the Surat warehouse from now.
+IN	Check whether [[Manoj Kumar Yadav|Person]] has signed the NDA.
+IN	[[Fatima Siddiqui|Person]] asked to change her delivery address to [[22, Ganesh Nagar, Indore 452001|Address]].
+IN	Please congratulate [[Sneha Patil|Person]] on her promotion in the newsletter.
+IN	[[K. Venkataraman|Person]] retired from the bank last year; send the pension form.
+IN	Send the offer letter to [[Rahul Verma|Person]] at [[rahul.verma92@gmail.com|Email]] today.
+IN	Customer [[Deepa Nair|Person]] says her card was charged twice.
+IN	Ring [[Suresh|Person]] uncle on [[98450 12345|Phone]] before you leave.
+IN	[[Pooja Agarwal|Person]], [[Vikas Agarwal|Person]] and their son are travelling to Shimla.
+IN	The patient [[Gopal Krishna Bhat|Person]] reported chest pain at 3 am.
+IN	yaar [[Neha|Person]] ka wedding card design kar do, theme marigold
+IN	Write a condolence note to the family of [[Late Shri Om Prakash Gupta|Person]].
+IN	[[Simran Gill|Person]] from Ludhiana won the inter-college debate.
+IN	Draft a WhatsApp message to [[Anil Bhaskar|Person]] about the society maintenance dues.
+IN	Ask [[Thomas Kurian|Person]] to share the Kottayam site photos.
+IN	[[Zoya Khan|Person]] wants her resume rewritten for a data analyst role.
+IN	[[Bhavesh Shah|Person]] ki dukaan [[Shop 4, Navrangpura, Ahmedabad|Address]] pe hai
+IN	The complaint was filed by [[Ritika Sen|Person]] at the Salt Lake police station.
+IN	Please verify the PAN of [[Sunil Dutta|Person]] before onboarding.
+IN	[[Lalitha|Person]] amma needs a ride to the temple at 6.
+IN	Book a cab for [[Ishaan Kapoor|Person]] from Terminal 2 to Powai.
+IN	[[Dinesh Karthik Subramaniam|Person]] has requested leave from 3rd to 7th.
+IN	My neighbour [[Mrs. Saroj Bala|Person]] needs help filling the pension form.
+IN	Tell [[Aditya|Person]] the server credentials are in the vault, not on Slack.
+IN	[[Gaurav Chauhan|Person]] lives at [[House No. 45, Sector 15, Chandigarh 160015|Address]].
+IN	Reply to [[Shreya Ghoshal Banerjee|Person]] that the courier left Kolkata yesterday.
+IN	[[Mahesh Babu Naidu|Person]] wants the quotation in Telugu and English.
+IN	Prepare minutes: present were [[Rekha Iyer|Person]], [[Farhan Akhtar Siddiqui|Person]] and [[Jaspreet Singh|Person]].
+IN	[[Yash|Person]] se pucho ki laptop ka bill kahan hai
+IN	Draft an email to [[Professor Anand Kumar|Person]] requesting an extension.
+IN	[[Moumita Das|Person]] needs the Durga Puja leave approved.
+IN	Hey [[Karan|Person]], can you share [[Riya Mehta|Person]]'s new number?
+IN	[[Sadhana Joshi|Person]] from Pune has opted out of the SMS alerts.
+IN	Please summarise the medical history of [[Baby of Sunita Rawat|Person]].
+IN	The landlord [[Mr. Narasimha Murthy|Person]] wants the deposit in cash.
+IN	[[Arunima Sinha|Person]] is the emergency contact for this trek group.
+IN	Send the warranty card to [[Vinod Tiwari|Person]], [[12/3 Civil Lines, Prayagraj 211001|Address]].
+IN	sir please tell [[Mahendra|Person]] ji that the cheque has bounced
+GL	Draft an apology email to [[Siobhan O'Brien|Person]] about the delayed shipment.
+GL	[[Nguyễn Văn An|Person]] and [[Oluwaseun Adeyemi|Person]] will present the Q3 results.
+GL	Please book a table for [[María José García López|Person]] at 8 pm.
+GL	[[Hiroshi Tanaka|Person]] asked for the contract in Japanese.
+GL	Can you summarise [[Dr. Fatima Al-Zahra|Person]]'s research proposal?
+GL	[[Jean-Luc Moreau|Person]] lives at [[14 Rue de la Paix, 75002 Paris|Address]].
+GL	Send the invoice to [[Klaus Müller|Person]] at [[k.mueller@firma-beispiel.de|Email]].
+GL	[[Chloe Nguyen|Person]] is our new account manager for the Sydney office.
+GL	Remind [[Kwame Mensah|Person]] about the visa interview on Tuesday.
+GL	[[Ivan Petrov|Person]] needs the server logs from last night.
+GL	Write a thank-you note to [[Mrs. Eleanor Whitfield|Person]] for hosting us.
+GL	[[Mehmet Yılmaz|Person]] reported that the Istanbul shipment is delayed.
+GL	Call [[Lucas Silva|Person]] on [[+55 11 91234-5678|Phone]] about the samples.
+GL	[[Seo-yeon Park|Person]] will join the standup from Seoul.
+GL	[[Aroha Ngata|Person]] submitted the grant application for the Auckland project.
+GL	The tenant [[Michael Brennan|Person]] lives at [[742 Evergreen Terrace, Springfield, OR 97477|Address]].
+GL	[[Wei Zhang|Person]] and [[Li Na|Person]] will review the pull request.
+GL	Please ask [[Sven Johansson|Person]] whether the Malmö plant is running.
+GL	[[Amara Okonkwo|Person]] needs a reference letter by Friday.
+GL	Translate this for [[Giulia Rossi|Person]]: the meeting moved to Thursday.
+GL	[[Juan Pablo Hernández|Person]] can be reached at [[jp.hernandez@correo.example|Email]].
+GL	The complaint came from [[Olga Kowalska|Person]] in Kraków.
+GL	[[Tomás Ó Súilleabháin|Person]] will chair the Dublin session.
+GL	Schedule a call with [[Yusuf Abdullahi|Person]] and [[Zainab Bello|Person]].
+GL	[[Emily Carter|Person]] wants her flight changed to the 9:40 departure.
+GL	Our client [[Pierre Dubois|Person]] disputes the March invoice.
+GL	[[Ahmed Hassan|Person]] needs the Cairo office keys returned.
+GL	Write a farewell card for [[Ingrid Larsen|Person]].
+GL	Please check [[Carlos Mendoza|Person]]'s timesheet for overtime.
+GL	[[Mei Ling Tan|Person]] lives at [[Blk 123 Ang Mo Kio Ave 3, #05-67, Singapore 560123|Address]].
+GL	The patient [[Robert Kowalski Jr.|Person]] is allergic to penicillin.
+GL	Forward the board pack to [[Ana Beatriz Costa|Person]] and [[João Ferreira|Person]].
+GL	[[Takeshi Yamamoto|Person]] approved the purchase order.
+GL	[[Nadia Rahman|Person]] asked to unsubscribe from marketing emails.
+GL	Draft a reply to [[Sarah O'Connell|Person]] confirming the refund.
+GL	[[Dmitri Volkov|Person]] wants the build artefacts by noon.
+GL	Ask [[Grace Wanjiru|Person]] for the Nairobi expense receipts.
+GL	[[Hannah Schmidt|Person]] is on parental leave until May.
+GL	Please greet [[Rashid Al Maktoum Khan|Person]] at the airport.
+GL	[[Valentina Morales|Person]] reported a bug in the checkout page.
+NEG	Write a product description for the new Infosys cloud migration service.
+NEG	What's the weather like in Bengaluru in December?
+NEG	Summarise the release notes for version 2.4.1 of our app.
+NEG	Order #88213 was shipped via Blue Dart yesterday.
+NEG	Compare Tata Nexon and Hyundai Creta on mileage.
+NEG	Explain how UPI works for a school project.
+NEG	Translate "good morning" into Tamil, Telugu and Kannada.
+NEG	The quarterly report shows revenue grew 12% in Pune and Chennai.
+NEG	Recommend three books about the history of the Mughal empire.
+NEG	Our Diwali sale starts on the 20th with 30% off on all kurtas.
+NEG	Write SQL to count orders per city from the sales table.
+NEG	Plan a 3 day trip to Jaipur with a budget of 20000 rupees.
+NEG	The Chief Executive Officer will address all employees on Monday.
+NEG	Ticket TCK-4521 is assigned to the backend team.
+NEG	Make a grocery list: atta, dal, paneer, tomatoes and dhania.
+NEG	How do I reset my router to factory settings?
+NEG	Explain the difference between a PAN card and an Aadhaar card.
+NEG	Draft a policy for remote work for our Hyderabad office.
+NEG	The train from Howrah to Puri leaves at 22:35.
+NEG	Write a haiku about monsoon in Kerala.

@@ -1,0 +1,120 @@
+{"region": "IN", "text": "Can you draft a polite reminder to Venkatesh Iyer about the pending invoice?", "entities": [{"start": 35, "end": 49, "kind": "Person"}]}
+{"region": "IN", "text": "bhai Gurpreet ko bol dena ki kal meeting 4 baje hai", "entities": [{"start": 5, "end": 13, "kind": "Person"}]}
+{"region": "IN", "text": "Summarise this complaint from Mohammed Faizal Shaikh, who lives at Flat 12B, Sea Breeze Apartments, Bandra West, Mumbai 400050.", "entities": [{"start": 30, "end": 52, "kind": "Person"}, {"start": 67, "end": 126, "kind": "Address"}]}
+{"region": "IN", "text": "Lakshmi Narayanan and her husband Ramesh want to open a joint account.", "entities": [{"start": 0, "end": 17, "kind": "Person"}, {"start": 34, "end": 40, "kind": "Person"}]}
+{"region": "IN", "text": "Please reply to Ananya Chatterjee in Bengali, she prefers that.", "entities": [{"start": 16, "end": 33, "kind": "Person"}]}
+{"region": "IN", "text": "The tenant, Sandeep Kulkarni, has not paid rent since August.", "entities": [{"start": 12, "end": 28, "kind": "Person"}]}
+{"region": "IN", "text": "Write a recommendation letter for my student Aisha Begum who topped the class.", "entities": [{"start": 45, "end": 56, "kind": "Person"}]}
+{"region": "IN", "text": "Harpreet Kaur Sandhu called twice about the refund for order 88213.", "entities": [{"start": 0, "end": 20, "kind": "Person"}]}
+{"region": "IN", "text": "Translate to Hindi: \"Dear Mr. Prakash Rao, your appointment is confirmed.\"", "entities": [{"start": 26, "end": 41, "kind": "Person"}]}
+{"region": "IN", "text": "mera naam Ravi Teja hai aur main Hyderabad se hoon", "entities": [{"start": 10, "end": 19, "kind": "Person"}]}
+{"region": "IN", "text": "Ask Dr. Meenakshi Sundaram whether the MRI report is ready.", "entities": [{"start": 4, "end": 26, "kind": "Person"}]}
+{"region": "IN", "text": "Reminder: Joseph D'Souza from accounts needs the GST invoices.", "entities": [{"start": 10, "end": 24, "kind": "Person"}]}
+{"region": "IN", "text": "Kavya Reddy wants to know why her EMI went up this month.", "entities": [{"start": 0, "end": 11, "kind": "Person"}]}
+{"region": "IN", "text": "Please check if Arjun Malhotra is free for the client call on Friday.", "entities": [{"start": 16, "end": 30, "kind": "Person"}]}
+{"region": "IN", "text": "Need a birthday message for my nani, Kamla Devi, turning 80.", "entities": [{"start": 37, "end": 47, "kind": "Person"}]}
+{"region": "IN", "text": "Rohit bhaiya ka phone switched off aa raha hai since morning", "entities": [{"start": 0, "end": 5, "kind": "Person"}]}
+{"region": "IN", "text": "Forward this to Shabnam Ansari and cc Imran Qureshi.", "entities": [{"start": 16, "end": 30, "kind": "Person"}, {"start": 38, "end": 51, "kind": "Person"}]}
+{"region": "IN", "text": "Our new intern Tenzin Dorjee joins from Gangtok on Monday.", "entities": [{"start": 15, "end": 28, "kind": "Person"}]}
+{"region": "IN", "text": "The Aadhaar update for Biswajit Mohanty is stuck at the enrolment centre.", "entities": [{"start": 23, "end": 39, "kind": "Person"}]}
+{"region": "IN", "text": "Priyanka Deshpande ne bola tha report Monday tak bhej degi", "entities": [{"start": 0, "end": 18, "kind": "Person"}]}
+{"region": "IN", "text": "Prepare a legal notice on behalf of Cyrus Mistry to the builder.", "entities": [{"start": 36, "end": 48, "kind": "Person"}]}
+{"region": "IN", "text": "Nandini Pillai from Kochi booked two tickets under her name.", "entities": [{"start": 0, "end": 14, "kind": "Person"}]}
+{"region": "IN", "text": "Hi team, Abhishek Jain will handle the Surat warehouse from now.", "entities": [{"start": 9, "end": 22, "kind": "Person"}]}
+{"region": "IN", "text": "Check whether Manoj Kumar Yadav has signed the NDA.", "entities": [{"start": 14, "end": 31, "kind": "Person"}]}
+{"region": "IN", "text": "Fatima Siddiqui asked to change her delivery address to 22, Ganesh Nagar, Indore 452001.", "entities": [{"start": 0, "end": 15, "kind": "Person"}, {"start": 56, "end": 87, "kind": "Address"}]}
+{"region": "IN", "text": "Please congratulate Sneha Patil on her promotion in the newsletter.", "entities": [{"start": 20, "end": 31, "kind": "Person"}]}
+{"region": "IN", "text": "K. Venkataraman retired from the bank last year; send the pension form.", "entities": [{"start": 0, "end": 15, "kind": "Person"}]}
+{"region": "IN", "text": "Send the offer letter to Rahul Verma at rahul.verma92@gmail.com today.", "entities": [{"start": 25, "end": 36, "kind": "Person"}, {"start": 40, "end": 63, "kind": "Email"}]}
+{"region": "IN", "text": "Customer Deepa Nair says her card was charged twice.", "entities": [{"start": 9, "end": 19, "kind": "Person"}]}
+{"region": "IN", "text": "Ring Suresh uncle on 98450 12345 before you leave.", "entities": [{"start": 5, "end": 11, "kind": "Person"}, {"start": 21, "end": 32, "kind": "Phone"}]}
+{"region": "IN", "text": "Pooja Agarwal, Vikas Agarwal and their son are travelling to Shimla.", "entities": [{"start": 0, "end": 13, "kind": "Person"}, {"start": 15, "end": 28, "kind": "Person"}]}
+{"region": "IN", "text": "The patient Gopal Krishna Bhat reported chest pain at 3 am.", "entities": [{"start": 12, "end": 30, "kind": "Person"}]}
+{"region": "IN", "text": "yaar Neha ka wedding card design kar do, theme marigold", "entities": [{"start": 5, "end": 9, "kind": "Person"}]}
+{"region": "IN", "text": "Write a condolence note to the family of Late Shri Om Prakash Gupta.", "entities": [{"start": 41, "end": 67, "kind": "Person"}]}
+{"region": "IN", "text": "Simran Gill from Ludhiana won the inter-college debate.", "entities": [{"start": 0, "end": 11, "kind": "Person"}]}
+{"region": "IN", "text": "Draft a WhatsApp message to Anil Bhaskar about the society maintenance dues.", "entities": [{"start": 28, "end": 40, "kind": "Person"}]}
+{"region": "IN", "text": "Ask Thomas Kurian to share the Kottayam site photos.", "entities": [{"start": 4, "end": 17, "kind": "Person"}]}
+{"region": "IN", "text": "Zoya Khan wants her resume rewritten for a data analyst role.", "entities": [{"start": 0, "end": 9, "kind": "Person"}]}
+{"region": "IN", "text": "Bhavesh Shah ki dukaan Shop 4, Navrangpura, Ahmedabad pe hai", "entities": [{"start": 0, "end": 12, "kind": "Person"}, {"start": 23, "end": 53, "kind": "Address"}]}
+{"region": "IN", "text": "The complaint was filed by Ritika Sen at the Salt Lake police station.", "entities": [{"start": 27, "end": 37, "kind": "Person"}]}
+{"region": "IN", "text": "Please verify the PAN of Sunil Dutta before onboarding.", "entities": [{"start": 25, "end": 36, "kind": "Person"}]}
+{"region": "IN", "text": "Lalitha amma needs a ride to the temple at 6.", "entities": [{"start": 0, "end": 7, "kind": "Person"}]}
+{"region": "IN", "text": "Book a cab for Ishaan Kapoor from Terminal 2 to Powai.", "entities": [{"start": 15, "end": 28, "kind": "Person"}]}
+{"region": "IN", "text": "Dinesh Karthik Subramaniam has requested leave from 3rd to 7th.", "entities": [{"start": 0, "end": 26, "kind": "Person"}]}
+{"region": "IN", "text": "My neighbour Mrs. Saroj Bala needs help filling the pension form.", "entities": [{"start": 13, "end": 28, "kind": "Person"}]}
+{"region": "IN", "text": "Tell Aditya the server credentials are in the vault, not on Slack.", "entities": [{"start": 5, "end": 11, "kind": "Person"}]}
+{"region": "IN", "text": "Gaurav Chauhan lives at House No. 45, Sector 15, Chandigarh 160015.", "entities": [{"start": 0, "end": 14, "kind": "Person"}, {"start": 24, "end": 66, "kind": "Address"}]}
+{"region": "IN", "text": "Reply to Shreya Ghoshal Banerjee that the courier left Kolkata yesterday.", "entities": [{"start": 9, "end": 32, "kind": "Person"}]}
+{"region": "IN", "text": "Mahesh Babu Naidu wants the quotation in Telugu and English.", "entities": [{"start": 0, "end": 17, "kind": "Person"}]}
+{"region": "IN", "text": "Prepare minutes: present were Rekha Iyer, Farhan Akhtar Siddiqui and Jaspreet Singh.", "entities": [{"start": 30, "end": 40, "kind": "Person"}, {"start": 42, "end": 64, "kind": "Person"}, {"start": 69, "end": 83, "kind": "Person"}]}
+{"region": "IN", "text": "Yash se pucho ki laptop ka bill kahan hai", "entities": [{"start": 0, "end": 4, "kind": "Person"}]}
+{"region": "IN", "text": "Draft an email to Professor Anand Kumar requesting an extension.", "entities": [{"start": 18, "end": 39, "kind": "Person"}]}
+{"region": "IN", "text": "Moumita Das needs the Durga Puja leave approved.", "entities": [{"start": 0, "end": 11, "kind": "Person"}]}
+{"region": "IN", "text": "Hey Karan, can you share Riya Mehta's new number?", "entities": [{"start": 4, "end": 9, "kind": "Person"}, {"start": 25, "end": 35, "kind": "Person"}]}
+{"region": "IN", "text": "Sadhana Joshi from Pune has opted out of the SMS alerts.", "entities": [{"start": 0, "end": 13, "kind": "Person"}]}
+{"region": "IN", "text": "Please summarise the medical history of Baby of Sunita Rawat.", "entities": [{"start": 40, "end": 60, "kind": "Person"}]}
+{"region": "IN", "text": "The landlord Mr. Narasimha Murthy wants the deposit in cash.", "entities": [{"start": 13, "end": 33, "kind": "Person"}]}
+{"region": "IN", "text": "Arunima Sinha is the emergency contact for this trek group.", "entities": [{"start": 0, "end": 13, "kind": "Person"}]}
+{"region": "IN", "text": "Send the warranty card to Vinod Tiwari, 12/3 Civil Lines, Prayagraj 211001.", "entities": [{"start": 26, "end": 38, "kind": "Person"}, {"start": 40, "end": 74, "kind": "Address"}]}
+{"region": "IN", "text": "sir please tell Mahendra ji that the cheque has bounced", "entities": [{"start": 16, "end": 24, "kind": "Person"}]}
+{"region": "GL", "text": "Draft an apology email to Siobhan O'Brien about the delayed shipment.", "entities": [{"start": 26, "end": 41, "kind": "Person"}]}
+{"region": "GL", "text": "Nguyễn Văn An and Oluwaseun Adeyemi will present the Q3 results.", "entities": [{"start": 0, "end": 16, "kind": "Person"}, {"start": 21, "end": 38, "kind": "Person"}]}
+{"region": "GL", "text": "Please book a table for María José García López at 8 pm.", "entities": [{"start": 24, "end": 51, "kind": "Person"}]}
+{"region": "GL", "text": "Hiroshi Tanaka asked for the contract in Japanese.", "entities": [{"start": 0, "end": 14, "kind": "Person"}]}
+{"region": "GL", "text": "Can you summarise Dr. Fatima Al-Zahra's research proposal?", "entities": [{"start": 18, "end": 37, "kind": "Person"}]}
+{"region": "GL", "text": "Jean-Luc Moreau lives at 14 Rue de la Paix, 75002 Paris.", "entities": [{"start": 0, "end": 15, "kind": "Person"}, {"start": 25, "end": 55, "kind": "Address"}]}
+{"region": "GL", "text": "Send the invoice to Klaus Müller at k.mueller@firma-beispiel.de.", "entities": [{"start": 20, "end": 33, "kind": "Person"}, {"start": 37, "end": 64, "kind": "Email"}]}
+{"region": "GL", "text": "Chloe Nguyen is our new account manager for the Sydney office.", "entities": [{"start": 0, "end": 12, "kind": "Person"}]}
+{"region": "GL", "text": "Remind Kwame Mensah about the visa interview on Tuesday.", "entities": [{"start": 7, "end": 19, "kind": "Person"}]}
+{"region": "GL", "text": "Ivan Petrov needs the server logs from last night.", "entities": [{"start": 0, "end": 11, "kind": "Person"}]}
+{"region": "GL", "text": "Write a thank-you note to Mrs. Eleanor Whitfield for hosting us.", "entities": [{"start": 26, "end": 48, "kind": "Person"}]}
+{"region": "GL", "text": "Mehmet Yılmaz reported that the Istanbul shipment is delayed.", "entities": [{"start": 0, "end": 14, "kind": "Person"}]}
+{"region": "GL", "text": "Call Lucas Silva on +55 11 91234-5678 about the samples.", "entities": [{"start": 5, "end": 16, "kind": "Person"}, {"start": 20, "end": 37, "kind": "Phone"}]}
+{"region": "GL", "text": "Seo-yeon Park will join the standup from Seoul.", "entities": [{"start": 0, "end": 13, "kind": "Person"}]}
+{"region": "GL", "text": "Aroha Ngata submitted the grant application for the Auckland project.", "entities": [{"start": 0, "end": 11, "kind": "Person"}]}
+{"region": "GL", "text": "The tenant Michael Brennan lives at 742 Evergreen Terrace, Springfield, OR 97477.", "entities": [{"start": 11, "end": 26, "kind": "Person"}, {"start": 36, "end": 80, "kind": "Address"}]}
+{"region": "GL", "text": "Wei Zhang and Li Na will review the pull request.", "entities": [{"start": 0, "end": 9, "kind": "Person"}, {"start": 14, "end": 19, "kind": "Person"}]}
+{"region": "GL", "text": "Please ask Sven Johansson whether the Malmö plant is running.", "entities": [{"start": 11, "end": 25, "kind": "Person"}]}
+{"region": "GL", "text": "Amara Okonkwo needs a reference letter by Friday.", "entities": [{"start": 0, "end": 13, "kind": "Person"}]}
+{"region": "GL", "text": "Translate this for Giulia Rossi: the meeting moved to Thursday.", "entities": [{"start": 19, "end": 31, "kind": "Person"}]}
+{"region": "GL", "text": "Juan Pablo Hernández can be reached at jp.hernandez@correo.example.", "entities": [{"start": 0, "end": 21, "kind": "Person"}, {"start": 40, "end": 67, "kind": "Email"}]}
+{"region": "GL", "text": "The complaint came from Olga Kowalska in Kraków.", "entities": [{"start": 24, "end": 37, "kind": "Person"}]}
+{"region": "GL", "text": "Tomás Ó Súilleabháin will chair the Dublin session.", "entities": [{"start": 0, "end": 24, "kind": "Person"}]}
+{"region": "GL", "text": "Schedule a call with Yusuf Abdullahi and Zainab Bello.", "entities": [{"start": 21, "end": 36, "kind": "Person"}, {"start": 41, "end": 53, "kind": "Person"}]}
+{"region": "GL", "text": "Emily Carter wants her flight changed to the 9:40 departure.", "entities": [{"start": 0, "end": 12, "kind": "Person"}]}
+{"region": "GL", "text": "Our client Pierre Dubois disputes the March invoice.", "entities": [{"start": 11, "end": 24, "kind": "Person"}]}
+{"region": "GL", "text": "Ahmed Hassan needs the Cairo office keys returned.", "entities": [{"start": 0, "end": 12, "kind": "Person"}]}
+{"region": "GL", "text": "Write a farewell card for Ingrid Larsen.", "entities": [{"start": 26, "end": 39, "kind": "Person"}]}
+{"region": "GL", "text": "Please check Carlos Mendoza's timesheet for overtime.", "entities": [{"start": 13, "end": 27, "kind": "Person"}]}
+{"region": "GL", "text": "Mei Ling Tan lives at Blk 123 Ang Mo Kio Ave 3, #05-67, Singapore 560123.", "entities": [{"start": 0, "end": 12, "kind": "Person"}, {"start": 22, "end": 72, "kind": "Address"}]}
+{"region": "GL", "text": "The patient Robert Kowalski Jr. is allergic to penicillin.", "entities": [{"start": 12, "end": 31, "kind": "Person"}]}
+{"region": "GL", "text": "Forward the board pack to Ana Beatriz Costa and João Ferreira.", "entities": [{"start": 26, "end": 43, "kind": "Person"}, {"start": 48, "end": 62, "kind": "Person"}]}
+{"region": "GL", "text": "Takeshi Yamamoto approved the purchase order.", "entities": [{"start": 0, "end": 16, "kind": "Person"}]}
+{"region": "GL", "text": "Nadia Rahman asked to unsubscribe from marketing emails.", "entities": [{"start": 0, "end": 12, "kind": "Person"}]}
+{"region": "GL", "text": "Draft a reply to Sarah O'Connell confirming the refund.", "entities": [{"start": 17, "end": 32, "kind": "Person"}]}
+{"region": "GL", "text": "Dmitri Volkov wants the build artefacts by noon.", "entities": [{"start": 0, "end": 13, "kind": "Person"}]}
+{"region": "GL", "text": "Ask Grace Wanjiru for the Nairobi expense receipts.", "entities": [{"start": 4, "end": 17, "kind": "Person"}]}
+{"region": "GL", "text": "Hannah Schmidt is on parental leave until May.", "entities": [{"start": 0, "end": 14, "kind": "Person"}]}
+{"region": "GL", "text": "Please greet Rashid Al Maktoum Khan at the airport.", "entities": [{"start": 13, "end": 35, "kind": "Person"}]}
+{"region": "GL", "text": "Valentina Morales reported a bug in the checkout page.", "entities": [{"start": 0, "end": 17, "kind": "Person"}]}
+{"region": "NEG", "text": "Write a product description for the new Infosys cloud migration service.", "entities": []}
+{"region": "NEG", "text": "What's the weather like in Bengaluru in December?", "entities": []}
+{"region": "NEG", "text": "Summarise the release notes for version 2.4.1 of our app.", "entities": []}
+{"region": "NEG", "text": "Order #88213 was shipped via Blue Dart yesterday.", "entities": []}
+{"region": "NEG", "text": "Compare Tata Nexon and Hyundai Creta on mileage.", "entities": []}
+{"region": "NEG", "text": "Explain how UPI works for a school project.", "entities": []}
+{"region": "NEG", "text": "Translate \"good morning\" into Tamil, Telugu and Kannada.", "entities": []}
+{"region": "NEG", "text": "The quarterly report shows revenue grew 12% in Pune and Chennai.", "entities": []}
+{"region": "NEG", "text": "Recommend three books about the history of the Mughal empire.", "entities": []}
+{"region": "NEG", "text": "Our Diwali sale starts on the 20th with 30% off on all kurtas.", "entities": []}
+{"region": "NEG", "text": "Write SQL to count orders per city from the sales table.", "entities": []}
+{"region": "NEG", "text": "Plan a 3 day trip to Jaipur with a budget of 20000 rupees.", "entities": []}
+{"region": "NEG", "text": "The Chief Executive Officer will address all employees on Monday.", "entities": []}
+{"region": "NEG", "text": "Ticket TCK-4521 is assigned to the backend team.", "entities": []}
+{"region": "NEG", "text": "Make a grocery list: atta, dal, paneer, tomatoes and dhania.", "entities": []}
+{"region": "NEG", "text": "How do I reset my router to factory settings?", "entities": []}
+{"region": "NEG", "text": "Explain the difference between a PAN card and an Aadhaar card.", "entities": []}
+{"region": "NEG", "text": "Draft a policy for remote work for our Hyderabad office.", "entities": []}
+{"region": "NEG", "text": "The train from Howrah to Puri leaves at 22:35.", "entities": []}
+{"region": "NEG", "text": "Write a haiku about monsoon in Kerala.", "entities": []}
