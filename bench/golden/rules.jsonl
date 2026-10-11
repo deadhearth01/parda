@@ -1,0 +1,81 @@
+{"text": "Value: ravi@example.com.", "entities": [{"start": 7, "end": 23, "kind": "Email"}]}
+{"text": "Value: first.last+tag@sub.domain.co.in.", "entities": [{"start": 7, "end": 38, "kind": "Email"}]}
+{"text": "Value: alice@example.org.", "entities": [{"start": 7, "end": 24, "kind": "Email"}]}
+{"text": "Value: a_b@example.net.", "entities": [{"start": 7, "end": 22, "kind": "Email"}]}
+{"text": "Value: test+news@company.io.", "entities": [{"start": 7, "end": 27, "kind": "Email"}]}
+{"text": "मेरा ईमेल ravi@example.com है", "entities": [{"start": 26, "end": 42, "kind": "Email"}]}
+{"text": "Value: +91 98765 43210.", "entities": [{"start": 7, "end": 22, "kind": "Phone"}]}
+{"text": "Value: 09876543210.", "entities": [{"start": 7, "end": 18, "kind": "Phone"}]}
+{"text": "Value: +1 (415) 555-0132.", "entities": [{"start": 7, "end": 24, "kind": "Phone"}]}
+{"text": "Value: +44 20 7946 0958.", "entities": [{"start": 7, "end": 23, "kind": "Phone"}]}
+{"text": "Value: 9876543210.", "entities": [{"start": 7, "end": 17, "kind": "Phone"}]}
+{"text": "Value: 98765-43210.", "entities": [{"start": 7, "end": 18, "kind": "Phone"}]}
+{"text": "Value: +919876543210.", "entities": [{"start": 7, "end": 20, "kind": "Phone"}]}
+{"text": "Value: 011-23456789.", "entities": [{"start": 7, "end": 19, "kind": "Phone"}]}
+{"text": "Value: 020 12345678.", "entities": [{"start": 7, "end": 19, "kind": "Phone"}]}
+{"text": "Value: 415.555.0132.", "entities": [{"start": 7, "end": 19, "kind": "Phone"}]}
+{"text": "Value: (415) 555-0132.", "entities": [{"start": 7, "end": 21, "kind": "Phone"}]}
+{"text": "Value: +33 1 23 45 67 89.", "entities": [{"start": 7, "end": 24, "kind": "Phone"}]}
+{"text": "Value: +442079460958.", "entities": [{"start": 7, "end": 20, "kind": "Phone"}]}
+{"text": "Value: 499111234566.", "entities": [{"start": 7, "end": 19, "kind": "Aadhaar"}]}
+{"text": "Value: 4991 1123 4566.", "entities": [{"start": 7, "end": 21, "kind": "Aadhaar"}]}
+{"text": "Value: 4991-1123-4566.", "entities": [{"start": 7, "end": 21, "kind": "Aadhaar"}]}
+{"text": "Value: ABCPE1234F.", "entities": [{"start": 7, "end": 17, "kind": "Pan"}]}
+{"text": "Value: AAPFU0939F.", "entities": [{"start": 7, "end": 17, "kind": "Pan"}]}
+{"text": "Value: AAAPL1234C.", "entities": [{"start": 7, "end": 17, "kind": "Pan"}]}
+{"text": "Value: 27AAPFU0939F1ZV.", "entities": [{"start": 7, "end": 22, "kind": "Gstin"}]}
+{"text": "Value: ravi.k@okaxis.", "entities": [{"start": 7, "end": 20, "kind": "Upi"}]}
+{"text": "Value: 9876543210@ybl.", "entities": [{"start": 7, "end": 21, "kind": "Upi"}]}
+{"text": "Value: ravi_sharma@paytm.", "entities": [{"start": 7, "end": 24, "kind": "Upi"}]}
+{"text": "Value: ravi@newbank.", "entities": [{"start": 7, "end": 19, "kind": "Upi"}]}
+{"text": "Value: HDFC0001234.", "entities": [{"start": 7, "end": 18, "kind": "Ifsc"}]}
+{"text": "Value: SBIN0001234.", "entities": [{"start": 7, "end": 18, "kind": "Ifsc"}]}
+{"text": "Value: ICIC0000123.", "entities": [{"start": 7, "end": 18, "kind": "Ifsc"}]}
+{"text": "Value: ABC1234567.", "entities": [{"start": 7, "end": 17, "kind": "VoterId"}]}
+{"text": "Value: XYZ9876543.", "entities": [{"start": 7, "end": 17, "kind": "VoterId"}]}
+{"text": "Value: MH 12 AB 1234.", "entities": [{"start": 7, "end": 20, "kind": "IndianVehicleReg"}]}
+{"text": "Value: KA05MN1234.", "entities": [{"start": 7, "end": 17, "kind": "IndianVehicleReg"}]}
+{"text": "Value: DL 01 C 1234.", "entities": [{"start": 7, "end": 19, "kind": "IndianVehicleReg"}]}
+{"text": "Value: MH1420110062821.", "entities": [{"start": 7, "end": 22, "kind": "DrivingLicence"}]}
+{"text": "Value: DL-0420110149646.", "entities": [{"start": 7, "end": 23, "kind": "DrivingLicence"}]}
+{"text": "Value: GB82 WEST 1234 5698 7654 32.", "entities": [{"start": 7, "end": 34, "kind": "Iban"}]}
+{"text": "Value: DE89 3704 0044 0532 0130 00.", "entities": [{"start": 7, "end": 34, "kind": "Iban"}]}
+{"text": "Value: GB82WEST12345698765432.", "entities": [{"start": 7, "end": 29, "kind": "Iban"}]}
+{"text": "Value: FR14 2004 1010 0505 0001 3M02 606.", "entities": [{"start": 7, "end": 40, "kind": "Iban"}]}
+{"text": "Value: 4111 1111 1111 1111.", "entities": [{"start": 7, "end": 26, "kind": "CreditCard"}]}
+{"text": "Value: 4111111111111111.", "entities": [{"start": 7, "end": 23, "kind": "CreditCard"}]}
+{"text": "Value: 5555-5555-5555-4444.", "entities": [{"start": 7, "end": 26, "kind": "CreditCard"}]}
+{"text": "Value: 378282246310005.", "entities": [{"start": 7, "end": 22, "kind": "CreditCard"}]}
+{"text": "Value: 192.168.1.1.", "entities": [{"start": 7, "end": 18, "kind": "IpAddress"}]}
+{"text": "Value: 8.8.8.8.", "entities": [{"start": 7, "end": 14, "kind": "IpAddress"}]}
+{"text": "Value: 2001:db8::1.", "entities": [{"start": 7, "end": 18, "kind": "IpAddress"}]}
+{"text": "Value: ::1.", "entities": [{"start": 7, "end": 10, "kind": "IpAddress"}]}
+{"text": "Value: fe80::abcd.", "entities": [{"start": 7, "end": 17, "kind": "IpAddress"}]}
+{"text": "Value: ::ffff:192.0.2.1.", "entities": [{"start": 7, "end": 23, "kind": "IpAddress"}]}
+{"text": "Value: 00:1A:2B:3C:4D:5E.", "entities": [{"start": 7, "end": 24, "kind": "MacAddress"}]}
+{"text": "Value: aa-bb-cc-dd-ee-ff.", "entities": [{"start": 7, "end": 24, "kind": "MacAddress"}]}
+{"text": "Value: https://example.com/?token=abc123.", "entities": [{"start": 7, "end": 40, "kind": "Url"}]}
+{"text": "Value: https://user:pass@example.com/path.", "entities": [{"start": 7, "end": 41, "kind": "Url"}]}
+{"text": "Value: https://example.org/?email=ravi%40example.com.", "entities": [{"start": 7, "end": 52, "kind": "Url"}]}
+{"text": "Value: 123-45-6789.", "entities": [{"start": 7, "end": 18, "kind": "UsSsn"}]}
+{"text": "Value: 321 54 9876.", "entities": [{"start": 7, "end": 18, "kind": "UsSsn"}]}
+{"text": "Value: AB123456C.", "entities": [{"start": 7, "end": 16, "kind": "UkNino"}]}
+{"text": "Value: JG 12 34 56 A.", "entities": [{"start": 7, "end": 20, "kind": "UkNino"}]}
+{"text": "Value: sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890.", "entities": [{"start": 7, "end": 56, "kind": "Secret"}]}
+{"text": "Value: ghp_abcdefghijklmnopqrstuvwxyz1234567890.", "entities": [{"start": 7, "end": 47, "kind": "Secret"}]}
+{"text": "Value: AKIAIOSFODNN7EXAMPLE.", "entities": [{"start": 7, "end": 27, "kind": "Secret"}]}
+{"text": "Value: sk-abcdefghijklmnopqrstuvwxyz123456.", "entities": [{"start": 7, "end": 42, "kind": "Secret"}]}
+{"text": "Value: xoxb-123456789012-123456789012-abcdefghijklmnop.", "entities": [{"start": 7, "end": 54, "kind": "Secret"}]}
+{"text": "Value: AIzaA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r.", "entities": [{"start": 7, "end": 46, "kind": "Secret"}]}
+{"text": "Value: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJl.", "entities": [{"start": 7, "end": 68, "kind": "Secret"}]}
+{"text": "Value: -----BEGIN PRIVATE KEY-----.", "entities": [{"start": 7, "end": 34, "kind": "Secret"}]}
+{"text": "Value: -----BEGIN RSA PRIVATE KEY-----.", "entities": [{"start": 7, "end": 38, "kind": "Secret"}]}
+{"text": "password = hunter2", "entities": [{"start": 11, "end": 18, "kind": "Secret"}]}
+{"text": "api_key: 550e8400-e29b-41d4-a716-446655440000", "entities": [{"start": 9, "end": 45, "kind": "Secret"}]}
+{"text": "credential aB3dE6gH9jK2mN5pQ8sT1vW4xY7z", "entities": [{"start": 11, "end": 39, "kind": "Secret"}]}
+{"text": "dob: 23/04/1990", "entities": [{"start": 5, "end": 15, "kind": "DateOfBirth"}]}
+{"text": "dob: 1990-04-23", "entities": [{"start": 5, "end": 15, "kind": "DateOfBirth"}]}
+{"text": "dob: 23-04-1990", "entities": [{"start": 5, "end": 15, "kind": "DateOfBirth"}]}
+{"text": "मेरा पैन ABCPE1234F है", "entities": [{"start": 23, "end": 33, "kind": "Pan"}]}
+{"text": "भुगतान ravi.k@okaxis करें", "entities": [{"start": 19, "end": 32, "kind": "Upi"}]}
+{"text": "आधार 4991 1123 4566 है", "entities": [{"start": 13, "end": 27, "kind": "Aadhaar"}]}
