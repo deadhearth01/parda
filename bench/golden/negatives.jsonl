@@ -1,0 +1,43 @@
+{"text": "version 1.2.3.4 is installed", "kinds": ["IpAddress"]}
+{"text": "VERSION: 10.20.30.40", "kinds": ["IpAddress"]}
+{"text": "version अअ 1.2.3.4", "kinds": ["IpAddress"]}
+{"text": "Connect to localhost", "kinds": ["IpAddress", "Url"]}
+{"text": "999.12.34.56", "kinds": ["IpAddress"]}
+{"text": "192.168.1.999", "kinds": ["IpAddress"]}
+{"text": "2001:db8:::1", "kinds": ["IpAddress"]}
+{"text": "12345:db8::1", "kinds": ["IpAddress"]}
+{"text": "order ID 123456789012", "kinds": ["Aadhaar", "CreditCard"]}
+{"text": "ISBN 978-0-306-40615-7", "kinds": ["CreditCard", "Aadhaar"]}
+{"text": "UUID 550e8400-e29b-41d4-a716-446655440000", "kinds": ["Secret"]}
+{"text": "aB3dE6gH9jK2mN5pQ8sT1vW4xY7z", "kinds": ["Secret"]}
+{"text": "499111234569", "kinds": ["Aadhaar"]}
+{"text": "199111234568", "kinds": ["Aadhaar"]}
+{"text": "000000000000", "kinds": ["Aadhaar"]}
+{"text": "111111111111", "kinds": ["Aadhaar"]}
+{"text": "23/04/1990", "kinds": ["DateOfBirth"]}
+{"text": "Meeting on 1990-04-23", "kinds": ["DateOfBirth"]}
+{"text": "born on 31/02/1990", "kinds": ["DateOfBirth"]}
+{"text": "31-12-2020", "kinds": ["DateOfBirth"]}
+{"text": "ABCDE1234F", "kinds": ["Pan"]}
+{"text": "abcpe1234f", "kinds": ["Pan"]}
+{"text": "27AAPFU0939F1Z0", "kinds": ["Gstin"]}
+{"text": "HDFC1001234", "kinds": ["Ifsc"]}
+{"text": "ravi@x", "kinds": ["Upi", "Email"]}
+{"text": "ravi@example.com", "kinds": ["Upi"]}
+{"text": "4111111111111112", "kinds": ["CreditCard"]}
+{"text": "000-12-3456", "kinds": ["UsSsn"]}
+{"text": "666-12-3456", "kinds": ["UsSsn"]}
+{"text": "123-00-3456", "kinds": ["UsSsn"]}
+{"text": "123-45-0000", "kinds": ["UsSsn"]}
+{"text": "QQ123456C", "kinds": ["UkNino"]}
+{"text": "DF123456A", "kinds": ["UkNino"]}
+{"text": "AB123456E", "kinds": ["UkNino"]}
+{"text": "ghp_short", "kinds": ["Secret"]}
+{"text": "AKIA123", "kinds": ["Secret"]}
+{"text": "-----BEGIN PUBLIC KEY-----", "kinds": ["Secret"]}
+{"text": "12987654321099", "kinds": ["Phone"]}
+{"text": "+12345678901234567", "kinds": ["Phone"]}
+{"text": "xABCPE1234Fy", "kinds": ["Pan"]}
+{"text": "आधार499111234568संख्या", "kinds": ["Aadhaar"]}
+{"text": "00:1G:2B:3C:4D:5E", "kinds": ["MacAddress"]}
+{"text": "https://example.com/docs", "kinds": ["Url"]}
