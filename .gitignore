@@ -1,0 +1,8 @@
+/target/
+/.parda-dev/
+/models/
+/bench/results/
+/bench/external/
+/.remember/
+.DS_Store
+*.swp
