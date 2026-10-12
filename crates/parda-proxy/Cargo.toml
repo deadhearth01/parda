@@ -27,6 +27,7 @@ http.workspace = true
 parda-detect.workspace = true
 tempfile.workspace = true
 flate2 = "1"
+proptest.workspace = true
 
 [lints]
 workspace = true

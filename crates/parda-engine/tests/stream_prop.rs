@@ -67,3 +67,36 @@ fn single_byte_chunks() {
     out.push_str(&sr.finish());
     assert_eq!(out, e.restore(&red, "global"));
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Arbitrary Unicode (with PII sprinkled in) always round-trips exactly,
+    /// and every chunking of the redacted text streams back identically.
+    #[test]
+    fn arbitrary_text_round_trips(
+        parts in proptest::collection::vec(
+            prop_oneof![
+                "\\PC{0,24}",
+                Just("Ravi Kumar".to_string()),
+                Just("ravi.k@gmail.com".to_string()),
+                Just("+91 98765 43210".to_string()),
+                Just("ABCPE1234F".to_string()),
+            ],
+            0..10,
+        ),
+        cut in 0usize..400,
+    ) {
+        let (_d, e) = engine();
+        let text = parts.concat();
+        let red = e.redact(&text, "global").unwrap();
+        prop_assert_eq!(e.restore(&red.text, "global"), text.clone());
+        let mut c = cut.min(red.text.len());
+        while !red.text.is_char_boundary(c) { c -= 1; }
+        let mut sr = e.stream_restorer("global");
+        let mut out = sr.push(&red.text[..c]);
+        out.push_str(&sr.push(&red.text[c..]));
+        out.push_str(&sr.finish());
+        prop_assert_eq!(out, text);
+    }
+}

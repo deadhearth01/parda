@@ -2777,6 +2777,7 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "parda-core",
+ "proptest",
  "regex",
  "serde",
  "serde_json",
@@ -2849,6 +2850,7 @@ dependencies = [
  "parda-core",
  "parda-detect",
  "parda-engine",
+ "proptest",
  "reqwest",
  "serde",
  "serde_json",
@@ -2881,6 +2883,7 @@ dependencies = [
  "hmac",
  "keyring",
  "parda-core",
+ "proptest",
  "rand 0.8.8",
  "rand_chacha 0.3.1",
  "rusqlite",
