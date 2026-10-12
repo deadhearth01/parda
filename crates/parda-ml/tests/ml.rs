@@ -68,6 +68,34 @@ fn import_verifies_manifest_and_installs() {
     assert!(err.to_string().contains("sha256"), "{err}");
 }
 
+#[test]
+fn fp32_model_onnx_counts_as_installed_and_is_preferred() {
+    let src = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write(src.path(), "model.onnx", b"fp32");
+    write(src.path(), "tokenizer.json", b"{}");
+    write(src.path(), "gliner_config.json", b"{}");
+    let manifest = serde_json::json!({ "files": {
+        "model.onnx": { "sha256": parda_ml::sha256_hex(b"fp32"), "size": 4 },
+        "tokenizer.json": { "sha256": parda_ml::sha256_hex(b"{}"), "size": 2 },
+        "gliner_config.json": { "sha256": parda_ml::sha256_hex(b"{}"), "size": 2 },
+    }});
+    write(src.path(), "manifest.json", manifest.to_string().as_bytes());
+    let mm = ModelManager::new(root.path());
+    mm.import("parda-pii-edge", src.path()).unwrap();
+    assert!(mm.is_installed("parda-pii-edge"));
+    let dir = mm.model_dir("parda-pii-edge");
+    assert_eq!(parda_ml::model_file(&dir).unwrap(), dir.join("model.onnx"));
+    // With both present, the full-precision model wins.
+    write(&dir, "model_quint8.onnx", b"int8");
+    assert_eq!(parda_ml::model_file(&dir).unwrap(), dir.join("model.onnx"));
+    // Neither present: not installed.
+    std::fs::remove_file(dir.join("model.onnx")).unwrap();
+    std::fs::remove_file(dir.join("model_quint8.onnx")).unwrap();
+    assert!(!mm.is_installed("parda-pii-edge"));
+    assert!(parda_ml::model_file(&dir).is_none());
+}
+
 /// Serve `body` once on 127.0.0.1 and return the URL.
 fn serve_once(body: Vec<u8>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

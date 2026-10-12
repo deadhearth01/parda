@@ -21,7 +21,8 @@ pub struct GlinerDetector {
 }
 
 impl GlinerDetector {
-    /// Load `model_quint8.onnx` + `tokenizer.json` from `dir`.
+    /// Load the model's ONNX file (see [`crate::MODEL_FILES`]) and
+    /// `tokenizer.json` from `dir`.
     pub fn load(dir: &Path, threshold: f32, ep: ExecutionProvider) -> anyhow::Result<Self> {
         let threads = std::thread::available_parallelism()
             .map(|n| n.get().min(4))
@@ -34,7 +35,8 @@ impl GlinerDetector {
             params,
             runtime,
             dir.join("tokenizer.json"),
-            dir.join("model_quint8.onnx"),
+            crate::manager::model_file(dir)
+                .with_context(|| format!("no ONNX model in {}", dir.display()))?,
         )
         .map_err(|e| anyhow::anyhow!("loading GLiNER model from {}: {e}", dir.display()))?;
         let (labels, kinds) = ml_labels()

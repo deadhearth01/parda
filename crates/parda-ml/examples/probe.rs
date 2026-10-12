@@ -17,7 +17,14 @@ fn main() -> anyhow::Result<()> {
     for (t, dets) in refs.iter().zip(det.detect_batch(&refs)?) {
         let found: Vec<String> = dets
             .iter()
-            .map(|d| format!("{}={:?}({:.2})", d.kind, &t[d.span.start..d.span.end], d.score))
+            .map(|d| {
+                format!(
+                    "{}={:?}({:.2})",
+                    d.kind,
+                    &t[d.span.start..d.span.end],
+                    d.score
+                )
+            })
             .collect();
         println!("{t}\n    {}", found.join("  "));
     }
