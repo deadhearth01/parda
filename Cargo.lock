@@ -2880,7 +2880,7 @@ dependencies = [
  "hmac",
  "keyring",
  "parda-core",
- "rand 0.8.8",
+ "rand 0.10.3",
  "rand_chacha 0.3.1",
  "rusqlite",
  "serde",
