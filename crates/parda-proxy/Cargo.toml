@@ -1,0 +1,32 @@
+[package]
+name = "parda-proxy"
+description = "Local HTTP proxy that redacts PII in AI-agent API traffic and restores it in answers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+parda-core.workspace = true
+parda-engine.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+# Keep the key order of JSON bodies we rewrite.
+serde_json = { workspace = true, features = ["preserve_order"] }
+tokio.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+bytes.workspace = true
+futures.workspace = true
+http.workspace = true
+
+[dev-dependencies]
+parda-detect.workspace = true
+tempfile.workspace = true
+flate2 = "1"
+
+[lints]
+workspace = true
