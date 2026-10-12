@@ -1,0 +1,53 @@
+# Indian given names used for surrogates and for recognising Indian names.
+# Whitespace separated. Kept to 4+ letters and away from everyday words,
+# deity names and common Hinglish words, because surrogates are restored by
+# word-bounded matching in model output.
+# North / West, male
+Aarav Aditya Akash Akhil Alok Amit Amitabh Anand Anil Anirudh Ankit Ankur Anuj Anupam
+Arjun Arnav Arun Arvind Ashish Ashok Ashwin Atul Ayush Bharat Bhavesh Chetan Chirag
+Darshan Deepak Devendra Dhruv Dinesh Gaurav Girish Govind Harish Hemant Himanshu
+Hitesh Ishaan Jagdish Jatin Jayant Jitendra Kailash Kalpesh Kamlesh Karan Kartik
+Kaustubh Keshav Kishore Kunal Lalit Lokesh Madhav Mahesh Manish Manoj Mayank Mihir
+Mohit Mukesh Mukul Naresh Naveen Navneet Nikhil Nilesh Nimesh Niranjan Nitin Omkar
+Pankaj Paresh Parth Pavan Piyush Pradeep Prakash Pranav Prashant Pratik Praveen Puneet
+Rahul Rajat Rajeev Rajesh Rakesh Ramesh Ranjit Ravindra Rishabh Ritesh Rohan Rohit
+Sachin Sahil Sameer Sandeep Sanjay Santosh Saurabh Shailesh Shashank Shekhar Shivam
+Shreyas Siddharth Sudhir Sumit Sunil Suresh Sushil Tarun Tejas Tushar Umesh Varun
+Vedant Vijay Vikas Vikram Vinay Vinod Vipul Vishal Vivek Yogesh Ravi Kiran Aniket
+# South, male
+Balachandran Gopinath Hariharan Jayaraman Karthik Krishnan Lakshman Madhavan Murali
+Nagaraj Narayanan Padmanabhan Raghavan Rajkumar Ramakrishnan Ranganathan Saravanan
+Selvam Senthil Sivakumar Srinivas Subramaniam Vasudevan Venkatesh Vignesh Dhanush
+Kathir Arulmozhi Ilango Manikandan Prabhakar Sridhar Srikanth Sudarshan Raghunath
+# East / North-East, male
+Abhijit Anirban Arnab Arindam Debashish Indranil Kaushik Partha Pritam Rajarshi
+Sabyasachi Sayan Soumya Subhash Sudipto Tanmoy Biswajit Prosenjit Dibyendu
+Bhaskar Hiranmoy Jyotirmoy Rupam Bhupen Pranjal Dhrubajyoti
+# Muslim, male
+Aamir Adil Afzal Ahmed Altaf Arif Asif Danish Farhan Faisal Haider Hamid Imran Irfan
+Javed Junaid Kabir Kashif Mohsin Nadeem Naveed Rashid Rizwan Sajid Salim Shahid
+Shoaib Tariq Wasim Zaheer Zubair Yusuf Sohail Arshad Iqbal Owais Azhar Fahad
+# Sikh, male
+Amarjeet Baljit Gurdeep Gurpreet Harjeet Harpreet Inderjit Jaswinder Kuldeep Manjeet
+Paramjit Ranveer Sukhdeep Tejinder Balwinder Daljit Hardeep Jaspal
+# Parsi
+Cyrus Darius Jehangir Rustom Zubin Feroze Behram Kaizad
+# Female
+Aarti Aishwarya Akanksha Ananya Anjali Ankita Anusha Aparna Archana Arpita Avni
+Bhavana Chitra Deepa Deepika Divya Gayatri Geeta Harini Isha Jyoti Kajal Kavita Kavya
+Komal Kriti Madhuri Mansi Meena Meera Megha Monika Nandini Neha Nidhi Nikita Nisha
+Pallavi Poonam Prachi Pratibha Preeti Priya Priyanka Radhika Rashmi Rekha Ritu Riya
+Ruchi Sakshi Sangeeta Sarita Seema Shalini Shikha Shilpa Shreya Shruti Shweta Simran
+Sneha Sonal Sonia Sudha Sunita Supriya Swati Tanvi Trisha Usha Vandana Vidya Snehal
+# South, female
+Bhargavi Deepthi Hamsini Janani Kalyani Keerthana Lavanya Mythili Padmini Revathi
+Sahana Sangeetha Saranya Sindhu Sowmya Swathi Thenmozhi Vaishnavi Yamini Indira
+Kamala Nithya Pavithra Ramya Sharanya
+# East, female
+Debjani Ishita Moumita Paromita Rituparna Sanchita Sohini Sreeja Sukanya Tanushree
+Rupali Anwesha Barnali Madhurima
+# Muslim, female
+Aaliya Afreen Ayesha Farah Fatima Hina Huma Nazia Nusrat Rubina Sana Shabnam Shazia
+Zainab Zara Mehreen Rukhsar Saba Yasmin Alina Sadia
+# Sikh, female
+Amrita Gurleen Harleen Jasleen Manpreet Navjot Parminder Simranjit Kiranjeet Rupinder

@@ -11,10 +11,12 @@
 pub mod crypto;
 pub mod keystore;
 pub mod store;
+pub mod surrogate;
 
 pub use crypto::VaultKey;
 pub use keystore::{KeySource, load_or_create_key};
 pub use store::Store;
+pub use surrogate::{SurrogateGen, token};
 
 /// Errors produced by the vault. Messages never contain real values.
 #[derive(Debug, thiserror::Error)]

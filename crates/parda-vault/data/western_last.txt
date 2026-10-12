@@ -1,0 +1,35 @@
+# Family names from Europe, the Americas, East Asia, Africa and the Middle East.
+# Whitespace separated, 4+ letters, no everyday English words.
+Abbott Adams Alvarez Anderson Andrews Armstrong Atkinson Bailey Barnes Barrett
+Bennett Blackwood Bradford Brennan Bryant Burke Burton Caldwell Campbell Carlson
+Carroll Carter Castillo Chandler Clarke Coleman Collins Connolly Crawford Cunningham
+Curtis Dalton Daniels Davidson Davies Dawson Delgado Dixon Donovan Doyle Duffy
+Duncan Edwards Elliott Ellis Erikson Evans Ferguson Fernandez Fitzgerald Fleming
+Foster Fowler Franklin Gallagher Garcia Gibson Gilbert Gonzalez Gordon Graham
+Gregory Griffin Hamilton Hansen Harper Harrington Harris Harrison Hartley Hawkins
+Henderson Hendricks Hernandez Hoffman Holmes Hopkins Howell Hughes Jacobs Jameson
+Jenkins Jennings Jensen Johansson Johnson Kavanagh Keller Kennedy Kessler Kimball
+Kowalski Lambert Larsen Lawson Lindqvist Lindgren Lloyd Lopez Lowell
+Macdonald Mackenzie Maddox Marshall Martinez Matthews Maxwell McCarthy McKenzie
+Mendoza Meyer Mitchell Molina Montgomery Moreno Morgan Morrison Murphy Nakamura
+Navarro Nielsen Nolan Novak Olsen Ortega Osborne Owens Palmer Patterson Pearson
+Perez Perkins Peterson Phillips Powell Quinn Ramirez Ramos Randall Reynolds
+Richardson Rivera Roberts Robertson Robinson Rodriguez Rossi Russo Sanchez Schmidt
+Schneider Schultz Simmons Sinclair Sullivan Sutherland Sweeney Thompson Thornton
+Torres Townsend Tucker Vargas Vaughan Wagner Wallace Walsh Watanabe Watkins Watson
+Webster Whitaker Whitfield Wilkinson Williams Williamson Wilson Wolfe Yamamoto
+Tanaka Suzuki Takahashi Kobayashi Kimura Nguyen Pham Huang Zhang Zhao Okafor
+Okonkwo Adeyemi Mensah Boateng Nkosi Dlamini Haddad Khoury Nasser Farouk Petrov
+Ivanov Volkov Sokolov Novikov Kowalczyk Nowak Horvath Varga Papadopoulos Georgiou
+Moretti Ricci Bianchi Romano Esposito Colombo Lehmann Becker Fischer Hartmann
+Krause Dubois Lefebvre Moreau Laurent Girard Fontaine Rousseau Delacroix
+Silva Santos Oliveira Costa Ferreira Svensson Lindberg Halvorsen Andersen Virtanen
+Korhonen Kaplan Friedman Goldberg Rosenberg Cohen Ashford Bellamy Blythe
+Calloway Carmichael Ellsworth Fairbanks Galloway Hargrove Hollister
+Kingsley Langford Lockwood Merriweather Pembroke Prescott Radcliffe Rutherford
+Stratford Thackeray Underwood Whitmore Yardley Ainsworth Beckett Callahan Delaney
+Eastwood Farrell Gallowitz Holloway Ingram Jablonski Kowalewski Lindstrom Mancini
+Nakagawa Okamoto Pellegrini Quintero Rasmussen Salazar Takeda Ulrich Valdez Wexler
+Yoshida Zimmerman Acosta Bauer Cardenas Dominguez Espinoza Figueroa Guerrero
+Herrera Iglesias Jimenez Lindholm Medina Nyberg Orozco Pacheco Quiroga Rojas
+Sorensen Urquhart Villanueva Weiss

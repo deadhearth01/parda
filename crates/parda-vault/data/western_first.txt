@@ -1,0 +1,38 @@
+# Given names from Europe, the Americas, East Asia, Africa and the Middle East.
+# Whitespace separated, 4+ letters, no everyday English words.
+Aaron Adrian Alan Albert Alexander Alfred Andrew Anthony Arthur Benjamin Bernard
+Bradley Brandon Brian Bruce Bryan Caleb Calvin Cameron Carl Carlos Charles
+Christopher Clayton Clifford Colin Connor Craig Curtis Damian Daniel Darren David
+Dennis Derek Dominic Donald Douglas Duncan Dustin Edgar Edmund Edward Elliot Emmett
+Eric Ernest Ethan Eugene Evan Felix Fernando Francis Gabriel Gareth Gavin Geoffrey
+George Gerald Gilbert Gordon Graham Gregory Harold Harvey Hector Henry Herbert Howard
+Isaac Jacob Jason Jasper Jeffrey Jeremy Jerome Joel Jonathan Joseph Joshua
+Julian Justin Keith Kenneth Kevin Kieran Lawrence Leonard Leon Lewis Liam
+Lionel Lucas Luke Malcolm Marcus Martin Matthew Maurice Melvin Michael Mitchell
+Nathan Neil Nicholas Nigel Noah Norman Oliver Oscar Owen Patrick Paul Peter Philip
+Quentin Ralph Raymond Reginald Richard Robert Roger Roland Ronald Russell Samuel
+Scott Sean Sebastian Simon Stanley Stephen Steven Stuart Terence Theodore Thomas
+Timothy Tobias Trevor Tristan Victor Vincent Wallace Walter Warren Wesley William
+Zachary Diego Mateo Javier Alejandro Andres Rafael Ricardo Santiago Emilio Joaquin
+Lorenzo Marco Matteo Giovanni Luca Stefan Henrik Lars Anders Johan Pieter Dirk Klaus
+Jurgen Matthias Pierre Laurent Antoine Etienne Hiroshi Kenji Takeshi Haruto Minjun
+Kwame Kofi Chinedu Oluwaseun Tunde Emeka Tendai Thabo Sipho Omar Khalid Youssef
+Karim Hassan Mustafa Ibrahim Dmitri Sergei Nikolai Mikhail Pavel Tomasz Piotr
+Andrzej Bogdan Goran Nikos Dimitri Ahmet Mehmet Emre Kerem
+Abigail Adriana Alice Alicia Allison Amanda Amelia Andrea Angela Anna Annabel Ashley
+Audrey Barbara Beatrice Bethany Brenda Brianna Bridget Caitlin Camila Caroline
+Catherine Cecilia Charlotte Chelsea Chloe Christina Claire Clara Claudia Colleen
+Cynthia Danielle Deborah Denise Diana Donna Dorothy Eleanor Elena Elise Elizabeth
+Ellen Eloise Emily Emma Erica Esther Evelyn Fiona Frances Gabriela Gillian
+Gloria Gwendolyn Hannah Harriet Helen Imogen Irene Isabel Isabella Jacqueline Janet
+Jennifer Jessica Joanna Jocelyn Josephine Judith Juliet Kaitlyn Karen
+Katherine Kathleen Kelly Kimberly Laura Lauren Leah Leslie Linda Lindsay Lorraine
+Louise Lucia Lucy Lydia Madeline Margaret Maria Marion Martha Megan Melanie Melissa
+Michelle Miranda Molly Monica Nadia Naomi Natalie Nicole Olivia Pamela Patricia
+Paula Penelope Phoebe Priscilla Rachel Rebecca Rosalind Samantha Sandra
+Sarah Scarlett Sharon Sheila Shirley Sophie Stephanie Susan Sylvia Tamara
+Teresa Theresa Tiffany Valerie Vanessa Veronica Vivian Wendy Yvonne Lucinda
+Ingrid Astrid Freya Sigrid Annika Greta Margot Camille Amelie Juliette Elodie Chiara
+Giulia Francesca Valentina Carmen Ximena Valeria Daniela Mariana Akiko Yumi
+Haruka Soojin Jiyeon Amara Adaeze Chiamaka Ngozi Zanele Thandiwe Layla Leila Salma
+Mariam Svetlana Natasha Katarzyna Agnieszka Elif Zeynep

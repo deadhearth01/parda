@@ -1,0 +1,40 @@
+# Indian family names used for surrogates and for recognising Indian names.
+# Whitespace separated, 4+ letters, no everyday English words.
+# North
+Agarwal Agrawal Ahluwalia Arora Awasthi Bajaj Bajpai Bansal Batra Bhalla Bhardwaj
+Bhatia Bhatnagar Bhatt Chadha Chaturvedi Chauhan Chawla Chopra Dhawan Dhillon Dixit
+Dubey Dwivedi Garg Goel Goyal Grover Gupta Jaiswal Johar Kakkar Kapoor Kapur Khanna
+Khurana Kohli Lamba Luthra Malhotra Malik Mathur Mehra Mehrotra Mishra Mittal Nagpal
+Nanda Narang Oberoi Pandey Pathak Prasad Rajput Rana Rastogi Rathore Saxena Sethi
+Sharma Shukla Sinha Sodhi Srivastava Tandon Thakur Tiwari Trivedi Tripathi Upadhyay
+Vaid Varma Verma Vohra Walia Yadav Kumar Singh Chaudhary Chaudhry Bhargava Bisht Negi
+Rawat Joshi Bhandari Kashyap Raghuvanshi Sisodia Tomar Bhadauria Chandel
+# West
+Apte Bhagat Bhosale Chavan Deshmukh Deshpande Gaikwad Gokhale Inamdar Jadhav Kadam
+Kamat Karnik Khare Kulkarni Mhatre Naik Nadkarni Patil Pawar Phadke Ranade
+Sathe Sawant Shinde Shirke Thakkar Vaidya Desai Mehta Patel Shah Parikh Vyas Pandya
+Parmar Solanki Rathod Chudasama Jain Doshi Kothari Sanghvi Sheth Choksi Mistry
+Daruwala Wadia Irani Bharucha Kapadia Batliwala Lokhandwala Dalal Bhavsar Gohil
+# South
+Iyer Iyengar Nair Menon Pillai Reddy Naidu Hegde Shetty Kamath Gowda Krishnamurthy
+Subramanian Ramachandran Swaminathan Venkataraman Natarajan Balasubramanian Sundaram
+Chandrasekhar Rajagopal Gopalan Varghese Kurian Chacko Panicker Kurup Namboodiri
+Warrier Nambiar Shenoy Prabhu Acharya Murthy Raju Chettiar Mudaliar Gounder Rajan
+Srinivasan Vaidyanathan Parthasarathy Ramaswamy Annamalai Arumugam Palaniappan
+Karunakaran Kannan Elangovan Sekar Rangarajan Seshadri Jayaraman Thampi Pothen
+Mammen Eapen Kuriakose Chandy Moorthy Ramanathan Anand
+# East / North-East
+Banerjee Chakraborty Chatterjee Dasgupta Dutta Ganguly Ghosh Guha Haldar Lahiri
+Majumdar Mitra Mukherjee Nandi Saha Sanyal Sarkar Sengupta Basu Bhattacharya Bhowmik
+Chowdhury Kundu Mondal Moitra Mohanty Patnaik Pattnaik Mahapatra Barua Bora Gogoi
+Hazarika Kalita Saikia Phukan Talukdar Sarma Deka Baruah Choudhury Biswas Samanta
+# Muslim
+Ansari Baig Farooqui Hashmi Hussain Jafri Kazmi Khan Mirza Naqvi Qureshi Rizvi Sayed
+Shaikh Siddiqui Syed Usmani Zaidi Chishti Pathan Lodhi Abbasi Rehman Haque Kidwai
+Bukhari Ghani Shervani Bhatti
+# Sikh
+Bedi Brar Cheema Deol Dhaliwal Grewal Kang Sandhu Sekhon Sidhu Virk Bajwa Randhawa
+Hundal Bains Atwal Johal Sahota Chahal Sangha
+# Christian / Goan / Mangalorean
+Fernandes Pereira Rodrigues Pinto Gomes Lobo Almeida Coutinho Noronha Mascarenhas
+Saldanha Menezes Furtado Rebello Carvalho Dias Colaco Fonseca Monteiro
