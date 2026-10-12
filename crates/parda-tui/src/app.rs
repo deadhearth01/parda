@@ -117,6 +117,16 @@ impl App {
     pub fn refresh(&mut self, b: &mut dyn Backend) {
         match b.call(Request::Status) {
             Ok(s) => {
+                // A fresh dashboard starts with the daemon's recent history.
+                if self.events.is_empty()
+                    && let Some(recent) = s["activity"]["recent"].as_array()
+                {
+                    for v in recent {
+                        if let Ok(e) = serde_json::from_value::<Event>(v.clone()) {
+                            self.on_event(e);
+                        }
+                    }
+                }
                 self.status = Some(s);
                 self.connected = true;
             }

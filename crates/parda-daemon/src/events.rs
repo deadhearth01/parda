@@ -13,6 +13,8 @@ use tokio::sync::broadcast;
 
 /// Latency samples kept for percentiles.
 const LATENCY_SAMPLES: usize = 2000;
+/// Recent events kept for clients that connect later (no values in them).
+const RECENT_EVENTS: usize = 200;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct SurfaceStats {
@@ -30,6 +32,7 @@ pub struct SurfaceStats {
 struct ActivityInner {
     surfaces: BTreeMap<String, SurfaceStats>,
     latencies: VecDeque<u64>,
+    recent: VecDeque<Event>,
     last_event_ms: Option<u64>,
 }
 
@@ -66,6 +69,10 @@ impl Activity {
                 a.latencies.pop_front();
             }
         }
+        a.recent.push_back(e.clone());
+        while a.recent.len() > RECENT_EVENTS {
+            a.recent.pop_front();
+        }
         a.last_event_ms = Some(e.ts_ms);
     }
 
@@ -83,6 +90,7 @@ impl Activity {
                 "max": lat.last(),
             },
             "last_event_ms": a.last_event_ms,
+            "recent": a.recent,
         })
     }
 }
@@ -191,6 +199,7 @@ mod tests {
         assert_eq!(s["redacted_total"], 8);
         assert_eq!(s["latency_ms"]["p50"], 9);
         assert_eq!(s["latency_ms"]["max"], 100);
+        assert_eq!(s["recent"].as_array().unwrap().len(), 5);
     }
 
     #[test]

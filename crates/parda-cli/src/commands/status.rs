@@ -85,3 +85,15 @@ pub fn run(json: bool) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+pub fn stop() -> anyhow::Result<()> {
+    let p = paths()?;
+    match daemon_client(&p)? {
+        Some(mut c) => {
+            c.call(Request::Shutdown)?;
+            println!("daemon stopping");
+        }
+        None => println!("daemon: not running"),
+    }
+    Ok(())
+}

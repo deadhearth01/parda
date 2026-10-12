@@ -28,6 +28,37 @@ impl Backend for Client {
     }
 }
 
+/// Render `app` into a `width`×`height` text screen (no terminal needed).
+pub fn render_text(app: &App, width: u16, height: u16) -> String {
+    let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("test backend");
+    let _ = t.draw(|f| app.draw(f));
+    let buf = t.backend().buffer().clone();
+    let mut s = String::with_capacity(usize::from(width + 1) * usize::from(height));
+    for y in 0..buf.area.height {
+        let line: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+        s.push_str(line.trim_end());
+        s.push('\n');
+    }
+    s
+}
+
+/// Print every tab, as the live daemon would show it, as plain text
+/// (`parda tui --dump`): for smoke tests, bug reports and docs.
+pub fn dump(runtime_dir: &Path, width: u16, height: u16) -> anyhow::Result<String> {
+    let mut client = Client::connect(runtime_dir)
+        .map_err(|e| anyhow::anyhow!("cannot reach the daemon: {e}"))?;
+    let mut app = App::new();
+    let mut out = String::new();
+    for tab in Tab::ALL {
+        app.tab = tab;
+        app.refresh(&mut client);
+        out.push_str(&format!("──── {} ────\n", tab.title()));
+        out.push_str(&render_text(&app, width, height));
+    }
+    Ok(out)
+}
+
 /// Run the dashboard against the daemon listening in `runtime_dir`.
 pub fn run(runtime_dir: &Path) -> anyhow::Result<()> {
     let mut client = Client::connect(runtime_dir).map_err(|e| {

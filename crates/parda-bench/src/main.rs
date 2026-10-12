@@ -4,6 +4,7 @@
 mod eval;
 mod golden;
 mod latency;
+mod load;
 mod mock;
 
 use std::path::{Path, PathBuf};
@@ -53,6 +54,21 @@ enum Cmd {
         ep: String,
         #[arg(long, default_value_t = 30)]
         runs: usize,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Concurrent requests through a running proxy (to a mock upstream).
+    Load {
+        /// Proxy base URL.
+        #[arg(long, default_value = "http://127.0.0.1:8787")]
+        url: String,
+        #[arg(long, default_value_t = 16)]
+        concurrency: usize,
+        #[arg(long, default_value_t = 1000)]
+        requests: usize,
+        /// Ask for SSE streams instead of JSON.
+        #[arg(long)]
+        stream: bool,
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -316,6 +332,29 @@ fn main() -> anyhow::Result<()> {
             runs,
             out,
         } => run_latency(&model, models_dir(models), &ep, runs, out),
+        Cmd::Load {
+            url,
+            concurrency,
+            requests,
+            stream,
+            out,
+        } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            let report = rt.block_on(load::run(&url, concurrency, requests, stream))?;
+            eprintln!(
+                "{} requests ({} concurrent, stream={}): {:.0} req/s, p50 {:.1} ms, p95 {:.1} ms, p99 {:.1} ms, errors {}, leaks {}",
+                report.requests,
+                report.concurrency,
+                report.stream,
+                report.throughput_rps,
+                report.p50_ms,
+                report.p95_ms,
+                report.p99_ms,
+                report.errors,
+                report.leaks
+            );
+            write_json(out, &report)
+        }
         Cmd::MockUpstream { port, log } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(mock::serve(port, log))

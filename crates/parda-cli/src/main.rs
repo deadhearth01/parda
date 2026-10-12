@@ -33,7 +33,13 @@ enum Command {
         verbose: bool,
     },
     /// Open the terminal dashboard.
-    Tui,
+    Tui {
+        /// Print every tab once as plain text instead (for scripts and bug reports).
+        #[arg(long)]
+        dump: bool,
+    },
+    /// Stop the running daemon.
+    Stop,
     /// Show daemon status.
     Status {
         #[arg(long)]
@@ -164,7 +170,8 @@ fn main() {
             no_hotkey,
             verbose,
         } => commands::daemon::run(!no_proxy, !no_clipboard, !no_hotkey, verbose),
-        Command::Tui => commands::tui::run(),
+        Command::Tui { dump } => commands::tui::run(dump),
+        Command::Stop => commands::status::stop(),
         Command::Status { json } => commands::status::run(json),
         Command::Redact { text, scope, json } => commands::redact::redact(text, scope, json),
         Command::Restore { text, scope } => commands::redact::restore(text, scope),
