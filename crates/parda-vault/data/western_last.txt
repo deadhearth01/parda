@@ -33,3 +33,11 @@ Nakagawa Okamoto Pellegrini Quintero Rasmussen Salazar Takeda Ulrich Valdez Wexl
 Yoshida Zimmerman Acosta Bauer Cardenas Dominguez Espinoza Figueroa Guerrero
 Herrera Iglesias Jimenez Lindholm Medina Nyberg Orozco Pacheco Quiroga Rojas
 Sorensen Urquhart Villanueva Weiss
+Abernathy Ackerman Alcott Babcock Ballard Barlow Beaumont Bradshaw Buchanan Cassidy
+Corrigan Dempsey Devereux Donnelly Dougherty Driscoll Dunleavy Eberhardt Ellery
+Finnegan Fitzpatrick Flanagan Garrity Geraghty Gilchrist Grimaldi Halloran
+Hollingsworth Ibarra Jansen Kilpatrick Kinsella Lachance Lorenzen Lundqvist Mahoney
+Malone McAllister Merrick Montoya Navarrete Ochoa Pemberton Petrakis Quigley
+Rafferty Riordan Rosales Santangelo Schofield Shaughnessy Sheridan Stanton
+Strickland Thorsen Tierney Treadwell Vasquez Villalobos Waverly Wetherby Winslow
+Yeager Zamora
