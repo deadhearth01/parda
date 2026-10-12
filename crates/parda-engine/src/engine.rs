@@ -965,6 +965,12 @@ mod tests {
         assert!(not_a_name(t, &at("Tata Nexon")));
         assert!(not_a_name(t, &at("Jaipur")));
         assert!(!not_a_name(t, &at("Durga Prasad")));
+        // Words that are also names are never on the list (a miss is a leak).
+        let t2 = "Ask Claude, Pan and Ola";
+        for w in ["Claude", "Pan", "Ola"] {
+            let s = t2.find(w).unwrap();
+            assert!(!not_a_name(t2, &d(s, s + w.len(), EntityKind::Person, Source::Ml)), "{w}");
+        }
         // Only model guesses are filtered; the user's dictionary always wins.
         let mut dict = at("Jaipur");
         dict.source = Source::Dictionary;
