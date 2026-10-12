@@ -355,10 +355,10 @@ fn strictly_inside(inner: &Span, outer: &Span) -> bool {
 /// * anything strictly inside a format match (an e-mail, URL, UPI id, …) is
 ///   part of it: "ravi" inside "ravi.k@gmail.com", or a phone number inside
 ///   "9876543210@ybl", must not split it;
-/// * a model guess never overrides a format match it does not fully cover:
-///   the model calling a Voter ID a passport number, or an API key an
-///   e-mail, loses to the rule. A model span that strictly contains a rule
-///   match (an address around a PIN code) still competes in the merge.
+/// * a model guess never overrides a format match: the model calling a
+///   Voter ID a passport number, or an API key an e-mail, loses to the rule.
+///   Only a model address or name that strictly contains a rule match (an
+///   address around a PIN code) still competes in the merge.
 fn absorb_contained(mut dets: Vec<Detection>) -> Vec<Detection> {
     let rules: Vec<(Span, bool)> = dets
         .iter()
@@ -382,9 +382,12 @@ fn absorb_contained(mut dets: Vec<Detection>) -> Vec<Detection> {
             return false;
         }
         if d.source == Source::Ml {
-            return !rules
-                .iter()
-                .any(|(s, _)| s.overlaps(&d.span) && !strictly_inside(s, &d.span));
+            // Only an address or a name may wrap a format match (a PIN code
+            // inside an address); a model "e-mail" around an API key may not.
+            let container = matches!(d.kind, EntityKind::Address | EntityKind::Person);
+            return !rules.iter().any(|(s, _)| {
+                s.overlaps(&d.span) && !(container && strictly_inside(s, &d.span))
+            });
         }
         true
     });
@@ -1000,6 +1003,13 @@ mod tests {
             ),
         ]));
         assert_eq!(out[0].kind, EntityKind::VoterId);
+        // A model e-mail span that wraps an API key (plus a full stop) loses.
+        let out = merge(absorb_contained(vec![
+            d(7, 55, EntityKind::Email, Source::Ml),
+            d(7, 54, EntityKind::Secret, Source::Rule { validated: false }),
+        ]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, EntityKind::Secret);
         // …but a model address that covers a PIN code still wins.
         let out = merge(absorb_contained(vec![
             d(0, 40, EntityKind::Address, Source::Ml),
