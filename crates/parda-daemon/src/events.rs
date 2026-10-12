@@ -1,8 +1,97 @@
-//! Turning proxy and clipboard happenings into IPC events for the TUI.
+//! Turning proxy and clipboard happenings into IPC events for the TUI, and
+//! keeping running totals of them for `parda status` and the dashboard.
+
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Mutex;
 
 use parda_clip::ClipEvent;
 use parda_ipc::Event;
 use parda_proxy::ProxyEvent;
+use serde::Serialize;
+use serde_json::{Value, json};
+use tokio::sync::broadcast;
+
+/// Latency samples kept for percentiles.
+const LATENCY_SAMPLES: usize = 2000;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SurfaceStats {
+    /// Events (requests, pastes, copies, CLI calls).
+    pub events: u64,
+    /// Values replaced.
+    pub redacted: u64,
+    /// Warnings and errors.
+    pub warnings: u64,
+    /// Replacements by kind on this surface.
+    pub kinds: BTreeMap<String, u64>,
+}
+
+#[derive(Default)]
+struct ActivityInner {
+    surfaces: BTreeMap<String, SurfaceStats>,
+    latencies: VecDeque<u64>,
+    last_event_ms: Option<u64>,
+}
+
+/// Running totals per surface (proxy, clipboard, cli) since the daemon
+/// started. Values are never recorded, only kinds and counts.
+#[derive(Default)]
+pub struct Activity {
+    inner: Mutex<ActivityInner>,
+}
+
+fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let i = ((sorted.len() - 1) as f64 * p).round() as usize;
+    sorted.get(i).copied()
+}
+
+impl Activity {
+    pub fn record(&self, e: &Event) {
+        let mut a = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let s = a.surfaces.entry(e.surface.clone()).or_default();
+        s.events += 1;
+        for (k, n) in &e.counts {
+            s.redacted += u64::from(*n);
+            *s.kinds.entry(k.clone()).or_insert(0) += u64::from(*n);
+        }
+        if e.level != "info" {
+            s.warnings += 1;
+        }
+        if let Some(ms) = e.latency_ms {
+            a.latencies.push_back(ms);
+            while a.latencies.len() > LATENCY_SAMPLES {
+                a.latencies.pop_front();
+            }
+        }
+        a.last_event_ms = Some(e.ts_ms);
+    }
+
+    pub fn snapshot(&self) -> Value {
+        let a = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut lat: Vec<u64> = a.latencies.iter().copied().collect();
+        lat.sort_unstable();
+        json!({
+            "surfaces": a.surfaces,
+            "redacted_total": a.surfaces.values().map(|s| s.redacted).sum::<u64>(),
+            "latency_ms": {
+                "samples": lat.len(),
+                "p50": percentile(&lat, 0.5),
+                "p95": percentile(&lat, 0.95),
+                "max": lat.last(),
+            },
+            "last_event_ms": a.last_event_ms,
+        })
+    }
+}
+
+/// Record an event and broadcast it to subscribers.
+pub fn emit(tx: &broadcast::Sender<Event>, activity: &Activity, e: Event) {
+    activity.record(&e);
+    let _ = tx.send(e);
+}
 
 pub fn from_proxy(ev: &ProxyEvent) -> Event {
     let total: u32 = ev.counts.values().sum();
@@ -81,6 +170,28 @@ pub fn from_clip(ev: &ClipEvent) -> Event {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn activity_totals_and_percentiles() {
+        let a = Activity::default();
+        for ms in [5u64, 7, 9, 100] {
+            let mut e = Event::now("proxy", "x");
+            e.counts.insert("Person".into(), 2);
+            e.latency_ms = Some(ms);
+            a.record(&e);
+        }
+        let mut w = Event::now("clipboard", "y");
+        w.level = "warn".into();
+        a.record(&w);
+        let s = a.snapshot();
+        assert_eq!(s["surfaces"]["proxy"]["events"], 4);
+        assert_eq!(s["surfaces"]["proxy"]["redacted"], 8);
+        assert_eq!(s["surfaces"]["proxy"]["kinds"]["Person"], 8);
+        assert_eq!(s["surfaces"]["clipboard"]["warnings"], 1);
+        assert_eq!(s["redacted_total"], 8);
+        assert_eq!(s["latency_ms"]["p50"], 9);
+        assert_eq!(s["latency_ms"]["max"], 100);
+    }
 
     #[test]
     fn proxy_summary() {

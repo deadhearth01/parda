@@ -147,39 +147,95 @@ fn percentile(mut xs: Vec<u64>, p: f64) -> Option<u64> {
     xs.get(i).copied()
 }
 
+fn num(v: &Value) -> u64 {
+    v.as_u64().unwrap_or(0)
+}
+
+fn kv_rows(map: &Value) -> Vec<(String, u64)> {
+    let mut rows: Vec<(String, u64)> = map
+        .as_object()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), num(v))).collect())
+        .unwrap_or_default();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    rows
+}
+
 fn dashboard(app: &App, f: &mut Frame, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
         .split(area);
     let null = Value::Null;
     let st = app.status.as_ref().unwrap_or(&null);
-    let latencies: Vec<u64> = app
-        .events
-        .iter()
-        .filter(|e| e.surface == "proxy")
-        .filter_map(|e| e.latency_ms)
-        .collect();
+    let stats = &st["stats"];
+    let act = &st["activity"];
+
+    // Latency: daemon-side percentiles, else what this session has seen.
     let lat = match (
-        percentile(latencies.clone(), 0.5),
-        percentile(latencies, 0.95),
+        act["latency_ms"]["p50"].as_u64(),
+        act["latency_ms"]["p95"].as_u64(),
     ) {
-        (Some(a), Some(b)) => format!("p50 {a} ms · p95 {b} ms"),
-        _ => "no proxied requests yet".into(),
+        (Some(a), Some(b)) => format!(
+            "p50 {a} ms · p95 {b} ms · max {} ms ({} requests)",
+            text(&act["latency_ms"]["max"]),
+            text(&act["latency_ms"]["samples"])
+        ),
+        _ => {
+            let latencies: Vec<u64> = app
+                .events
+                .iter()
+                .filter(|e| e.surface == "proxy")
+                .filter_map(|e| e.latency_ms)
+                .collect();
+            match (
+                percentile(latencies.clone(), 0.5),
+                percentile(latencies, 0.95),
+            ) {
+                (Some(a), Some(b)) => format!("p50 {a} ms · p95 {b} ms"),
+                _ => "no proxied requests yet".into(),
+            }
+        }
     };
     let model = match (st["model"].as_str(), st["model_error"].as_str()) {
         (Some(m), _) => m.to_string(),
         (None, Some(e)) => format!("NOT LOADED — {e}"),
         _ => "none (rules only)".into(),
     };
+    let ml_calls = num(&stats["ml_calls"]);
+    let ml_avg = if ml_calls > 0 {
+        format!(
+            "{:.1} ms avg",
+            num(&stats["ml_ms_total"]) as f64 / ml_calls as f64
+        )
+    } else {
+        "-".into()
+    };
+    let frags = num(&stats["fragments"]);
+    let hit_rate = if frags > 0 {
+        format!(
+            "{:.0}%",
+            100.0 * num(&stats["cache_hits"]) as f64 / frags as f64
+        )
+    } else {
+        "-".into()
+    };
+    let total: u64 = kv_rows(&stats["entities"]).iter().map(|(_, n)| n).sum();
     let lines = vec![
+        Line::from(vec![
+            Span::styled("filtered   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{total} values"),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" in {} redactions", text(&stats["redactions"]))),
+        ]),
         Line::from(format!(
             "daemon     {}",
             if app.connected {
                 format!(
-                    "running · pid {} · up {} s",
+                    "running · pid {} · up {}",
                     text(&st["pid"]),
-                    text(&st["uptime_s"])
+                    uptime(num(&st["uptime_s"]))
                 )
             } else {
                 "unreachable".into()
@@ -208,11 +264,14 @@ fn dashboard(app: &App, f: &mut Frame, area: Rect) {
         )),
         Line::from(format!("latency    {lat}")),
         Line::from(format!(
-            "activity   {} redactions · {} cache hits · {} ML calls ({} failed)",
-            text(s(st, &["stats", "redactions"])),
-            text(s(st, &["stats", "cache_hits"])),
-            text(s(st, &["stats", "ml_calls"])),
-            text(s(st, &["stats", "ml_failures"])),
+            "model use  {ml_calls} calls · {ml_avg} · {} failed · {} skipped",
+            num(&stats["ml_failures"]),
+            num(&stats["ml_skipped"])
+        )),
+        Line::from(format!(
+            "cache      {hit_rate} hits ({} of {} fragments)",
+            num(&stats["cache_hits"]),
+            frags
         )),
     ];
     f.render_widget(
@@ -222,21 +281,59 @@ fn dashboard(app: &App, f: &mut Frame, area: Rect) {
         cols[0],
     );
 
-    let rows: Vec<Row> = st["stats"]["entities"]
-        .as_object()
-        .map(|m| {
-            m.iter()
-                .map(|(k, v)| Row::new(vec![Cell::from(k.clone()), Cell::from(text(v))]))
-                .collect()
-        })
-        .unwrap_or_default();
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(cols[1]);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let kind_rows: Vec<Row> = kv_rows(&stats["entities"])
+        .into_iter()
+        .map(|(k, n)| Row::new(vec![Cell::from(k), Cell::from(n.to_string())]))
+        .collect();
+    let title = format!("Filtered by kind ({total})");
     let table = Table::new(
-        rows,
+        kind_rows,
         [Constraint::Percentage(70), Constraint::Percentage(30)],
     )
-    .header(Row::new(vec!["kind", "redacted"]).style(Style::default().add_modifier(Modifier::BOLD)))
-    .block(block("Redacted since start"));
-    f.render_widget(table, cols[1]);
+    .header(Row::new(vec!["kind", "count"]).style(bold))
+    .block(block(&title));
+    f.render_widget(table, right[0]);
+
+    let mut rows: Vec<Row> = kv_rows(&stats["by_source"])
+        .into_iter()
+        .map(|(k, n)| Row::new(vec!["found by".to_string(), k, n.to_string()]))
+        .collect();
+    if let Some(surfaces) = act["surfaces"].as_object() {
+        for (name, s) in surfaces {
+            if name == "daemon" {
+                continue;
+            }
+            rows.push(Row::new(vec![
+                "surface".to_string(),
+                format!("{name} ({} events)", num(&s["events"])),
+                num(&s["redacted"]).to_string(),
+            ]));
+        }
+    }
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(25),
+            Constraint::Percentage(50),
+            Constraint::Percentage(25),
+        ],
+    )
+    .header(Row::new(vec!["", "source", "values"]).style(bold))
+    .block(block("Where from"));
+    f.render_widget(table, right[1]);
+}
+
+fn uptime(s: u64) -> String {
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m {}s", s / 60, s % 60),
+        _ => format!("{}h {}m", s / 3600, (s / 60) % 60),
+    }
 }
 
 fn live(app: &App, f: &mut Frame, area: Rect) {
@@ -469,8 +566,12 @@ mod tests {
                 Request::Status => json!({
                     "pid": 42, "uptime_s": 7, "proxy": "127.0.0.1:8787", "clipboard": true,
                     "hotkey": "default", "model": "gliner-pii-edge", "mode": "strict", "style": "surrogate",
-                    "stats": {"redactions": 3, "cache_hits": 1, "ml_calls": 2, "ml_failures": 0,
-                              "entities": {"Person": 2, "Email": 1}},
+                    "stats": {"redactions": 3, "cache_hits": 1, "fragments": 4, "ml_calls": 2,
+                              "ml_ms_total": 18, "ml_failures": 0,
+                              "entities": {"Person": 2, "Email": 1},
+                              "by_source": {"model": 2, "rules": 1}},
+                    "activity": {"surfaces": {"proxy": {"events": 2, "redacted": 3, "warnings": 0, "kinds": {}}},
+                                 "latency_ms": {"samples": 2, "p50": 4, "p95": 9, "max": 9}},
                     "paths": {"config": "/x/config.toml"}
                 }),
                 Request::Redact { text, .. } => json!({
@@ -537,6 +638,10 @@ mod tests {
         }
         assert!(screen.contains("pid 42") && screen.contains("gliner-pii-edge"));
         assert!(screen.contains("Person"));
+        assert!(screen.contains("3 values"), "{screen}");
+        assert!(screen.contains("p95 9 ms"));
+        assert!(screen.contains("model") && screen.contains("proxy (2 events)"));
+        assert!(screen.contains("9.0 ms avg") && screen.contains("25% hits"));
         for (k, want) in [
             ('2', "Live ("),
             ('3', "Input"),

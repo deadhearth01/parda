@@ -18,6 +18,8 @@ mod ml;
 mod restore;
 mod stream;
 
-pub use engine::{Engine, EngineError, EngineOptions, EngineStats, Redaction, Replacement};
+pub use engine::{
+    Engine, EngineError, EngineOptions, EngineStats, Redaction, Replacement, source_label,
+};
 pub use fragment::{DEFAULT_MAX_FRAGMENT_BYTES, split_fragments};
 pub use stream::StreamRestorer;

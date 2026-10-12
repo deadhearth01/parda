@@ -15,7 +15,7 @@ use parda_ml::ExecutionProvider;
 use serde_json::json;
 use tokio::sync::{broadcast, watch};
 
-use crate::events;
+use crate::events::{self, Activity, emit};
 use crate::paths::{Paths, load_config, load_rules, write_private};
 
 /// Which services to start.
@@ -82,6 +82,7 @@ struct Shared {
     engine: Engine,
     config: RwLock<Config>,
     events: broadcast::Sender<Event>,
+    activity: Arc<Activity>,
     clip: Option<ClipHandle>,
     proxy_addr: RwLock<Option<SocketAddr>>,
     model_error: Option<String>,
@@ -114,14 +115,14 @@ impl Daemon {
         )
         .context("opening the vault")?;
         let (events, _) = broadcast::channel(512);
+        let activity = Arc::new(Activity::default());
         let clip = if opts.clipboard && config.clipboard.enabled {
             let tx = events.clone();
+            let act = activity.clone();
             match parda_clip::spawn(
                 engine.clone(),
                 config.clipboard.clone(),
-                Box::new(move |e| {
-                    let _ = tx.send(events::from_clip(&e));
-                }),
+                Box::new(move |e| emit(&tx, &act, events::from_clip(&e))),
             ) {
                 Ok(h) => Some(h),
                 Err(e) => {
@@ -139,6 +140,7 @@ impl Daemon {
                 engine,
                 config: RwLock::new(config),
                 events,
+                activity,
                 clip,
                 proxy_addr: RwLock::new(None),
                 model_error,
@@ -207,12 +209,11 @@ impl Daemon {
             let state =
                 parda_proxy::ProxyState::new(shared.engine.clone(), config.proxy.clone(), ptx)?;
             let events = shared.events.clone();
+            let activity = shared.activity.clone();
             tokio::spawn(async move {
                 loop {
                     match prx.recv().await {
-                        Ok(ev) => {
-                            let _ = events.send(events::from_proxy(&ev));
-                        }
+                        Ok(ev) => emit(&events, &activity, events::from_proxy(&ev)),
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
@@ -406,6 +407,7 @@ impl DaemonHandle {
             "mode": config.detect.mode,
             "style": config.replace.style,
             "stats": s.engine.stats(),
+            "activity": s.activity.snapshot(),
             "paths": {
                 "config": s.paths.config_file(),
                 "rules": s.paths.rules_file(),
@@ -450,7 +452,7 @@ impl DaemonHandle {
                                 format!("redacted {} value(s)", counts.values().sum::<u32>()),
                             );
                             e.counts = counts;
-                            let _ = s.events.send(e);
+                            emit(&s.events, &s.activity, e);
                         }
                         Response::ok(json!({
                             "text": r.text,

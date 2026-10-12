@@ -55,11 +55,33 @@ pub fn run(json: bool) -> anyhow::Result<()> {
         "activity:  {} redactions, {} cache hits, {} ML calls ({} failed)",
         st["redactions"], st["cache_hits"], st["ml_calls"], st["ml_failures"]
     );
-    if let Some(ents) = st["entities"].as_object()
-        && !ents.is_empty()
-    {
-        let list: Vec<String> = ents.iter().map(|(k, v)| format!("{k} {v}")).collect();
-        println!("found:     {}", list.join(", "));
+    let line = |label: &str, v: &serde_json::Value| {
+        if let Some(m) = v.as_object()
+            && !m.is_empty()
+        {
+            let list: Vec<String> = m.iter().map(|(k, v)| format!("{k} {v}")).collect();
+            println!("{label}{}", list.join(", "));
+        }
+    };
+    line("found:     ", &st["entities"]);
+    line("by tier:   ", &st["by_source"]);
+    if let Some(surfaces) = s["activity"]["surfaces"].as_object() {
+        for (name, v) in surfaces.iter().filter(|(n, _)| *n != "daemon") {
+            println!(
+                "{:<10} {} events, {} values redacted, {} warnings",
+                format!("{name}:"),
+                v["events"],
+                v["redacted"],
+                v["warnings"]
+            );
+        }
+    }
+    let lat = &s["activity"]["latency_ms"];
+    if lat["p50"].is_u64() {
+        println!(
+            "latency:   p50 {} ms, p95 {} ms, max {} ms (added by parda per request)",
+            lat["p50"], lat["p95"], lat["max"]
+        );
     }
     Ok(())
 }
