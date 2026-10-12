@@ -16,6 +16,7 @@ use parda_core::UnscannedMedia;
 use parda_engine::{Engine, EngineError};
 use serde_json::Value;
 
+use crate::body::{self, BodyError};
 use crate::error::error_response;
 use crate::route::{Provider, route};
 use crate::sse::{Restorers, StreamRewriter};
@@ -227,6 +228,36 @@ fn engine_error(provider: Provider, e: &EngineError) -> (Response, String) {
     }
 }
 
+fn body_error(provider: Provider, e: &BodyError) -> (Response, String) {
+    let (status, code, message) = match e {
+        BodyError::UnsupportedEncoding(coding) => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "parda_unsupported_encoding",
+            format!(
+                "parda cannot decode Content-Encoding `{coding}` (supported: gzip, deflate, br, \
+                 zstd); the request was not sent"
+            ),
+        ),
+        BodyError::TooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "parda_body_too_large",
+            "the decoded request body exceeds proxy.max_body_bytes".to_string(),
+        ),
+        BodyError::Unparseable(why) => (
+            StatusCode::BAD_REQUEST,
+            "parda_unparseable_body",
+            format!(
+                "parda could not read the request body as JSON ({why}), so it could not \
+                 redact it; the request was not sent"
+            ),
+        ),
+    };
+    (
+        error_response(provider, status, code, &message),
+        code.into(),
+    )
+}
+
 fn finish(
     state: &ProxyState,
     mut event: ProxyEvent,
@@ -284,13 +315,24 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         }
     };
 
-    // Redact the request.
+    // Redact the request. A body parda cannot read is refused, never
+    // forwarded as is.
     let mut out_body = body.clone();
     let mut redact_ms = 0;
+    let mut decoded = false;
     if let Some(walker) = request_walker(provider)
         && !body.is_empty()
-        && let Ok(v) = serde_json::from_slice::<Value>(&body)
     {
+        let v = match body::decode(&parts.headers, body, state.cfg.max_body_bytes)
+            .and_then(|raw| body::parse_json(&raw))
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let (resp, code) = body_error(provider, &e);
+                return finish(&state, event, resp, Some(code));
+            }
+        };
+        decoded = body::is_encoded(&parts.headers);
         let started = Instant::now();
         let engine = state.engine.clone();
         let scope2 = scope.clone();
@@ -342,7 +384,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
     let url = format!("{}{pq}", base.trim_end_matches('/'));
     let mut rb = state.http.request(parts.method.clone(), &url);
     for (k, v) in &parts.headers {
-        if forward_request_header(k) {
+        if forward_request_header(k) && !(decoded && k == header::CONTENT_ENCODING) {
             rb = rb.header(k, v);
         }
     }

@@ -12,6 +12,7 @@
 //! untouched and are never stored.
 
 mod anthropic;
+mod body;
 mod error;
 mod guard;
 mod openai_chat;
