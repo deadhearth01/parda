@@ -126,6 +126,7 @@ pub struct Setup {
     pub events: broadcast::Receiver<ProxyEvent>,
     pub mock: Mock,
     pub client: reqwest::Client,
+    pub state: Arc<ProxyState>,
 }
 
 impl Setup {
@@ -192,7 +193,8 @@ pub async fn setup_with(
     let state = ProxyState::new(engine.clone(), config.proxy.clone(), tx).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = listener.local_addr().unwrap();
-    tokio::spawn(async move { parda_proxy::serve(listener, state).await.unwrap() });
+    let served = state.clone();
+    tokio::spawn(async move { parda_proxy::serve(listener, served).await.unwrap() });
     Setup {
         _dir: dir,
         engine,
@@ -200,6 +202,7 @@ pub async fn setup_with(
         events: rx,
         mock,
         client: reqwest::Client::new(),
+        state,
     }
 }
 

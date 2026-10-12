@@ -25,7 +25,7 @@ mod sse;
 mod walk;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use parda_core::ProxyConfig;
@@ -34,7 +34,7 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 
 pub use route::{Provider, normalize_path};
-pub use server::{SCOPE_HEADER, router, serve, serve_with_shutdown};
+pub use server::{SCOPE_HEADER, bind, router, serve, serve_with_shutdown};
 pub use sse::{SseEvent, parse_sse, serialize};
 
 /// One proxied request, for the event feed. Never holds raw values.
@@ -61,7 +61,7 @@ pub struct ProxyEvent {
 
 pub struct ProxyState {
     pub engine: Engine,
-    pub cfg: ProxyConfig,
+    cfg: RwLock<Arc<ProxyConfig>>,
     pub events: broadcast::Sender<ProxyEvent>,
     pub http: reqwest::Client,
 }
@@ -80,9 +80,20 @@ impl ProxyState {
             .build()?;
         Ok(Arc::new(ProxyState {
             engine,
-            cfg,
+            cfg: RwLock::new(Arc::new(cfg)),
             events,
             http,
         }))
+    }
+
+    /// The settings in force; each request uses one snapshot.
+    pub fn config(&self) -> Arc<ProxyConfig> {
+        self.cfg.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Apply new settings to the running proxy. `listen` and `enabled` only
+    /// take effect on restart; everything else applies to the next request.
+    pub fn set_config(&self, cfg: ProxyConfig) {
+        *self.cfg.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(cfg);
     }
 }

@@ -2,17 +2,19 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::Context;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::response::Response;
 use bytes::Bytes;
 use http::header::{self, HeaderName};
 use http::{HeaderMap, StatusCode};
-use parda_core::UnscannedMedia;
+use parda_core::{ProxyConfig, UnscannedMedia};
 use parda_engine::{Engine, EngineError};
 use serde_json::Value;
 
@@ -31,12 +33,48 @@ pub fn router(state: Arc<ProxyState>) -> Router {
     Router::new().fallback(handle).with_state(state)
 }
 
+/// Bind `cfg.listen`, refusing any non-loopback address unless
+/// `proxy.allow_non_loopback` is set (the proxy holds no credentials of its
+/// own: anyone who can reach it can send through it and read restored
+/// answers).
+pub async fn bind(cfg: &ProxyConfig) -> anyhow::Result<tokio::net::TcpListener> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&cfg.listen)
+        .await
+        .with_context(|| format!("resolving proxy.listen = {}", cfg.listen))?
+        .collect();
+    if addrs.is_empty() {
+        anyhow::bail!("proxy.listen = {} resolves to no address", cfg.listen);
+    }
+    if !cfg.allow_non_loopback
+        && let Some(a) = addrs.iter().find(|a| !a.ip().is_loopback())
+    {
+        anyhow::bail!(
+            "proxy.listen = {} resolves to {a}, which is not a loopback address; parda only \
+             serves this machine unless proxy.allow_non_loopback = true",
+            cfg.listen
+        );
+    }
+    let mut last = None;
+    for a in addrs {
+        match tokio::net::TcpListener::bind(a).await {
+            Ok(l) => return Ok(l),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(anyhow::Error::from(last.expect("at least one address"))
+        .context(format!("binding the proxy on {}", cfg.listen)))
+}
+
 /// Serve until the listener fails.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     state: Arc<ProxyState>,
 ) -> anyhow::Result<()> {
-    axum::serve(listener, router(state)).await?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -46,9 +84,12 @@ pub async fn serve_with_shutdown(
     state: Arc<ProxyState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
     Ok(())
 }
 
@@ -308,6 +349,11 @@ fn finish(
 
 async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
+    let cfg = state.config();
+    let peer = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(a)| *a);
     // Route (and forward) the path the way the upstream will read it, so
     // `/v1//messages` or `/v1/%6Dessages` cannot slip past the walkers.
     let path = normalize_path(parts.uri.path());
@@ -326,12 +372,12 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         error: None,
     };
 
-    if let Err(msg) = guard::check(&parts.headers, &state.cfg) {
+    if let Err(msg) = guard::check(&parts.headers, &parts.uri, peer, &cfg) {
         let resp = error_response(provider, StatusCode::FORBIDDEN, "parda_forbidden", msg);
         return finish(&state, event, resp, Some("parda_forbidden".into()));
     }
     let scope = scope_of(&parts.headers);
-    let body = match axum::body::to_bytes(body, state.cfg.max_body_bytes).await {
+    let body = match axum::body::to_bytes(body, cfg.max_body_bytes).await {
         Ok(b) => b,
         Err(_) => {
             let resp = error_response(
@@ -347,7 +393,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
     // An endpoint parda cannot redact may only carry bodies without text.
     if !provider.rewrites()
         && !body.is_empty()
-        && !carries_no_text(&parts.headers, &body, state.cfg.max_body_bytes)
+        && !carries_no_text(&parts.headers, &body, cfg.max_body_bytes)
     {
         let resp = error_response(
             provider,
@@ -370,7 +416,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
     if let Some(walker) = request_walker(provider)
         && !body.is_empty()
     {
-        let v = match body::decode(&parts.headers, body, state.cfg.max_body_bytes)
+        let v = match body::decode(&parts.headers, body, cfg.max_body_bytes)
             .and_then(|raw| body::parse_json(&raw))
         {
             Ok(v) => v,
@@ -394,7 +440,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
                 event.unknown_parts = r.unscanned.unknown;
                 event.paused = r.paused;
                 event.added_ms = redact_ms;
-                if r.unscanned.total() > 0 && state.cfg.unscanned_media == UnscannedMedia::Block {
+                if r.unscanned.total() > 0 && cfg.unscanned_media == UnscannedMedia::Block {
                     let resp = error_response(
                         provider,
                         StatusCode::BAD_REQUEST,
@@ -425,9 +471,9 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
 
     // Forward.
     let base = if provider.is_anthropic() {
-        &state.cfg.anthropic_upstream
+        &cfg.anthropic_upstream
     } else {
-        &state.cfg.openai_upstream
+        &cfg.openai_upstream
     };
     let url = match parts.uri.query() {
         Some(q) => format!("{}{path}?{q}", base.trim_end_matches('/')),
