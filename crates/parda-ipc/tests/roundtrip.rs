@@ -15,10 +15,12 @@ use parda_ipc::{
     socket_name,
 };
 use serde_json::json;
+#[cfg(unix)]
+use tokio::{io::AsyncReadExt, task::JoinSet};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::broadcast,
-    task::{JoinHandle, JoinSet},
+    task::JoinHandle,
 };
 
 const LIMIT: usize = MAX_LINE_BYTES;

@@ -2712,6 +2712,7 @@ dependencies = [
  "parda-detect",
  "parda-engine",
  "parda-ml",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

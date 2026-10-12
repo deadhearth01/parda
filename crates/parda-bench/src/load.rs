@@ -45,7 +45,7 @@ fn prompt(i: usize) -> (String, String) {
     let name = NAMES[i % NAMES.len()];
     let email = format!("user{}.test@gmail.com", i % 97);
     // Half the requests repeat earlier text (agents resend history).
-    let tail = if i % 2 == 0 {
+    let tail = if i.is_multiple_of(2) {
         String::new()
     } else {
         format!(" Ticket #{i}.")
