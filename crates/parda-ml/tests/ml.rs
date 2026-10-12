@@ -192,3 +192,33 @@ fn fine_tuned_model_is_listed_with_pinned_files() {
     );
     assert!(m.files.iter().all(|f| f.sha256.len() == 64 && f.size > 0));
 }
+
+/// Batch composition must not change what is found (dynamic INT8 quantization
+/// scales activations over the whole padded batch). Runs only when
+/// PARDA_TEST_MODEL_DIR points at an installed model.
+#[test]
+#[ignore]
+fn results_do_not_depend_on_batch_neighbours() {
+    let Ok(dir) = std::env::var("PARDA_TEST_MODEL_DIR") else {
+        return;
+    };
+    let det =
+        parda_ml::GlinerDetector::load(Path::new(&dir), 0.4, parda_ml::ExecutionProvider::Cpu)
+            .unwrap();
+    use parda_core::MlDetector;
+    let texts = [
+        "Need a birthday message for my nani, Kamla Devi, turning 80.",
+        "Rohit bhaiya ka phone switched off aa raha hai since morning",
+        "Prepare minutes: present were Rekha Iyer, Farhan Akhtar Siddiqui and Jaspreet Singh, and we discussed the quarterly budget, hiring plan and the vendor contract renewal in detail.",
+    ];
+    let batch = det.detect_batch(&texts).unwrap();
+    for (t, b) in texts.iter().zip(&batch) {
+        let single = det.detect_batch(&[*t]).unwrap().remove(0);
+        let spans = |v: &[parda_core::Detection]| {
+            v.iter()
+                .map(|d| (d.span, d.kind.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(spans(b), spans(&single), "batch changed results for {t:?}");
+    }
+}

@@ -18,6 +18,10 @@ pub struct GlinerDetector {
     labels: Vec<String>,
     kinds: Vec<EntityKind>,
     name: String,
+    /// Run one text per inference. Dynamically quantized models scale
+    /// activations over the whole padded batch, so batch neighbours would
+    /// change each other's results.
+    one_at_a_time: bool,
 }
 
 impl GlinerDetector {
@@ -31,14 +35,12 @@ impl GlinerDetector {
             .with_threads(threads)
             .with_execution_providers(ep.dispatch());
         let params = Parameters::default().with_threshold(threshold);
-        let model = GLiNER::<TokenMode>::new(
-            params,
-            runtime,
-            dir.join("tokenizer.json"),
-            crate::manager::model_file(dir)
-                .with_context(|| format!("no ONNX model in {}", dir.display()))?,
-        )
-        .map_err(|e| anyhow::anyhow!("loading GLiNER model from {}: {e}", dir.display()))?;
+        let model_path = crate::manager::model_file(dir)
+            .with_context(|| format!("no ONNX model in {}", dir.display()))?;
+        let one_at_a_time = model_path.file_name() == Some("model_quint8.onnx".as_ref());
+        let model =
+            GLiNER::<TokenMode>::new(params, runtime, dir.join("tokenizer.json"), model_path)
+                .map_err(|e| anyhow::anyhow!("loading GLiNER model from {}: {e}", dir.display()))?;
         let (labels, kinds) = ml_labels()
             .into_iter()
             .map(|(l, k)| (l.to_string(), k))
@@ -48,6 +50,7 @@ impl GlinerDetector {
             labels,
             kinds,
             name: "gliner".into(),
+            one_at_a_time,
         })
     }
 
@@ -68,11 +71,30 @@ impl MlDetector for GlinerDetector {
         let idx: Vec<usize> = (0..texts.len())
             .filter(|&i| texts[i].chars().any(char::is_alphanumeric))
             .collect();
-        if idx.is_empty() {
-            return Ok(out);
+        let groups: Vec<Vec<usize>> = if self.one_at_a_time {
+            idx.into_iter().map(|i| vec![i]).collect()
+        } else if idx.is_empty() {
+            Vec::new()
+        } else {
+            vec![idx]
+        };
+        for group in groups {
+            self.infer(texts, &group, &mut out)?;
         }
+        Ok(out)
+    }
+}
+
+impl GlinerDetector {
+    /// Run one inference over `texts[i]` for each `i` in `group`.
+    fn infer(
+        &self,
+        texts: &[&str],
+        group: &[usize],
+        out: &mut [Vec<Detection>],
+    ) -> anyhow::Result<()> {
         let input = TextInput::new(
-            idx.iter().map(|&i| texts[i].to_string()).collect(),
+            group.iter().map(|&i| texts[i].to_string()).collect(),
             self.labels.clone(),
         )
         .map_err(|e| anyhow::anyhow!("building GLiNER input: {e}"))?;
@@ -81,7 +103,7 @@ impl MlDetector for GlinerDetector {
             .inference(input)
             .map_err(|e| anyhow::anyhow!("GLiNER inference: {e}"))?;
         for (seq, spans) in output.spans.iter().enumerate() {
-            let target = idx[seq];
+            let target = group[seq];
             let text = texts[target];
             for s in spans {
                 let (start, end) = s.offsets();
@@ -106,6 +128,6 @@ impl MlDetector for GlinerDetector {
                 });
             }
         }
-        Ok(out)
+        Ok(())
     }
 }
