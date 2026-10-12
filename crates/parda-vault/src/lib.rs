@@ -14,7 +14,7 @@ pub mod store;
 pub mod surrogate;
 
 pub use crypto::VaultKey;
-pub use keystore::{KeySource, load_or_create_key};
+pub use keystore::{KeySource, delete_key, find_key, load_or_create_key};
 pub use store::Store;
 pub use surrogate::{SurrogateGen, token};
 

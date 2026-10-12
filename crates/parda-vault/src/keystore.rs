@@ -59,6 +59,37 @@ pub fn load_or_create_key(data_dir: &Path, use_keyring: bool) -> Result<(VaultKe
     load_or_create_file(&file)
 }
 
+/// Where an existing key would be loaded from, without creating one (for
+/// `parda doctor`). `Ok(None)` when no key exists yet.
+pub fn find_key(data_dir: &Path, use_keyring: bool) -> Result<Option<KeySource>> {
+    let file = data_dir.join(KEY_FILE_NAME);
+    if use_keyring {
+        match os_keyring::get() {
+            Lookup::Found(_) => return Ok(Some(KeySource::Keyring)),
+            Lookup::Corrupt => {
+                return Err(Error::Key(
+                    "corrupt keyring entry (expected 64 hex characters)".into(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(read_key_file(&file)?.map(|_| KeySource::File(file)))
+}
+
+/// Delete the vault key from the keyring and the key file. Every mapping
+/// encrypted with it becomes unreadable: only for `parda vault reset`.
+pub fn delete_key(data_dir: &Path, use_keyring: bool) -> Result<()> {
+    if use_keyring {
+        os_keyring::delete();
+    }
+    match fs::remove_file(data_dir.join(KEY_FILE_NAME)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn load_or_create_file(path: &Path) -> Result<(VaultKey, KeySource)> {
     if let Some(key) = read_key_file(path)? {
         return Ok((key, KeySource::File(path.to_path_buf())));
@@ -202,6 +233,12 @@ mod os_keyring {
         }
         matches!(get(), Lookup::Found(back) if back.as_bytes() == key.as_bytes())
     }
+
+    pub(super) fn delete() {
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+            let _ = entry.delete_credential();
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -216,6 +253,8 @@ mod os_keyring {
     pub(super) fn set(_key: &VaultKey) -> bool {
         false
     }
+
+    pub(super) fn delete() {}
 }
 
 #[cfg(test)]
