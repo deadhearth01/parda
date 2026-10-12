@@ -99,6 +99,12 @@ impl NameMl {
             score: 0.9,
         })
     }
+    pub fn with_score(names: &[&str], score: f32) -> Arc<Self> {
+        Arc::new(NameMl {
+            names: std::sync::Mutex::new(names.iter().map(|s| s.to_string()).collect()),
+            score,
+        })
+    }
     pub fn set(&self, names: &[&str]) {
         *self.names.lock().unwrap() = names.iter().map(|s| s.to_string()).collect();
     }

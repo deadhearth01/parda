@@ -231,8 +231,10 @@ impl Engine {
         self.inner.cache.clear();
     }
 
-    /// Apply a new configuration (packs, actions, mode, style, budgets). The
-    /// ML model itself is not reloaded.
+    /// Apply a new configuration (packs, actions, mode, style, budgets, model
+    /// threshold). The ML model itself is not reloaded: a threshold below the
+    /// one it was loaded with only takes effect once it is (the model never
+    /// reports findings under its load-time threshold).
     pub fn set_config(&self, config: Config) {
         let mut d = self.inner.detectors.write();
         let next = Detectors::new(config, d.rules_file.clone(), d.epoch + 1);
@@ -821,6 +823,10 @@ impl Inner {
         }
 
         let ml_ok = !ml_required || !ml_skipped;
+        // Applied here, not only when the model was loaded, so changing
+        // `detect.ml_threshold` at runtime takes effect (the final cache is
+        // keyed by the config epoch; the ML cache keeps raw model output).
+        let threshold = det.config.detect.ml_threshold;
         for &ti in &misses {
             let text = texts[ti];
             let mut dets = det.dict.detect(text);
@@ -835,6 +841,9 @@ impl Inner {
                     for d in found.iter() {
                         if !valid_span(body, d.span) {
                             tracing::warn!("ML detector returned an invalid span; ignored");
+                            continue;
+                        }
+                        if d.score < threshold {
                             continue;
                         }
                         let d = Detection {

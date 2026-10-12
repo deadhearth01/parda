@@ -318,3 +318,20 @@ fn name_parts_survive_while_the_full_name_is_used() {
     assert_eq!(e.restore(&format!("Hi {first}"), "global"), "Hi Ravi");
     assert_eq!(e.restore(&sur, "global"), "Ravi Kumar");
 }
+
+/// Review A finding 7: `detect.ml_threshold` applies to model findings at
+/// once — changing it at runtime is not a no-op.
+#[test]
+fn model_threshold_change_applies_without_reload() {
+    let ml = NameMl::with_score(&["Anna Schmidt"], 0.5);
+    let mut c = ml_config(parda_core::Mode::Strict, 1000);
+    c.detect.ml_threshold = 0.4;
+    let (_d, e) = engine_with(c, Some(ml as std::sync::Arc<dyn parda_core::MlDetector>));
+    let t = "met Anna Schmidt today";
+    assert!(!e.redact(t, "global").unwrap().text.contains("Anna"));
+    let mut c = e.config();
+    c.detect.ml_threshold = 0.6;
+    e.set_config(c);
+    assert_eq!(e.scan(t).unwrap(), vec![], "0.5 is below the new threshold");
+    assert_eq!(e.redact(t, "global").unwrap().text, t);
+}
