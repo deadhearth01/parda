@@ -1,0 +1,40 @@
+# Entries with a hyphen are phrases (durga-puja = "durga puja").
+# Words the name model sometimes calls a person but that never are one on
+# their own: identifier names, festivals, foods, places, months, languages,
+# brands. Only *model* Person detections whose whole text is one of these
+# (case-insensitive) are dropped; your rules.toml always wins.
+# Identifier and banking words
+aadhaar aadhar adhaar pan upi gst gstin ifsc micr epic kyc otp pin cvv iban swift ssn nino
+passport visa voter licence license ration uan pf esic demat nach neft rtgs imps cheque
+bhim paytm phonepe gpay
+# Festivals and occasions
+diwali deepavali holi eid ramzan ramadan christmas navratri durga-puja dussehra
+ chaturthi onam pongal sankranti lohri baisakhi vaisakhi
+janmashtami karwa chauth chhath bihu ugadi gudi padwa muharram easter thanksgiving
+halloween hanukkah diwali-sale ganesh-chaturthi raksha-bandhan kar-do kar-dena hai-na
+# Food and household
+atta dal daal paneer dhania jeera haldi masala ghee roti chapati naan biryani dosa idli
+sambar rasam poha upma paratha samosa chai lassi kheer halwa ladoo laddu jalebi rajma
+chole chana aloo gobi palak bhindi tikka korma pulao khichdi pakora vada pav bhaji
+marigold neem
+# Cities, states and places
+mumbai bombay delhi bengaluru bangalore chennai madras kolkata calcutta hyderabad pune
+ahmedabad surat jaipur lucknow kanpur nagpur indore bhopal patna vadodara ludhiana agra
+nashik varanasi kochi cochin mysuru mysore coimbatore madurai visakhapatnam vizag
+chandigarh gurugram gurgaon noida ghaziabad faridabad thane navi goa shimla manali
+srinagar amritsar jodhpur udaipur rishikesh haridwar dehradun guwahati shillong
+bhubaneswar ranchi raipur trivandrum thiruvananthapuram kerala karnataka maharashtra
+gujarat rajasthan punjab haryana bihar odisha assam telangana andhra tamil nadu
+bengal uttarakhand himachal kashmir india
+london paris tokyo dubai singapore sydney toronto berlin
+# Months and days
+january february march july august september october november december
+monday tuesday wednesday thursday friday saturday sunday
+# Languages and scripts
+hindi english bengali bangla marathi telugu tamil kannada malayalam gujarati punjabi urdu
+odia oriya assamese sanskrit hinglish
+# Brands and products often mistaken for people
+tata nexon creta hyundai maruti suzuki swift mahindra scorpio thar honda toyota innova
+fortuner kia seltos sonet jio airtel vodafone flipkart amazon swiggy zomato ola uber
+infosys wipro reliance iphone android whatsapp instagram facebook youtube google
+microsoft chatgpt claude gemini copilot

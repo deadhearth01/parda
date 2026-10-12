@@ -290,6 +290,52 @@ fn create_private_dir(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Built-in words the model mistakes for people (see `data/not_names.txt`).
+struct NotNames {
+    words: std::collections::HashSet<String>,
+    phrases: std::collections::HashSet<String>,
+}
+
+fn not_names() -> &'static NotNames {
+    static LIST: std::sync::OnceLock<NotNames> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let mut words = std::collections::HashSet::new();
+        let mut phrases = std::collections::HashSet::new();
+        for line in include_str!("../data/not_names.txt").lines() {
+            let line = line.split('#').next().unwrap_or("");
+            for w in line.split_whitespace() {
+                if w.contains('-') {
+                    phrases.insert(w.replace('-', " "));
+                } else {
+                    words.insert(w.to_string());
+                }
+            }
+        }
+        NotNames { words, phrases }
+    })
+}
+
+/// A model Person detection that is only festival / food / place /
+/// identifier words ("Aadhaar", "Durga Puja", "Tata Nexon").
+fn not_a_name(text: &str, d: &Detection) -> bool {
+    if d.source != Source::Ml || d.kind != EntityKind::Person {
+        return false;
+    }
+    let Some(t) = text.get(d.span.start..d.span.end) else {
+        return false;
+    };
+    let lower = t.to_lowercase();
+    let words: Vec<&str> = lower
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let list = not_names();
+    !words.is_empty()
+        && (list.phrases.contains(&words.join(" "))
+            || words.iter().all(|w| list.words.contains(*w)))
+}
+
 /// Human label of a detection tier, for statistics.
 pub fn source_label(source: &Source) -> &'static str {
     match source {
@@ -520,7 +566,7 @@ impl Inner {
             if ml_required && !ml_skipped {
                 let mk = cache::key("ml", 0, f.body);
                 if let Some(m) = ml_dets.get(&mk) {
-                    dets.extend(m.iter().cloned());
+                    dets.extend(m.iter().filter(|d| !not_a_name(f.body, d)).cloned());
                 }
             }
             let dets = det.allow.filter(f.body, merge(absorb_contained(dets)));
@@ -905,6 +951,24 @@ mod tests {
             score: 0.9,
             source,
         }
+    }
+
+    #[test]
+    fn model_person_guesses_on_common_words_are_dropped() {
+        let t = "Aadhaar card for Durga Puja, Durga Prasad, Tata Nexon, Jaipur";
+        let at = |w: &str| {
+            let s = t.find(w).unwrap();
+            d(s, s + w.len(), EntityKind::Person, Source::Ml)
+        };
+        assert!(not_a_name(t, &at("Aadhaar")));
+        assert!(not_a_name(t, &at("Durga Puja")));
+        assert!(not_a_name(t, &at("Tata Nexon")));
+        assert!(not_a_name(t, &at("Jaipur")));
+        assert!(!not_a_name(t, &at("Durga Prasad")));
+        // Only model guesses are filtered; the user's dictionary always wins.
+        let mut dict = at("Jaipur");
+        dict.source = Source::Dictionary;
+        assert!(!not_a_name(t, &dict));
     }
 
     #[test]
