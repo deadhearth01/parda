@@ -115,7 +115,26 @@ pub struct DetectConfig {
     pub ml_timeout_ms: u64,
     /// `auto`, `cpu`, `coreml`, `directml` or `cuda`.
     pub execution_provider: String,
+    /// Per built-in kind. Names ignore case (`secret`, `IP_ADDRESS`); an
+    /// unknown name is a configuration error rather than a silent no-op.
+    #[serde(deserialize_with = "builtin_actions")]
     pub actions: BTreeMap<EntityKind, Action>,
+}
+
+fn builtin_actions<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<BTreeMap<EntityKind, Action>, D::Error> {
+    use serde::de::Error as _;
+    BTreeMap::<String, Action>::deserialize(d)?
+        .into_iter()
+        .map(|(name, action)| match EntityKind::builtin(&name) {
+            Some(kind) => Ok((kind, action)),
+            None => Err(D::Error::custom(format!(
+                "unknown entity kind `{name}` in [detect.actions]; expected one of: {}",
+                EntityKind::builtin_names()
+            ))),
+        })
+        .collect()
 }
 
 impl Default for DetectConfig {
@@ -254,6 +273,23 @@ mod tests {
         let c = Config::from_toml_str("[detect.actions]\nSecret = \"block\"\n").unwrap();
         assert_eq!(c.action_for(&EntityKind::Secret), Action::Block);
         assert_eq!(c.action_for(&EntityKind::Email), Action::Redact);
+    }
+
+    #[test]
+    fn action_keys_ignore_case() {
+        let c =
+            Config::from_toml_str("[detect.actions]\nsecret = \"block\"\nip_address = \"warn\"\n")
+                .unwrap();
+        assert_eq!(c.action_for(&EntityKind::Secret), Action::Block);
+        assert_eq!(c.action_for(&EntityKind::IpAddress), Action::Warn);
+    }
+
+    #[test]
+    fn unknown_action_key_is_an_error() {
+        let err = Config::from_toml_str("[detect.actions]\nsecrets = \"block\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("secrets") && err.contains("Secret"), "{err}");
     }
 
     #[test]
