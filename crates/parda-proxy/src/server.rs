@@ -24,7 +24,7 @@ use crate::error::error_response;
 use crate::route::{Provider, route};
 use crate::route::{SUPPORTED, normalize_path};
 use crate::sse::{Restorers, StreamRewriter};
-use crate::walk::{Unscanned, Visit, leaves};
+use crate::walk::{Unscanned, Visit, leaves, preserve_numbers};
 use crate::{ProxyEvent, ProxyState, anthropic, guard, legacy, openai_chat, openai_responses, sse};
 
 /// Header naming the vault scope of a request (default `global`).
@@ -189,6 +189,7 @@ struct Redacted {
 fn redact_body(
     engine: &Engine,
     walker: Walker,
+    raw: &[u8],
     mut v: Value,
     scope: &str,
 ) -> Result<Redacted, EngineError> {
@@ -212,6 +213,7 @@ fn redact_body(
         }
     });
     let body = serde_json::to_vec(&v).map_err(|e| EngineError::Other(e.to_string()))?;
+    let body = preserve_numbers(raw, body);
     Ok(Redacted {
         body,
         counts,
@@ -224,6 +226,7 @@ fn redact_body(
 fn restore_body(
     engine: &Engine,
     provider: Provider,
+    raw: &[u8],
     mut v: Value,
     scope: &str,
     success: bool,
@@ -246,7 +249,7 @@ fn restore_body(
         // Error bodies may quote the request; restore every string.
         leaves(&mut v, &mut f);
     }
-    serde_json::to_vec(&v).unwrap_or_default()
+    preserve_numbers(raw, serde_json::to_vec(&v).unwrap_or_default())
 }
 
 fn engine_error(provider: Provider, e: &EngineError) -> (Response, String) {
@@ -452,10 +455,10 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
     if let Some(walker) = request_walker(provider)
         && !body.is_empty()
     {
-        let v = match body::decode(&parts.headers, body, cfg.max_body_bytes)
-            .and_then(|raw| body::parse_json(&raw))
+        let (raw, v) = match body::decode(&parts.headers, body, cfg.max_body_bytes)
+            .and_then(|raw| body::parse_json(&raw).map(|v| (raw, v)))
         {
-            Ok(v) => v,
+            Ok(x) => x,
             Err(e) => {
                 let (resp, code) = body_error(provider, &e);
                 return finish(&state, event, resp, Some(code));
@@ -466,7 +469,8 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         let engine = state.engine.clone();
         let scope2 = scope.clone();
         let res =
-            tokio::task::spawn_blocking(move || redact_body(&engine, walker, v, &scope2)).await;
+            tokio::task::spawn_blocking(move || redact_body(&engine, walker, &raw, v, &scope2))
+                .await;
         redact_ms = started.elapsed().as_millis() as u64;
         match res {
             Ok(Ok(r)) => {
@@ -612,8 +616,9 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
                 let engine = state.engine.clone();
                 let scope2 = scope.clone();
                 let ok = status.is_success();
+                let raw = bytes.clone();
                 let res = tokio::task::spawn_blocking(move || {
-                    restore_body(&engine, provider, v, &scope2, ok)
+                    restore_body(&engine, provider, &raw, v, &scope2, ok)
                 })
                 .await;
                 restore_ms = started.elapsed().as_millis() as u64;

@@ -229,3 +229,48 @@ async fn too_deeply_nested_body_is_refused() {
     assert_eq!(resp.status(), 400);
     assert_eq!(s.mock.count(), 0);
 }
+
+#[tokio::test]
+async fn number_literals_survive_the_rewrite() {
+    let s = setup(ok_reply()).await;
+    // Too big for u64 / i64, and float spellings serde_json would change.
+    let body = br#"{"model":"m","metadata":{"id":123456789012345678901234567890,"neg":-98765432109876543210},"temperature":1.0,"top_p":1e-1,"messages":[{"role":"user","content":"Ravi Kumar"},{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"n","input":{"order":340282366920938463463374607431768211457,"to":"Ravi Kumar"}}]}]}"#;
+    let resp = post_raw(&s, "/v1/messages", body.to_vec(), None).await;
+    assert_eq!(resp.status(), 200);
+    let up = s.mock.last().text();
+    assert!(!up.contains("Ravi"), "{up}");
+    for lit in [
+        "123456789012345678901234567890",
+        "-98765432109876543210",
+        "\"temperature\":1.0",
+        "\"top_p\":1e-1",
+        "340282366920938463463374607431768211457",
+    ] {
+        assert!(up.contains(lit), "{lit} missing in {up}");
+    }
+
+    // Inside a JSON-encoded tool-call argument string too.
+    let s = setup(responder(|_| {
+        Reply::Json(StatusCode::OK, json!({"choices": []}))
+    }))
+    .await;
+    let args = r#"{"to":"Ravi Kumar","id":123456789012345678901234567890}"#;
+    let resp = post_raw(
+        &s,
+        "/v1/chat/completions",
+        json!({"model": "m", "messages": [{"role": "assistant", "content": null,
+            "tool_calls": [{"id": "1", "type": "function", "function": {"name": "f", "arguments": args}}]}]})
+        .to_string()
+        .into_bytes(),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let seen = s.mock.last().json();
+    let sent = seen["messages"][0]["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(sent.contains("123456789012345678901234567890"), "{sent}");
+    assert!(!sent.contains("Ravi"), "{sent}");
+}

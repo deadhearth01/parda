@@ -70,10 +70,79 @@ pub(crate) fn json_string(s: &mut String, f: Visit<'_>) {
     match serde_json::from_str::<Value>(s) {
         Ok(mut v) if v.is_object() || v.is_array() => {
             leaves(&mut v, f);
-            *s = v.to_string();
+            let out = preserve_numbers(s.as_bytes(), v.to_string().into_bytes());
+            *s = String::from_utf8(out)
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
         }
         _ => f(s),
     }
+}
+
+/// Byte ranges of the number literals of a JSON text, outside strings.
+fn number_tokens(json: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut in_string = false;
+    while i < json.len() {
+        let b = json[i];
+        if in_string {
+            match b {
+                b'\\' => i += 2,
+                b'"' => {
+                    in_string = false;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            i += 1;
+        } else if b == b'-' || b.is_ascii_digit() {
+            let start = i;
+            while i < json.len()
+                && matches!(json[i], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+            {
+                i += 1;
+            }
+            out.push((start, i));
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// serde_json (without `arbitrary_precision`) turns integers beyond 64 bits
+/// into floats and respells some floats (`1e-1` → `0.1`). Put the
+/// original literals back into `out`, a re-serialisation of `original`,
+/// wherever the two denote the same value: redaction only rewrites
+/// strings, so numbers appear in the same order (a body whose numbers do
+/// not line up — duplicate keys — is left as re-serialised).
+pub(crate) fn preserve_numbers(original: &[u8], out: Vec<u8>) -> Vec<u8> {
+    let before = number_tokens(original);
+    let after = number_tokens(&out);
+    if before.len() != after.len() {
+        return out;
+    }
+    let as_f64 = |t: &[u8]| std::str::from_utf8(t).ok()?.parse::<f64>().ok();
+    let mut fixed = Vec::with_capacity(out.len());
+    let mut last = 0;
+    for (&(bs, be), &(as_, ae)) in before.iter().zip(&after) {
+        let (orig, now) = (&original[bs..be], &out[as_..ae]);
+        if orig == now || as_f64(orig).is_none() || as_f64(orig) != as_f64(now) {
+            continue;
+        }
+        fixed.extend_from_slice(&out[last..as_]);
+        fixed.extend_from_slice(orig);
+        last = ae;
+    }
+    if last == 0 {
+        return out;
+    }
+    fixed.extend_from_slice(&out[last..]);
+    fixed
 }
 
 pub(crate) fn str_field(v: &mut Value, key: &str, f: Visit<'_>) {
@@ -98,6 +167,23 @@ pub(crate) fn collect(v: &mut Value, walker: impl Fn(&mut Value, Visit<'_>)) -> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn number_literals_are_preserved() {
+        let orig =
+            br#"{"a":123456789012345678901234567890,"s":"1e5 \"9\"","b":[1e-1,-0.0,2],"c":1.0}"#;
+        let v: Value = serde_json::from_slice(orig).unwrap();
+        let out = preserve_numbers(orig, serde_json::to_vec(&v).unwrap());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(orig.to_vec()).unwrap()
+        );
+        // Duplicate keys: numbers no longer line up; nothing is swapped.
+        let orig = br#"{"a":"x","b":1,"a":2}"#;
+        let v: Value = serde_json::from_slice(orig).unwrap();
+        let re = serde_json::to_vec(&v).unwrap();
+        assert_eq!(preserve_numbers(orig, re.clone()), re);
+    }
 
     #[test]
     fn leaves_and_json_strings() {
