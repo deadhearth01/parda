@@ -1,0 +1,47 @@
+[package]
+name = "parda"
+description = "Local, real-time PII filter for AI chats and agents: redacts personal data before it leaves your machine and restores it in the answers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["pii", "privacy", "redaction", "llm", "proxy"]
+categories = ["command-line-utilities", "text-processing"]
+
+[[bin]]
+name = "parda"
+path = "src/main.rs"
+
+[dependencies]
+parda-core.workspace = true
+parda-detect.workspace = true
+parda-vault.workspace = true
+parda-engine.workspace = true
+parda-ml.workspace = true
+parda-ipc.workspace = true
+parda-daemon.workspace = true
+parda-tui.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dialoguer.workspace = true
+indicatif.workspace = true
+tracing.workspace = true
+arboard.workspace = true
+
+[features]
+default = []
+coreml = ["parda-ml/coreml"]
+directml = ["parda-ml/directml"]
+cuda = ["parda-ml/cuda"]
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
