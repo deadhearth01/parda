@@ -1,0 +1,27 @@
+[package]
+name = "parda-bench"
+description = "Golden-corpus evaluation, latency harness and mock upstream for parda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+parda-core.workspace = true
+parda-detect.workspace = true
+parda-engine.workspace = true
+parda-ml.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+axum.workspace = true
+bytes.workspace = true
+futures.workspace = true
+
+[lints]
+workspace = true
