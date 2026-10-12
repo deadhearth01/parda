@@ -6,11 +6,11 @@ use serde_json::{Map, Value, json};
 
 use crate::anthropic;
 use crate::sse::{Restorers, SseEvent, StreamRewriter};
-use crate::walk::{Visit, str_field};
+use crate::walk::{Unscanned, Visit, str_field};
 
 /// `POST /v1/messages/batches`: each `requests[].params` is a Messages request.
-pub(crate) fn walk_batch_request(v: &mut Value, f: Visit<'_>) -> u32 {
-    let mut unscanned = 0;
+pub(crate) fn walk_batch_request(v: &mut Value, f: Visit<'_>) -> Unscanned {
+    let mut unscanned = Unscanned::NONE;
     if let Some(Value::Array(reqs)) = v.get_mut("requests") {
         for r in reqs {
             if let Some(params) = r.get_mut("params") {
@@ -22,9 +22,9 @@ pub(crate) fn walk_batch_request(v: &mut Value, f: Visit<'_>) -> u32 {
 }
 
 /// `POST /v1/complete`: the `prompt`.
-pub(crate) fn walk_complete_request(v: &mut Value, f: Visit<'_>) -> u32 {
+pub(crate) fn walk_complete_request(v: &mut Value, f: Visit<'_>) -> Unscanned {
     str_field(v, "prompt", f);
-    0
+    Unscanned::NONE
 }
 
 pub(crate) fn walk_complete_response(v: &mut Value, f: Visit<'_>) {
@@ -33,14 +33,13 @@ pub(crate) fn walk_complete_response(v: &mut Value, f: Visit<'_>) {
 
 /// A completions `prompt` / embeddings `input`: a string, an array of
 /// strings, or token ids. Token ids cannot be scanned and are counted.
-fn text_or_tokens(v: Option<&mut Value>, f: Visit<'_>) -> u32 {
+fn text_or_tokens(v: Option<&mut Value>, f: Visit<'_>) -> Unscanned {
     match v {
         Some(Value::String(s)) => {
             f(s);
-            0
+            Unscanned::NONE
         }
         Some(Value::Array(items)) => {
-            let mut unscanned = 0;
             let mut tokens = false;
             for item in items {
                 match item {
@@ -50,17 +49,18 @@ fn text_or_tokens(v: Option<&mut Value>, f: Visit<'_>) -> u32 {
                 }
             }
             if tokens {
-                unscanned += 1;
+                Unscanned::MEDIA
+            } else {
+                Unscanned::NONE
             }
-            unscanned
         }
-        Some(Value::Null) | None => 0,
-        Some(_) => 1,
+        Some(Value::Null) | None => Unscanned::NONE,
+        Some(_) => Unscanned::UNKNOWN,
     }
 }
 
 /// `POST /v1/completions`: `prompt` and the fill-in-the-middle `suffix`.
-pub(crate) fn walk_completions_request(v: &mut Value, f: Visit<'_>) -> u32 {
+pub(crate) fn walk_completions_request(v: &mut Value, f: Visit<'_>) -> Unscanned {
     let unscanned = text_or_tokens(v.get_mut("prompt"), f);
     str_field(v, "suffix", f);
     unscanned
@@ -75,7 +75,7 @@ pub(crate) fn walk_completions_response(v: &mut Value, f: Visit<'_>) {
 }
 
 /// `POST /v1/embeddings`: the `input`.
-pub(crate) fn walk_embeddings_request(v: &mut Value, f: Visit<'_>) -> u32 {
+pub(crate) fn walk_embeddings_request(v: &mut Value, f: Visit<'_>) -> Unscanned {
     text_or_tokens(v.get_mut("input"), f)
 }
 
@@ -219,7 +219,7 @@ mod tests {
             ["a", "b", "s"]
         );
         let mut v = json!({"input": [[1, 2], [3]]});
-        assert_eq!(walk_embeddings_request(&mut v, &mut |_| {}), 1);
+        assert_eq!(walk_embeddings_request(&mut v, &mut |_| {}).media, 1);
         let mut v = json!({"requests": [{"custom_id": "x", "params": {"messages": [{"role": "user", "content": "U"}]}}]});
         assert_eq!(
             collect(&mut v, |v, f| {

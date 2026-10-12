@@ -46,8 +46,11 @@ pub struct ProxyEvent {
     pub ml_ms: u64,
     /// Time parda itself added (redaction + restore of a JSON body).
     pub added_ms: u64,
-    /// Images / binary documents forwarded without scanning.
+    /// Images / binary documents / token ids forwarded without scanning.
     pub unscanned_media: u32,
+    /// Blocks, parts or items of a type parda does not know, forwarded
+    /// without scanning (a warning).
+    pub unknown_parts: u32,
     pub status: u16,
     pub streaming: bool,
     /// Protection was switched off: the request went upstream unfiltered.

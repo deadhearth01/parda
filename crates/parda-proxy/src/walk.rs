@@ -8,6 +8,51 @@ use serde_json::Value;
 
 pub(crate) type Visit<'a> = &'a mut dyn FnMut(&mut String);
 
+/// What a request walker had to forward without scanning.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Unscanned {
+    /// Images, audio, binary documents, token ids.
+    pub media: u32,
+    /// Blocks / parts / items of a type parda does not know.
+    pub unknown: u32,
+}
+
+impl Unscanned {
+    pub(crate) const NONE: Unscanned = Unscanned {
+        media: 0,
+        unknown: 0,
+    };
+    pub(crate) const MEDIA: Unscanned = Unscanned {
+        media: 1,
+        unknown: 0,
+    };
+    pub(crate) const UNKNOWN: Unscanned = Unscanned {
+        media: 0,
+        unknown: 1,
+    };
+
+    pub(crate) fn total(self) -> u32 {
+        self.media + self.unknown
+    }
+}
+
+impl std::ops::AddAssign for Unscanned {
+    fn add_assign(&mut self, o: Unscanned) {
+        self.media += o.media;
+        self.unknown += o.unknown;
+    }
+}
+
+impl std::iter::Sum for Unscanned {
+    fn sum<I: Iterator<Item = Unscanned>>(iter: I) -> Unscanned {
+        let mut t = Unscanned::NONE;
+        for u in iter {
+            t += u;
+        }
+        t
+    }
+}
+
 /// Every string leaf (values, not keys).
 pub(crate) fn leaves(v: &mut Value, f: Visit<'_>) {
     match v {

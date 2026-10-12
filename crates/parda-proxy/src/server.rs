@@ -21,7 +21,7 @@ use crate::error::error_response;
 use crate::route::{Provider, route};
 use crate::route::{SUPPORTED, normalize_path};
 use crate::sse::{Restorers, StreamRewriter};
-use crate::walk::{Visit, leaves};
+use crate::walk::{Unscanned, Visit, leaves};
 use crate::{ProxyEvent, ProxyState, anthropic, guard, legacy, openai_chat, openai_responses, sse};
 
 /// Header naming the vault scope of a request (default `global`).
@@ -52,7 +52,7 @@ pub async fn serve_with_shutdown(
     Ok(())
 }
 
-type Walker = fn(&mut Value, Visit<'_>) -> u32;
+type Walker = fn(&mut Value, Visit<'_>) -> Unscanned;
 
 fn request_walker(p: Provider) -> Option<Walker> {
     match p {
@@ -140,7 +140,7 @@ struct Redacted {
     body: Vec<u8>,
     counts: BTreeMap<String, u32>,
     ml_ms: u64,
-    unscanned: u32,
+    unscanned: Unscanned,
     paused: bool,
 }
 
@@ -298,6 +298,7 @@ fn finish(
         ml_ms = event.ml_ms,
         entities = event.counts.values().sum::<u32>(),
         unscanned = event.unscanned_media,
+        unknown_parts = event.unknown_parts,
         streaming = event.streaming,
         "proxied request"
     );
@@ -318,6 +319,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         ml_ms: 0,
         added_ms: 0,
         unscanned_media: 0,
+        unknown_parts: 0,
         status: 0,
         streaming: false,
         paused: false,
@@ -388,16 +390,18 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
             Ok(Ok(r)) => {
                 event.counts = r.counts;
                 event.ml_ms = r.ml_ms;
-                event.unscanned_media = r.unscanned;
+                event.unscanned_media = r.unscanned.media;
+                event.unknown_parts = r.unscanned.unknown;
                 event.paused = r.paused;
                 event.added_ms = redact_ms;
-                if r.unscanned > 0 && state.cfg.unscanned_media == UnscannedMedia::Block {
+                if r.unscanned.total() > 0 && state.cfg.unscanned_media == UnscannedMedia::Block {
                     let resp = error_response(
                         provider,
                         StatusCode::BAD_REQUEST,
                         "parda_unscanned_media",
-                        "the request contains images or binary documents, which parda cannot \
-                         scan yet (proxy.unscanned_media = \"block\")",
+                        "the request contains images, binary documents, token ids or content \
+                         of a type parda does not know, which it cannot scan \
+                         (proxy.unscanned_media = \"block\")",
                     );
                     return finish(&state, event, resp, Some("parda_unscanned_media".into()));
                 }

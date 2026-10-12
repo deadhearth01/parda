@@ -3,35 +3,71 @@
 use serde_json::{Map, Value, json};
 
 use crate::sse::{Restorers, SseEvent, StreamRewriter};
-use crate::walk::{Visit, json_string, str_field, type_of};
+use crate::walk::{Unscanned, Visit, json_string, str_field, type_of};
 
-pub(crate) fn walk_request(v: &mut Value, f: Visit<'_>) -> u32 {
-    let mut unscanned = 0;
-    let Some(Value::Array(msgs)) = v.get_mut("messages") else {
-        return 0;
-    };
-    for m in msgs {
-        match m.get_mut("content") {
-            Some(Value::String(s)) => f(s),
-            Some(Value::Array(parts)) => {
-                for p in parts {
-                    match type_of(p) {
-                        "text" => str_field(p, "text", f),
-                        "image_url" | "input_audio" | "file" => unscanned += 1,
-                        _ => {}
-                    }
-                }
+pub(crate) fn walk_request(v: &mut Value, f: Visit<'_>) -> Unscanned {
+    let mut unscanned = Unscanned::NONE;
+    tool_descriptions(v, f);
+    if let Some(Value::Array(msgs)) = v.get_mut("messages") {
+        for m in msgs {
+            str_field(m, "name", f);
+            str_field(m, "refusal", f);
+            if let Some(c) = m.get_mut("content") {
+                unscanned += content(c, f);
             }
-            _ => {}
+            tool_calls(m, f);
         }
-        tool_calls(m, f);
+    }
+    // Predicted output (a draft of the answer, usually the user's file).
+    if let Some(c) = v.get_mut("prediction").and_then(|p| p.get_mut("content")) {
+        unscanned += content(c, f);
     }
     unscanned
 }
 
+/// `tools[].function.description` and the legacy `functions[].description`.
+fn tool_descriptions(v: &mut Value, f: Visit<'_>) {
+    if let Some(Value::Array(tools)) = v.get_mut("tools") {
+        for t in tools {
+            if let Some(func) = t.get_mut("function") {
+                str_field(func, "description", f);
+            }
+            str_field(t, "description", f);
+        }
+    }
+    if let Some(Value::Array(funcs)) = v.get_mut("functions") {
+        for func in funcs {
+            str_field(func, "description", f);
+        }
+    }
+}
+
+/// A message `content`: a string or an array of parts.
+fn content(c: &mut Value, f: Visit<'_>) -> Unscanned {
+    match c {
+        Value::String(s) => {
+            f(s);
+            Unscanned::NONE
+        }
+        Value::Array(parts) => {
+            let mut unscanned = Unscanned::NONE;
+            for p in parts {
+                match type_of(p) {
+                    "text" => str_field(p, "text", f),
+                    "refusal" => str_field(p, "refusal", f),
+                    "image_url" | "input_audio" | "file" => unscanned += Unscanned::MEDIA,
+                    _ => unscanned += Unscanned::UNKNOWN,
+                }
+            }
+            unscanned
+        }
+        _ => Unscanned::NONE,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn count_unscanned(v: &mut Value) -> u32 {
-    walk_request(v, &mut |_| {})
+    walk_request(v, &mut |_| {}).total()
 }
 
 fn tool_calls(m: &mut Value, f: Visit<'_>) {
@@ -57,6 +93,7 @@ pub(crate) fn walk_response(v: &mut Value, f: Visit<'_>) {
         for c in choices {
             if let Some(m) = c.get_mut("message") {
                 str_field(m, "content", f);
+                str_field(m, "refusal", f);
                 tool_calls(m, f);
             }
         }
@@ -213,5 +250,29 @@ mod tests {
         });
         assert_eq!(texts, ["S", "U", "A", "R"]);
         assert_eq!(count_unscanned(&mut v), 1);
+    }
+
+    #[test]
+    fn request_walk_covers_names_refusals_predictions_and_tools() {
+        let mut v = json!({
+            "messages": [
+                {"role": "user", "name": "N", "content": "U"},
+                {"role": "assistant", "refusal": "MR", "content": [{"type": "refusal", "refusal": "PR"}, {"type": "text", "text": "T"}]}
+            ],
+            "prediction": {"type": "content", "content": [{"type": "text", "text": "P"}]},
+            "tools": [{"type": "function", "function": {"name": "f", "description": "FD", "parameters": {}}}],
+            "functions": [{"name": "g", "description": "GD"}]
+        });
+        let texts = collect(&mut v, |v, f| {
+            walk_request(v, f);
+        });
+        assert_eq!(texts, ["FD", "GD", "N", "U", "MR", "PR", "T", "P"]);
+        let mut v = json!({"messages": [], "prediction": {"type": "content", "content": "PS"}});
+        assert_eq!(
+            collect(&mut v, |v, f| {
+                walk_request(v, f);
+            }),
+            ["PS"]
+        );
     }
 }

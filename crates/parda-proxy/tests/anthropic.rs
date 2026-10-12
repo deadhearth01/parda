@@ -366,3 +366,28 @@ async fn blocked_kind_returns_400_and_is_not_forwarded() {
     assert_eq!(body["error"]["type"], "parda_blocked");
     assert_eq!(s.mock.count(), 0);
 }
+
+#[tokio::test]
+async fn unknown_parts_are_unscanned_and_blocked_by_policy() {
+    let req = json!({"model": "m", "messages": [{"role": "user", "content": [
+        {"type": "future_part", "x": "Ravi Kumar"},
+        {"type": "text", "text": "hi"}
+    ]}]});
+    // Allowed by default, with a warning in the event.
+    let mut s = setup(echo_first_user_text()).await;
+    assert_eq!(s.post("/v1/messages", &req).await.status(), 200);
+    let ev = s.events.recv().await.unwrap();
+    assert_eq!((ev.unknown_parts, ev.unscanned_media), (1, 0));
+
+    let s = setup_with(
+        echo_first_user_text(),
+        |c| c.proxy.unscanned_media = UnscannedMedia::Block,
+        None,
+    )
+    .await;
+    let resp = s.post("/v1/messages", &req).await;
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "parda_unscanned_media");
+    assert_eq!(s.mock.count(), 0);
+}

@@ -3,91 +3,147 @@
 use serde_json::{Value, json};
 
 use crate::sse::{Restorers, SseEvent, StreamRewriter};
-use crate::walk::{Visit, json_string, str_field, type_of};
+use crate::walk::{Unscanned, Visit, json_string, str_field, type_of};
 
-pub(crate) fn walk_request(v: &mut Value, f: Visit<'_>) -> u32 {
-    let mut unscanned = 0;
-    str_field(v, "instructions", f);
-    match v.get_mut("input") {
-        Some(Value::String(s)) => f(s),
-        Some(Value::Array(items)) => {
-            for item in items {
-                unscanned += input_item(item, f);
-            }
+pub(crate) fn walk_request(v: &mut Value, f: Visit<'_>) -> Unscanned {
+    let mut unscanned = Unscanned::NONE;
+    if let Some(Value::Array(tools)) = v.get_mut("tools") {
+        for t in tools {
+            str_field(t, "description", f);
         }
-        _ => {}
     }
+    if let Some(Value::Object(vars)) = v.get_mut("prompt").and_then(|p| p.get_mut("variables")) {
+        for var in vars.values_mut() {
+            unscanned += match var {
+                Value::String(s) => {
+                    f(s);
+                    Unscanned::NONE
+                }
+                part => content_part(part, f),
+            };
+        }
+    }
+    unscanned += items(v.get_mut("instructions"), f);
+    unscanned += items(v.get_mut("input"), f);
     unscanned
+}
+
+/// `instructions` / `input`: a string or a list of input items.
+fn items(v: Option<&mut Value>, f: Visit<'_>) -> Unscanned {
+    match v {
+        Some(Value::String(s)) => {
+            f(s);
+            Unscanned::NONE
+        }
+        Some(Value::Array(items)) => items.iter_mut().map(|item| input_item(item, f)).sum(),
+        _ => Unscanned::NONE,
+    }
 }
 
 /// `POST /v1/conversations` and `POST /v1/conversations/{id}/items`: the
 /// `items` are Responses input items.
-pub(crate) fn walk_conversation_request(v: &mut Value, f: Visit<'_>) -> u32 {
-    let mut unscanned = 0;
-    if let Some(Value::Array(items)) = v.get_mut("items") {
-        for item in items {
-            unscanned += input_item(item, f);
-        }
-    }
-    unscanned
+pub(crate) fn walk_conversation_request(v: &mut Value, f: Visit<'_>) -> Unscanned {
+    items(v.get_mut("items"), f)
 }
 
 #[cfg(test)]
 pub(crate) fn count_unscanned(v: &mut Value) -> u32 {
-    walk_request(v, &mut |_| {})
+    walk_request(v, &mut |_| {}).total()
 }
 
-fn content_parts(content: &mut Value, f: Visit<'_>) -> u32 {
-    match content {
-        Value::String(s) => {
-            f(s);
-            0
+fn content_part(p: &mut Value, f: Visit<'_>) -> Unscanned {
+    match type_of(p) {
+        "input_text" | "output_text" | "text" => {
+            str_field(p, "text", f);
+            Unscanned::NONE
         }
-        Value::Array(parts) => {
-            let mut unscanned = 0;
-            for p in parts {
-                match type_of(p) {
-                    "input_text" | "output_text" | "text" => str_field(p, "text", f),
-                    "input_image" | "input_file" | "input_audio" => unscanned += 1,
-                    _ => {}
-                }
-            }
-            unscanned
+        "refusal" => {
+            str_field(p, "refusal", f);
+            Unscanned::NONE
         }
-        _ => 0,
+        "input_image" | "input_file" | "input_audio" | "computer_screenshot" => Unscanned::MEDIA,
+        _ => Unscanned::UNKNOWN,
     }
 }
 
-fn input_item(item: &mut Value, f: Visit<'_>) -> u32 {
+fn content_parts(content: &mut Value, f: Visit<'_>) -> Unscanned {
+    match content {
+        Value::String(s) => {
+            f(s);
+            Unscanned::NONE
+        }
+        Value::Array(parts) => parts.iter_mut().map(|p| content_part(p, f)).sum(),
+        Value::Null => Unscanned::NONE,
+        _ => Unscanned::UNKNOWN,
+    }
+}
+
+fn input_item(item: &mut Value, f: Visit<'_>) -> Unscanned {
     let ty = type_of(item).to_string();
     match ty.as_str() {
-        "message" | "" if item.get("content").is_some() => {
-            item.get_mut("content").map_or(0, |c| content_parts(c, f))
-        }
+        "message" | "" if item.get("content").is_some() => item
+            .get_mut("content")
+            .map_or(Unscanned::NONE, |c| content_parts(c, f)),
         "function_call" => {
             if let Some(Value::String(a)) = item.get_mut("arguments") {
                 json_string(a, f);
             }
-            0
+            Unscanned::NONE
         }
-        "function_call_output" => match item.get_mut("output") {
-            Some(Value::String(s)) => {
-                f(s);
-                0
-            }
-            Some(other) => content_parts(other, f),
-            None => 0,
-        },
+        "function_call_output" | "custom_tool_call_output" => item
+            .get_mut("output")
+            .map_or(Unscanned::NONE, |o| content_parts(o, f)),
         "custom_tool_call" => {
             str_field(item, "input", f);
-            0
+            Unscanned::NONE
         }
-        "custom_tool_call_output" => {
+        "local_shell_call_output" | "apply_patch_call_output" => {
             str_field(item, "output", f);
-            0
+            Unscanned::NONE
         }
-        // reasoning (encrypted), item references, future types: untouched.
-        _ => 0,
+        "shell_call_output" => {
+            match item.get_mut("output") {
+                Some(Value::Array(chunks)) => {
+                    for c in chunks {
+                        str_field(c, "stdout", f);
+                        str_field(c, "stderr", f);
+                    }
+                }
+                Some(Value::String(s)) => f(s),
+                _ => {}
+            }
+            Unscanned::NONE
+        }
+        "mcp_call" => {
+            if let Some(Value::String(a)) = item.get_mut("arguments") {
+                json_string(a, f);
+            }
+            str_field(item, "output", f);
+            str_field(item, "error", f);
+            Unscanned::NONE
+        }
+        "mcp_approval_response" => {
+            str_field(item, "reason", f);
+            Unscanned::NONE
+        }
+        "computer_call_output" => Unscanned::MEDIA,
+        // Encrypted reasoning, references, and calls / results of tools the
+        // provider ran itself (it produced them): untouched.
+        "reasoning"
+        | "item_reference"
+        | "compaction"
+        | "web_search_call"
+        | "file_search_call"
+        | "image_generation_call"
+        | "code_interpreter_call"
+        | "computer_call"
+        | "local_shell_call"
+        | "shell_call"
+        | "apply_patch_call"
+        | "mcp_list_tools"
+        | "mcp_approval_request" => Unscanned::NONE,
+        // A type parda does not know: forwarded unscanned, with a warning.
+        _ => Unscanned::UNKNOWN,
     }
 }
 
@@ -106,8 +162,10 @@ fn output_item(item: &mut Value, f: Visit<'_>) {
         "message" => {
             if let Some(Value::Array(parts)) = item.get_mut("content") {
                 for p in parts {
-                    if type_of(p) == "output_text" {
-                        str_field(p, "text", f);
+                    match type_of(p) {
+                        "output_text" => str_field(p, "text", f),
+                        "refusal" => str_field(p, "refusal", f),
+                        _ => {}
                     }
                 }
             }
@@ -296,6 +354,34 @@ mod tests {
                 walk_request(v, f);
             }),
             ["plain"]
+        );
+    }
+
+    #[test]
+    fn request_walk_covers_tool_outputs_prompt_variables_and_tools() {
+        let mut v = json!({
+            "tools": [{"type": "function", "name": "f", "description": "FD", "parameters": {}}],
+            "prompt": {"id": "p", "variables": {"name": "PV", "doc": {"type": "input_text", "text": "PT"},
+                       "pic": {"type": "input_image", "image_url": "x"}}},
+            "input": [
+                {"type": "local_shell_call_output", "call_id": "1", "output": "LS"},
+                {"type": "shell_call_output", "call_id": "2", "output": [{"stdout": "SO", "stderr": "SE", "outcome": {"type": "exit", "exit_code": 0}}]},
+                {"type": "apply_patch_call_output", "call_id": "3", "status": "completed", "output": "AP"},
+                {"type": "mcp_call", "id": "4", "server_label": "s", "name": "n", "arguments": "{\"q\":\"MA\"}", "output": "MO"},
+                {"type": "mcp_approval_response", "approval_request_id": "5", "approve": false, "reason": "MR"},
+                {"type": "custom_tool_call_output", "call_id": "6", "output": [{"type": "input_text", "text": "CO"}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": "RF"}]},
+                {"type": "computer_call_output", "call_id": "7", "output": {"type": "computer_screenshot", "image_url": "x"}}
+            ]
+        });
+        let texts = collect(&mut v, |v, f| {
+            walk_request(v, f);
+        });
+        assert_eq!(
+            texts,
+            [
+                "FD", "PV", "PT", "LS", "SO", "SE", "AP", "MA", "MO", "MR", "CO", "RF"
+            ]
         );
     }
 }
