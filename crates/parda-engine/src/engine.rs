@@ -350,16 +350,21 @@ fn strictly_inside(inner: &Span, outer: &Span) -> bool {
     outer.start <= inner.start && inner.end <= outer.end && outer.len() > inner.len()
 }
 
-/// Resolve tier conflicts before the rank-based merge:
+/// Resolve tier conflicts, then merge, without ever losing coverage.
 ///
-/// * anything strictly inside a format match (an e-mail, URL, UPI id, …) is
+/// * Anything strictly inside a format match (an e-mail, URL, UPI id, …) is
 ///   part of it: "ravi" inside "ravi.k@gmail.com", or a phone number inside
-///   "9876543210@ybl", must not split it;
-/// * a model guess never overrides a format match: the model calling a
-///   Voter ID a passport number, or an API key an e-mail, loses to the rule.
-///   Only a model address or name that strictly contains a rule match (an
-///   address around a PIN code) still competes in the merge.
-fn absorb_contained(mut dets: Vec<Detection>) -> Vec<Detection> {
+///   "9876543210@ybl", must not split it.
+/// * A model guess does not decide the kind of a format match: the model
+///   calling a Voter ID a passport number, or an API key an e-mail, loses
+///   to the rule. Only a model address or name that strictly contains a rule
+///   match (an address around a PIN code) competes in the merge.
+/// * Coverage is the union of every tier: whatever part of a losing
+///   detection no winner covers (the rest of an address around a validated
+///   phone number, the name part of an odd e-mail) is still redacted, as its
+///   own segment of the loser's kind. Tier conflicts can change kinds, never
+///   shrink what is hidden.
+fn resolve(text: &str, dets: Vec<Detection>) -> Vec<Detection> {
     let rules: Vec<(Span, bool)> = dets
         .iter()
         .filter(|d| matches!(d.source, Source::Rule { .. }))
@@ -374,24 +379,78 @@ fn absorb_contained(mut dets: Vec<Detection>) -> Vec<Detection> {
             (d.span, structured)
         })
         .collect();
-    dets.retain(|d| {
+    let mut competing = Vec::with_capacity(dets.len());
+    let mut deferred = Vec::new();
+    for d in dets {
         if rules
             .iter()
             .any(|(s, structured)| *structured && strictly_inside(&d.span, s))
         {
-            return false;
+            continue; // covered by the enclosing format match
         }
         if d.source == Source::Ml {
-            // Only an address or a name may wrap a format match (a PIN code
-            // inside an address); a model "e-mail" around an API key may not.
             let container = matches!(d.kind, EntityKind::Address | EntityKind::Person);
-            return !rules.iter().any(|(s, _)| {
-                s.overlaps(&d.span) && !(container && strictly_inside(s, &d.span))
+            if rules
+                .iter()
+                .any(|(s, _)| s.overlaps(&d.span) && !(container && strictly_inside(s, &d.span)))
+            {
+                deferred.push(d);
+                continue;
+            }
+        }
+        competing.push(d);
+    }
+    let winners = merge(competing.clone());
+    let mut out = winners.clone();
+    for d in competing
+        .iter()
+        .filter(|d| !winners.contains(d))
+        .chain(&deferred)
+    {
+        for seg in uncovered(text, d.span, &out) {
+            out.push(Detection {
+                span: seg,
+                ..d.clone()
             });
         }
-        true
-    });
-    dets
+    }
+    out.sort_by_key(|d| (d.span.start, d.span.end));
+    out
+}
+
+/// Parts of `span` not covered by `taken`, trimmed to letters and digits,
+/// that still contain at least one letter or digit.
+fn uncovered(text: &str, span: Span, taken: &[Detection]) -> Vec<Span> {
+    let mut cuts: Vec<Span> = taken
+        .iter()
+        .map(|d| d.span)
+        .filter(|s| s.overlaps(&span))
+        .collect();
+    cuts.sort_by_key(|s| s.start);
+    let mut gaps = Vec::new();
+    let mut pos = span.start;
+    for c in cuts {
+        if c.start > pos {
+            gaps.push(Span::new(pos, c.start));
+        }
+        pos = pos.max(c.end);
+    }
+    if pos < span.end {
+        gaps.push(Span::new(pos, span.end));
+    }
+    gaps.into_iter()
+        .filter_map(|g| {
+            let seg = text.get(g.start..g.end)?;
+            let start = g.start + seg.find(|c: char| c.is_alphanumeric())?;
+            let end = g.start
+                + seg
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| c.is_alphanumeric())
+                    .map(|(i, c)| i + c.len_utf8())?;
+            (start < end).then(|| Span::new(start, end))
+        })
+        .collect()
 }
 
 fn token_parts(s: &str) -> Vec<(usize, usize)> {
@@ -572,7 +631,7 @@ impl Inner {
                     dets.extend(m.iter().filter(|d| !not_a_name(f.body, d)).cloned());
                 }
             }
-            let dets = det.allow.filter(f.body, merge(absorb_contained(dets)));
+            let dets = det.allow.filter(f.body, resolve(f.body, dets));
             let dets = Arc::new(dets);
             if ml_ok {
                 self.cache.put(f.key, dets.clone());
@@ -915,6 +974,60 @@ impl Inner {
 mod tests {
     use super::*;
 
+    /// Text for span-only tests: every byte a letter.
+    static TXT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "x".repeat(80));
+
+    #[test]
+    fn coverage_is_kept_when_a_rule_wins() {
+        // An address around a validated phone: phone wins, the rest of the
+        // address is still redacted on both sides.
+        let t = "Flat 4, MG Road 9876543210 Pune 411001";
+        let p = t.find("9876543210").unwrap();
+        let out = resolve(
+            t,
+            vec![
+                d(0, t.len(), EntityKind::Address, Source::Ml),
+                d(
+                    p,
+                    p + 10,
+                    EntityKind::Phone,
+                    Source::Rule { validated: true },
+                ),
+            ],
+        );
+        let kinds: Vec<_> = out
+            .iter()
+            .map(|x| (x.kind.clone(), &t[x.span.start..x.span.end]))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (EntityKind::Address, "Flat 4, MG Road"),
+                (EntityKind::Phone, "9876543210"),
+                (EntityKind::Address, "Pune 411001"),
+            ]
+        );
+        // An odd e-mail the e-mail rule misses, with phone digits inside.
+        let t = "mail rahul.9876543210@corp-mail now";
+        let s0 = t.find("rahul").unwrap();
+        let e0 = t.find(" now").unwrap();
+        let p = t.find("9876543210").unwrap();
+        let out = resolve(
+            t,
+            vec![
+                d(s0, e0, EntityKind::Email, Source::Ml),
+                d(
+                    p,
+                    p + 10,
+                    EntityKind::Phone,
+                    Source::Rule { validated: true },
+                ),
+            ],
+        );
+        let texts: Vec<_> = out.iter().map(|x| &t[x.span.start..x.span.end]).collect();
+        assert_eq!(texts, vec!["rahul", "9876543210", "corp-mail"]);
+    }
+
     #[test]
     fn token_parts_and_core() {
         assert_eq!(
@@ -942,7 +1055,7 @@ mod tests {
                 source: Source::Rule { validated: false },
             },
         ];
-        let out = merge(absorb_contained(dets));
+        let out = resolve(&TXT, dets);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, EntityKind::Email);
     }
@@ -972,7 +1085,10 @@ mod tests {
         let t2 = "Ask Claude, Pan and Ola";
         for w in ["Claude", "Pan", "Ola"] {
             let s = t2.find(w).unwrap();
-            assert!(!not_a_name(t2, &d(s, s + w.len(), EntityKind::Person, Source::Ml)), "{w}");
+            assert!(
+                !not_a_name(t2, &d(s, s + w.len(), EntityKind::Person, Source::Ml)),
+                "{w}"
+            );
         }
         // Only model guesses are filtered; the user's dictionary always wins.
         let mut dict = at("Jaipur");
@@ -983,43 +1099,56 @@ mod tests {
     #[test]
     fn longer_format_match_wins_over_validated_inner_match() {
         // "9876543210@ybl": a validated phone inside an (unvalidated) UPI id.
-        let out = merge(absorb_contained(vec![
-            d(0, 10, EntityKind::Phone, Source::Rule { validated: true }),
-            d(0, 14, EntityKind::Upi, Source::Rule { validated: false }),
-        ]));
+        let out = resolve(
+            &TXT,
+            vec![
+                d(0, 10, EntityKind::Phone, Source::Rule { validated: true }),
+                d(0, 14, EntityKind::Upi, Source::Rule { validated: false }),
+            ],
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, EntityKind::Upi);
     }
 
     #[test]
     fn model_does_not_relabel_a_format_match() {
-        let out = merge(absorb_contained(vec![
-            d(7, 17, EntityKind::Passport, Source::Ml),
-            d(
-                7,
-                17,
-                EntityKind::VoterId,
-                Source::Rule { validated: false },
-            ),
-        ]));
+        let out = resolve(
+            &TXT,
+            vec![
+                d(7, 17, EntityKind::Passport, Source::Ml),
+                d(
+                    7,
+                    17,
+                    EntityKind::VoterId,
+                    Source::Rule { validated: false },
+                ),
+            ],
+        );
         assert_eq!(out[0].kind, EntityKind::VoterId);
         // A model e-mail span that wraps an API key (plus a full stop) loses.
-        let out = merge(absorb_contained(vec![
-            d(7, 55, EntityKind::Email, Source::Ml),
-            d(7, 54, EntityKind::Secret, Source::Rule { validated: false }),
-        ]));
+        let t = "Value: xoxb-123456789012-123456789012-abcdefghijklmnop.";
+        let out = resolve(
+            t,
+            vec![
+                d(7, 55, EntityKind::Email, Source::Ml),
+                d(7, 54, EntityKind::Secret, Source::Rule { validated: false }),
+            ],
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, EntityKind::Secret);
         // …but a model address that covers a PIN code still wins.
-        let out = merge(absorb_contained(vec![
-            d(0, 40, EntityKind::Address, Source::Ml),
-            d(
-                34,
-                40,
-                EntityKind::Custom("Pin".into()),
-                Source::Rule { validated: false },
-            ),
-        ]));
+        let out = resolve(
+            &TXT,
+            vec![
+                d(0, 40, EntityKind::Address, Source::Ml),
+                d(
+                    34,
+                    40,
+                    EntityKind::Custom("Pin".into()),
+                    Source::Rule { validated: false },
+                ),
+            ],
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, EntityKind::Address);
     }
