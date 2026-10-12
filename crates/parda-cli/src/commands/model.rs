@@ -81,6 +81,8 @@ pub fn pull(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+const FP32_TIMEOUT_MS: u64 = 1000;
+
 pub fn use_model(id: &str) -> anyhow::Result<()> {
     let p = paths()?;
     p.ensure()?;
@@ -92,6 +94,14 @@ pub fn use_model(id: &str) -> anyhow::Result<()> {
     }
     let mut config = load_config(&p)?;
     config.detect.model = id.to_string();
+    // The fine-tuned model runs in full precision (~4x slower than the INT8
+    // default); give it room so strict mode does not refuse long new text.
+    if id == "parda-pii-edge" && config.detect.ml_timeout_ms < FP32_TIMEOUT_MS {
+        config.detect.ml_timeout_ms = FP32_TIMEOUT_MS;
+        println!(
+            "detect.ml_timeout_ms = {FP32_TIMEOUT_MS} (full-precision model needs a larger time budget)"
+        );
+    }
     write_private(&p.config_file(), &config.to_toml_string()?)?;
     println!("detect.model = \"{id}\" — restart the daemon to load it");
     Ok(())

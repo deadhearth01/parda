@@ -182,3 +182,21 @@ fn off_passes_text_through_with_warning_and_on_resumes() {
         .success()
         .stdout(predicate::str::contains("ravi.k@").not());
 }
+
+#[test]
+fn using_the_fp32_model_raises_the_ml_time_budget() {
+    let h = home();
+    let dir = h.path().join("data/models/parda-pii-edge");
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in ["model.onnx", "tokenizer.json", "gliner_config.json"] {
+        std::fs::write(dir.join(f), b"x").unwrap();
+    }
+    parda(&h)
+        .args(["model", "use", "parda-pii-edge"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ml_timeout_ms = 1000"));
+    let cfg = std::fs::read_to_string(h.path().join("config.toml")).unwrap();
+    assert!(cfg.contains("ml_timeout_ms = 1000"), "{cfg}");
+    assert!(cfg.contains("model = \"parda-pii-edge\""), "{cfg}");
+}
