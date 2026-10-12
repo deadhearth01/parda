@@ -1,6 +1,8 @@
 //! OpenAI Responses API: request/response walkers and the SSE rewriter.
 
-use serde_json::{Value, json};
+use std::collections::HashMap;
+
+use serde_json::{Map, Value, json};
 
 use crate::sse::{Restorers, SseEvent, StreamRewriter};
 use crate::walk::{Unscanned, Visit, json_string, str_field, type_of};
@@ -182,47 +184,104 @@ fn output_item(item: &mut Value, f: Visit<'_>) {
 
 pub(crate) struct ResponsesStream {
     restorers: Restorers,
+    /// item_id / output_index / content_index of each open restorer key,
+    /// for synthetic deltas flushed after the item's own events.
+    meta: HashMap<String, Map<String, Value>>,
+    /// Next `sequence_number` to send: events are renumbered so synthetic
+    /// deltas and held-back ones leave neither duplicates nor gaps.
+    next_seq: Option<u64>,
 }
+
+/// The streamed fields parda restores, by restorer key prefix.
+const DELTAS: [(&str, &str); 4] = [
+    ("text:", "response.output_text.delta"),
+    ("args:", "response.function_call_arguments.delta"),
+    ("custom:", "response.custom_tool_call_input.delta"),
+    ("refusal:", "response.refusal.delta"),
+];
 
 impl ResponsesStream {
     pub(crate) fn new(restorers: Restorers) -> Self {
-        ResponsesStream { restorers }
+        ResponsesStream {
+            restorers,
+            meta: HashMap::new(),
+            next_seq: None,
+        }
     }
 
-    fn text_key(v: &Value) -> String {
-        format!(
-            "text:{}:{}",
-            v.get("item_id").and_then(Value::as_str).unwrap_or(""),
-            v.get("content_index").and_then(Value::as_u64).unwrap_or(0)
-        )
+    fn id(v: &Value) -> &str {
+        v.get("item_id").and_then(Value::as_str).unwrap_or("")
     }
 
-    fn args_key(v: &Value) -> String {
-        format!(
-            "args:{}",
-            v.get("item_id").and_then(Value::as_str).unwrap_or("")
-        )
+    fn content_index(v: &Value) -> u64 {
+        v.get("content_index").and_then(Value::as_u64).unwrap_or(0)
     }
 
-    /// A synthetic `*.delta` event carrying held-back text, modelled on the
-    /// `*.done` event `v` that is about to be forwarded.
-    fn flush(&mut self, key: &str, delta_type: &str, v: &Value, out: &mut Vec<SseEvent>) {
+    /// The restorer key for a delta / done event, and whether it is JSON.
+    fn key_of(ty: &str, v: &Value) -> Option<(String, bool)> {
+        let key = match ty {
+            "response.output_text.delta" | "response.output_text.done" => {
+                format!("text:{}:{}", Self::id(v), Self::content_index(v))
+            }
+            "response.function_call_arguments.delta" | "response.function_call_arguments.done" => {
+                return Some((format!("args:{}", Self::id(v)), true));
+            }
+            "response.custom_tool_call_input.delta" | "response.custom_tool_call_input.done" => {
+                format!("custom:{}", Self::id(v))
+            }
+            "response.refusal.delta" | "response.refusal.done" => {
+                format!("refusal:{}:{}", Self::id(v), Self::content_index(v))
+            }
+            _ => return None,
+        };
+        Some((key, false))
+    }
+
+    fn delta_type(key: &str) -> &'static str {
+        DELTAS
+            .iter()
+            .find(|(prefix, _)| key.starts_with(prefix))
+            .map_or("response.output_text.delta", |(_, t)| t)
+    }
+
+    /// A synthetic delta carrying the held-back text of `key`.
+    fn flush(&mut self, key: &str, out: &mut Vec<SseEvent>) {
+        let meta = self.meta.remove(key).unwrap_or_default();
         let rest = self.restorers.finish(key);
         if rest.is_empty() {
             return;
         }
-        let mut d = json!({"type": delta_type, "delta": rest});
-        for k in [
-            "item_id",
-            "output_index",
-            "content_index",
-            "sequence_number",
-        ] {
-            if let Some(x) = v.get(k) {
-                d[k] = x.clone();
-            }
+        let delta_type = Self::delta_type(key);
+        let mut d = meta;
+        d.insert("type".into(), json!(delta_type));
+        d.insert("delta".into(), json!(rest));
+        // Renumbered by `emit`.
+        d.insert("sequence_number".into(), json!(0));
+        self.emit(
+            SseEvent::new(Some(delta_type), Value::Object(d).to_string()),
+            out,
+        );
+    }
+
+    fn flush_all(&mut self, out: &mut Vec<SseEvent>) {
+        for key in self.restorers.open_keys() {
+            self.flush(&key, out);
         }
-        out.push(SseEvent::new(Some(delta_type), d.to_string()));
+    }
+
+    /// Send an event, renumbering its `sequence_number`.
+    fn emit(&mut self, mut ev: SseEvent, out: &mut Vec<SseEvent>) {
+        if let Ok(mut v) = serde_json::from_str::<Value>(&ev.data)
+            && let Some(n) = v.get("sequence_number").and_then(Value::as_u64)
+        {
+            let next = *self.next_seq.get_or_insert(n);
+            if n != next {
+                v["sequence_number"] = json!(next);
+                ev.set_data(v.to_string());
+            }
+            self.next_seq = Some(next + 1);
+        }
+        out.push(ev);
     }
 
     fn restore_all(&self, v: &mut Value, walk: impl Fn(&mut Value, Visit<'_>)) {
@@ -239,40 +298,48 @@ impl StreamRewriter for ResponsesStream {
         };
         let ty = type_of(&v).to_string();
         match ty.as_str() {
-            "response.output_text.delta" => {
-                let key = Self::text_key(&v);
+            "response.output_text.delta"
+            | "response.function_call_arguments.delta"
+            | "response.custom_tool_call_input.delta"
+            | "response.refusal.delta" => {
+                let Some((key, json_mode)) = Self::key_of(&ty, &v) else {
+                    self.emit(ev, out);
+                    return;
+                };
+                self.meta.entry(key.clone()).or_insert_with(|| {
+                    ["item_id", "output_index", "content_index"]
+                        .into_iter()
+                        .filter_map(|k| Some((k.to_string(), v.get(k)?.clone())))
+                        .collect()
+                });
                 if let Some(Value::String(d)) = v.get_mut("delta") {
-                    let restored = self.restorers.push(&key, d);
+                    let restored = if json_mode {
+                        self.restorers.push_json(&key, d)
+                    } else {
+                        self.restorers.push(&key, d)
+                    };
                     if restored.is_empty() {
-                        return;
+                        return; // held back; `emit` keeps the numbering dense
                     }
                     *d = restored;
                     ev.set_data(v.to_string());
                 }
             }
-            "response.function_call_arguments.delta" => {
-                let key = Self::args_key(&v);
-                if let Some(Value::String(d)) = v.get_mut("delta") {
-                    let restored = self.restorers.push_json(&key, d);
-                    if restored.is_empty() {
-                        return;
-                    }
-                    *d = restored;
-                    ev.set_data(v.to_string());
+            "response.output_text.done"
+            | "response.function_call_arguments.done"
+            | "response.custom_tool_call_input.done"
+            | "response.refusal.done" => {
+                if let Some((key, _)) = Self::key_of(&ty, &v) {
+                    self.flush(&key, out);
                 }
-            }
-            "response.output_text.done" => {
-                let key = Self::text_key(&v);
-                self.flush(&key, "response.output_text.delta", &v, out);
-                self.restore_all(&mut v, |v, f| str_field(v, "text", f));
-                ev.set_data(v.to_string());
-            }
-            "response.function_call_arguments.done" => {
-                let key = Self::args_key(&v);
-                self.flush(&key, "response.function_call_arguments.delta", &v, out);
-                self.restore_all(&mut v, |v, f| {
-                    if let Some(Value::String(a)) = v.get_mut("arguments") {
-                        json_string(a, f);
+                self.restore_all(&mut v, |v, f| match type_of(v) {
+                    "response.output_text.done" => str_field(v, "text", f),
+                    "response.custom_tool_call_input.done" => str_field(v, "input", f),
+                    "response.refusal.done" => str_field(v, "refusal", f),
+                    _ => {
+                        if let Some(Value::String(a)) = v.get_mut("arguments") {
+                            json_string(a, f);
+                        }
                     }
                 });
                 ev.set_data(v.to_string());
@@ -281,6 +348,7 @@ impl StreamRewriter for ResponsesStream {
                 self.restore_all(&mut v, |v, f| {
                     if let Some(p) = v.get_mut("part") {
                         str_field(p, "text", f);
+                        str_field(p, "refusal", f);
                     }
                 });
                 ev.set_data(v.to_string());
@@ -294,14 +362,7 @@ impl StreamRewriter for ResponsesStream {
                 ev.set_data(v.to_string());
             }
             "response.completed" | "response.incomplete" | "response.failed" => {
-                for key in self.restorers.open_keys() {
-                    let delta_type = if key.starts_with("args:") {
-                        "response.function_call_arguments.delta"
-                    } else {
-                        "response.output_text.delta"
-                    };
-                    self.flush(&key, delta_type, &json!({}), out);
-                }
+                self.flush_all(out);
                 self.restore_all(&mut v, |v, f| {
                     if let Some(r) = v.get_mut("response") {
                         walk_response(r, f);
@@ -311,18 +372,11 @@ impl StreamRewriter for ResponsesStream {
             }
             _ => {}
         }
-        out.push(ev);
+        self.emit(ev, out);
     }
 
     fn on_end(&mut self, out: &mut Vec<SseEvent>) {
-        for key in self.restorers.open_keys() {
-            let delta_type = if key.starts_with("args:") {
-                "response.function_call_arguments.delta"
-            } else {
-                "response.output_text.delta"
-            };
-            self.flush(&key, delta_type, &json!({}), out);
-        }
+        self.flush_all(out);
     }
 }
 
