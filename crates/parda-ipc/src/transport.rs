@@ -71,7 +71,8 @@ pub fn is_not_running(err: &anyhow::Error) -> bool {
     })
 }
 
-/// Resolve `<runtime_dir>/parda.sock` on Unix or `parda-<USERNAME>` on Windows.
+/// Resolve `<runtime_dir>/parda.sock` on Unix or `parda-<USERNAME>-<hash of runtime_dir>`
+/// on Windows.
 /// On Windows, `PARDA_PIPE_NAME` overrides the full namespaced pipe name.
 ///
 /// # Panics
@@ -91,7 +92,7 @@ fn checked_socket_name(runtime_dir: &Path) -> io::Result<Name<'static>> {
 }
 
 #[cfg(windows)]
-fn checked_socket_name(_runtime_dir: &Path) -> io::Result<Name<'static>> {
+fn checked_socket_name(runtime_dir: &Path) -> io::Result<Name<'static>> {
     use interprocess::local_socket::GenericNamespaced;
     let name = match std::env::var_os("PARDA_PIPE_NAME") {
         Some(name) => name,
@@ -100,10 +101,24 @@ fn checked_socket_name(_runtime_dir: &Path) -> io::Result<Name<'static>> {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "USERNAME is not set"))?;
             let mut name = std::ffi::OsString::from("parda-");
             name.push(user);
+            // One pipe per runtime directory, so separate PARDA_HOMEs (and
+            // parallel test daemons) never share a pipe.
+            name.push(format!(
+                "-{:08x}",
+                fnv1a(runtime_dir.as_os_str().as_encoded_bytes())
+            ));
             name
         }
     };
     name.to_ns_name::<GenericNamespaced>()
+}
+
+/// 32-bit FNV-1a: stable across Rust versions, unlike `DefaultHasher`.
+#[cfg(windows)]
+fn fnv1a(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5u32, |h, &b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    })
 }
 
 /// Application requests run on Tokio's blocking pool. `Hello` and `Subscribe`
