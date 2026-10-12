@@ -177,6 +177,14 @@ pub fn from_clip(ev: &ClipEvent) -> Event {
             Default::default(),
             true,
         ),
+        ClipEvent::OriginalNotRestored { reason } => (
+            format!(
+                "pasted, but the original could not be put back — the redacted text is still \
+                 on the clipboard ({reason})"
+            ),
+            Default::default(),
+            true,
+        ),
     };
     let mut e = Event::now("clipboard", summary);
     e.counts = counts;
