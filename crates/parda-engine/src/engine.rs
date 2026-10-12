@@ -5,9 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parda_core::{
-    Action, Config, Detection, EntityKind, MlDetector, Mode, Source, Span, Style, merge,
-};
+use parda_core::{Action, Config, Detection, EntityKind, MlDetector, Mode, Source, Span, Style};
 use parda_detect::{AllowList, Detector, DictionaryDetector, RuleDetector, RulesFile};
 use parda_vault::surrogate::{SurrogateGen, apply_case, token};
 use parda_vault::{Store, load_or_create_key};
@@ -15,9 +13,10 @@ use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 
 use crate::cache::{self, DetCache};
-use crate::fragment::{DEFAULT_MAX_FRAGMENT_BYTES, split_fragments};
+use crate::fragment::{DEFAULT_MAX_FRAGMENT_BYTES, ml_windows};
 use crate::index::ScopeIndex;
 use crate::ml::MlWorker;
+use crate::resolve::{flatten, resolve};
 use crate::restore::{Entry, RestoreTable, case_insensitive};
 use crate::stream::StreamRestorer;
 
@@ -365,111 +364,20 @@ pub fn source_label(source: &Source) -> &'static str {
     }
 }
 
-fn strictly_inside(inner: &Span, outer: &Span) -> bool {
-    outer.start <= inner.start && inner.end <= outer.end && outer.len() > inner.len()
+/// ML cache key: the window text, salted with the model so results of one
+/// model are never served for another.
+fn ml_key(model: &str, window: &str) -> cache::Key {
+    cache::key(&format!("ml\u{0}{model}"), 0, window)
 }
 
-/// Resolve tier conflicts, then merge, without ever losing coverage.
-///
-/// * Anything strictly inside a format match (an e-mail, URL, UPI id, …) is
-///   part of it: "ravi" inside "ravi.k@gmail.com", or a phone number inside
-///   "9876543210@ybl", must not split it.
-/// * A model guess does not decide the kind of a format match: the model
-///   calling a Voter ID a passport number, or an API key an e-mail, loses
-///   to the rule. Only a model address or name that strictly contains a rule
-///   match (an address around a PIN code) competes in the merge.
-/// * Coverage is the union of every tier: whatever part of a losing
-///   detection no winner covers (the rest of an address around a validated
-///   phone number, the name part of an odd e-mail) is still redacted, as its
-///   own segment of the loser's kind. Tier conflicts can change kinds, never
-///   shrink what is hidden.
-fn resolve(text: &str, dets: Vec<Detection>) -> Vec<Detection> {
-    let rules: Vec<(Span, bool)> = dets
-        .iter()
-        .filter(|d| matches!(d.source, Source::Rule { .. }))
-        .map(|d| {
-            let structured = !matches!(
-                d.kind,
-                EntityKind::Person
-                    | EntityKind::Address
-                    | EntityKind::Organization
-                    | EntityKind::Custom(_)
-            );
-            (d.span, structured)
-        })
-        .collect();
-    let mut competing = Vec::with_capacity(dets.len());
-    let mut deferred = Vec::new();
-    for d in dets {
-        if rules
-            .iter()
-            .any(|(s, structured)| *structured && strictly_inside(&d.span, s))
-        {
-            continue; // covered by the enclosing format match
-        }
-        if d.source == Source::Ml {
-            let container = matches!(d.kind, EntityKind::Address | EntityKind::Person);
-            if rules
-                .iter()
-                .any(|(s, _)| s.overlaps(&d.span) && !(container && strictly_inside(s, &d.span)))
-            {
-                deferred.push(d);
-                continue;
-            }
-        }
-        competing.push(d);
-    }
-    let winners = merge(competing.clone());
-    let mut out = winners.clone();
-    for d in competing
-        .iter()
-        .filter(|d| !winners.contains(d))
-        .chain(&deferred)
-    {
-        for seg in uncovered(text, d.span, &out) {
-            out.push(Detection {
-                span: seg,
-                ..d.clone()
-            });
-        }
-    }
-    out.sort_by_key(|d| (d.span.start, d.span.end));
-    out
-}
-
-/// Parts of `span` not covered by `taken`, trimmed to letters and digits,
-/// that still contain at least one letter or digit.
-fn uncovered(text: &str, span: Span, taken: &[Detection]) -> Vec<Span> {
-    let mut cuts: Vec<Span> = taken
-        .iter()
-        .map(|d| d.span)
-        .filter(|s| s.overlaps(&span))
-        .collect();
-    cuts.sort_by_key(|s| s.start);
-    let mut gaps = Vec::new();
-    let mut pos = span.start;
-    for c in cuts {
-        if c.start > pos {
-            gaps.push(Span::new(pos, c.start));
-        }
-        pos = pos.max(c.end);
-    }
-    if pos < span.end {
-        gaps.push(Span::new(pos, span.end));
-    }
-    gaps.into_iter()
-        .filter_map(|g| {
-            let seg = text.get(g.start..g.end)?;
-            let start = g.start + seg.find(|c: char| c.is_alphanumeric())?;
-            let end = g.start
-                + seg
-                    .char_indices()
-                    .rev()
-                    .find(|(_, c)| c.is_alphanumeric())
-                    .map(|(i, c)| i + c.len_utf8())?;
-            (start < end).then(|| Span::new(start, end))
-        })
-        .collect()
+/// A model span is usable only if it is non-empty, inside `body` and on
+/// character boundaries (another `MlDetector` implementation may get this
+/// wrong; slicing with a bad span would panic).
+fn valid_span(body: &str, span: Span) -> bool {
+    span.start < span.end
+        && span.end <= body.len()
+        && body.is_char_boundary(span.start)
+        && body.is_char_boundary(span.end)
 }
 
 fn token_parts(s: &str) -> Vec<(usize, usize)> {
@@ -544,37 +452,48 @@ impl Inner {
 
     /// Run the tiers over `texts`. Returns per-text detections (merged,
     /// allow-listed, sorted), ML milliseconds and whether ML was skipped.
+    ///
+    /// The dictionary and rule tiers always see each text whole (they are
+    /// linear and cheap), so no split can cut a value they would find. Only
+    /// the model runs per window ([`ml_windows`], overlapping), with its
+    /// results cached per window; the final result is cached per text.
     fn detect(&self, det: &Detectors, texts: &[&str]) -> Result<(Vec<Vec<Detection>>, u64, bool)> {
-        struct Frag<'a> {
-            text_idx: usize,
+        let keys: Vec<cache::Key> = texts
+            .iter()
+            .map(|t| cache::key("final", det.epoch, t))
+            .collect();
+        let mut results: Vec<Option<Arc<Vec<Detection>>>> =
+            keys.iter().map(|k| self.cache.get(k)).collect();
+        let hits = results.iter().filter(|r| r.is_some()).count() as u64;
+        let misses: Vec<usize> = (0..texts.len()).filter(|&i| results[i].is_none()).collect();
+
+        // Model windows of the texts not in the final cache.
+        struct Win {
             span: Span,
-            body: &'a str,
             key: cache::Key,
         }
-        let mut frags = Vec::new();
-        for (ti, text) in texts.iter().enumerate() {
-            for span in split_fragments(text, DEFAULT_MAX_FRAGMENT_BYTES) {
-                let body = &text[span.start..span.end];
-                frags.push(Frag {
-                    text_idx: ti,
-                    span,
-                    body,
-                    key: cache::key("final", det.epoch, body),
-                });
+        let ml_required = det.ml_required();
+        let model = self.ml.as_ref().map_or("", |m| m.name());
+        let mut windows: HashMap<usize, Vec<Win>> = HashMap::new();
+        if ml_required {
+            for &ti in &misses {
+                let text = texts[ti];
+                let w = ml_windows(text, DEFAULT_MAX_FRAGMENT_BYTES)
+                    .into_iter()
+                    .map(|span| Win {
+                        span,
+                        key: ml_key(model, &text[span.start..span.end]),
+                    })
+                    .collect();
+                windows.insert(ti, w);
             }
         }
+        let fragments: u64 = windows.values().map(|w| w.len() as u64).sum();
 
-        let mut results: Vec<Option<Arc<Vec<Detection>>>> =
-            frags.iter().map(|f| self.cache.get(&f.key)).collect();
-        let hits = results.iter().filter(|r| r.is_some()).count() as u64;
-
-        // ML for fragments not in the final cache.
-        let ml_required = det.ml_required();
         let strict = det.config.detect.mode == Mode::Strict;
         let mut ml_ms = 0;
         let mut ml_skipped = false;
         let mut ml_dets: HashMap<cache::Key, Arc<Vec<Detection>>> = HashMap::new();
-        let misses: Vec<usize> = (0..frags.len()).filter(|&i| results[i].is_none()).collect();
         if ml_required && !misses.is_empty() {
             match &self.ml {
                 None => {
@@ -584,21 +503,23 @@ impl Inner {
                     ml_skipped = true;
                 }
                 Some(worker) => {
-                    // Unique fragments that the model has not seen.
+                    // Unique windows that the model has not seen.
                     let mut texts_for_ml = Vec::new();
                     let mut keys_for_ml = Vec::new();
-                    for &i in &misses {
-                        let mk = cache::key("ml", 0, frags[i].body);
-                        if ml_dets.contains_key(&mk) || keys_for_ml.contains(&mk) {
-                            continue;
-                        }
-                        if let Some(d) = self.ml_cache.get(&mk) {
-                            ml_dets.insert(mk, d);
-                        } else if frags[i].body.chars().any(char::is_alphabetic) {
-                            texts_for_ml.push(frags[i].body.to_string());
-                            keys_for_ml.push(mk);
-                        } else {
-                            ml_dets.insert(mk, Arc::new(Vec::new()));
+                    for &ti in &misses {
+                        for w in &windows[&ti] {
+                            let body = &texts[ti][w.span.start..w.span.end];
+                            if ml_dets.contains_key(&w.key) || keys_for_ml.contains(&w.key) {
+                                continue;
+                            }
+                            if let Some(d) = self.ml_cache.get(&w.key) {
+                                ml_dets.insert(w.key, d);
+                            } else if body.chars().any(char::is_alphabetic) {
+                                texts_for_ml.push(body.to_string());
+                                keys_for_ml.push(w.key);
+                            } else {
+                                ml_dets.insert(w.key, Arc::new(Vec::new()));
+                            }
                         }
                     }
                     if !texts_for_ml.is_empty() {
@@ -639,36 +560,49 @@ impl Inner {
             self.stats.lock().ml_skipped += 1;
         }
 
-        for &i in &misses {
-            let f = &frags[i];
-            let mut dets = det.dict.detect(f.body);
-            dets.extend(det.rules.detect(f.body));
-            let ml_ok = !ml_required || !ml_skipped;
+        let ml_ok = !ml_required || !ml_skipped;
+        for &ti in &misses {
+            let text = texts[ti];
+            let mut dets = det.dict.detect(text);
+            dets.extend(det.rules.detect(text));
             if ml_required && !ml_skipped {
-                let mk = cache::key("ml", 0, f.body);
-                if let Some(m) = ml_dets.get(&mk) {
-                    dets.extend(m.iter().filter(|d| !not_a_name(f.body, d)).cloned());
+                let mut seen = std::collections::HashSet::new();
+                for w in &windows[&ti] {
+                    let Some(found) = ml_dets.get(&w.key) else {
+                        continue;
+                    };
+                    let body = &text[w.span.start..w.span.end];
+                    for d in found.iter() {
+                        if !valid_span(body, d.span) {
+                            tracing::warn!("ML detector returned an invalid span; ignored");
+                            continue;
+                        }
+                        let d = Detection {
+                            span: d.span.shifted(w.span.start),
+                            ..d.clone()
+                        };
+                        // Overlapping windows report the same entity twice.
+                        if not_a_name(text, &d) || !seen.insert((d.span, d.kind.clone())) {
+                            continue;
+                        }
+                        dets.push(d);
+                    }
                 }
             }
-            let dets = det.allow.filter(f.body, resolve(f.body, dets));
-            let dets = Arc::new(dets);
+            let dets = Arc::new(det.allow.filter(text, flatten(resolve(text, dets))));
             if ml_ok {
-                self.cache.put(f.key, dets.clone());
+                self.cache.put(keys[ti], dets.clone());
             }
-            results[i] = Some(dets);
+            results[ti] = Some(dets);
         }
 
-        let mut per_text: Vec<Vec<Detection>> = vec![Vec::new(); texts.len()];
-        for (f, r) in frags.iter().zip(results) {
-            for d in r.expect("filled above").iter() {
-                let mut d = d.clone();
-                d.span = d.span.shifted(f.span.start);
-                per_text[f.text_idx].push(d);
-            }
-        }
+        let per_text = results
+            .into_iter()
+            .map(|r| r.expect("filled above").as_ref().clone())
+            .collect();
         {
             let mut s = self.stats.lock();
-            s.fragments += frags.len() as u64;
+            s.fragments += fragments;
             s.cache_hits += hits;
         }
         Ok((per_text, ml_ms, ml_skipped))
@@ -994,60 +928,6 @@ impl Inner {
 mod tests {
     use super::*;
 
-    /// Text for span-only tests: every byte a letter.
-    static TXT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "x".repeat(80));
-
-    #[test]
-    fn coverage_is_kept_when_a_rule_wins() {
-        // An address around a validated phone: phone wins, the rest of the
-        // address is still redacted on both sides.
-        let t = "Flat 4, MG Road 9876543210 Pune 411001";
-        let p = t.find("9876543210").unwrap();
-        let out = resolve(
-            t,
-            vec![
-                d(0, t.len(), EntityKind::Address, Source::Ml),
-                d(
-                    p,
-                    p + 10,
-                    EntityKind::Phone,
-                    Source::Rule { validated: true },
-                ),
-            ],
-        );
-        let kinds: Vec<_> = out
-            .iter()
-            .map(|x| (x.kind.clone(), &t[x.span.start..x.span.end]))
-            .collect();
-        assert_eq!(
-            kinds,
-            vec![
-                (EntityKind::Address, "Flat 4, MG Road"),
-                (EntityKind::Phone, "9876543210"),
-                (EntityKind::Address, "Pune 411001"),
-            ]
-        );
-        // An odd e-mail the e-mail rule misses, with phone digits inside.
-        let t = "mail rahul.9876543210@corp-mail now";
-        let s0 = t.find("rahul").unwrap();
-        let e0 = t.find(" now").unwrap();
-        let p = t.find("9876543210").unwrap();
-        let out = resolve(
-            t,
-            vec![
-                d(s0, e0, EntityKind::Email, Source::Ml),
-                d(
-                    p,
-                    p + 10,
-                    EntityKind::Phone,
-                    Source::Rule { validated: true },
-                ),
-            ],
-        );
-        let texts: Vec<_> = out.iter().map(|x| &t[x.span.start..x.span.end]).collect();
-        assert_eq!(texts, vec!["rahul", "9876543210", "corp-mail"]);
-    }
-
     #[test]
     fn token_parts_and_core() {
         assert_eq!(
@@ -1057,27 +937,6 @@ mod tests {
         assert_eq!(core("Kumar,"), "Kumar");
         assert_eq!(core("(R.)"), "R");
         assert_eq!(core("..."), "");
-    }
-
-    #[test]
-    fn absorb_drops_name_inside_email() {
-        let dets = vec![
-            Detection {
-                span: Span::new(0, 4),
-                kind: EntityKind::Person,
-                score: 1.0,
-                source: Source::Dictionary,
-            },
-            Detection {
-                span: Span::new(0, 16),
-                kind: EntityKind::Email,
-                score: 0.9,
-                source: Source::Rule { validated: false },
-            },
-        ];
-        let out = resolve(&TXT, dets);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, EntityKind::Email);
     }
 
     fn d(s: usize, e: usize, kind: EntityKind, source: Source) -> Detection {
@@ -1117,59 +976,12 @@ mod tests {
     }
 
     #[test]
-    fn longer_format_match_wins_over_validated_inner_match() {
-        // "9876543210@ybl": a validated phone inside an (unvalidated) UPI id.
-        let out = resolve(
-            &TXT,
-            vec![
-                d(0, 10, EntityKind::Phone, Source::Rule { validated: true }),
-                d(0, 14, EntityKind::Upi, Source::Rule { validated: false }),
-            ],
-        );
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, EntityKind::Upi);
-    }
-
-    #[test]
-    fn model_does_not_relabel_a_format_match() {
-        let out = resolve(
-            &TXT,
-            vec![
-                d(7, 17, EntityKind::Passport, Source::Ml),
-                d(
-                    7,
-                    17,
-                    EntityKind::VoterId,
-                    Source::Rule { validated: false },
-                ),
-            ],
-        );
-        assert_eq!(out[0].kind, EntityKind::VoterId);
-        // A model e-mail span that wraps an API key (plus a full stop) loses.
-        let t = "Value: xoxb-123456789012-123456789012-abcdefghijklmnop.";
-        let out = resolve(
-            t,
-            vec![
-                d(7, 55, EntityKind::Email, Source::Ml),
-                d(7, 54, EntityKind::Secret, Source::Rule { validated: false }),
-            ],
-        );
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, EntityKind::Secret);
-        // …but a model address that covers a PIN code still wins.
-        let out = resolve(
-            &TXT,
-            vec![
-                d(0, 40, EntityKind::Address, Source::Ml),
-                d(
-                    34,
-                    40,
-                    EntityKind::Custom("Pin".into()),
-                    Source::Rule { validated: false },
-                ),
-            ],
-        );
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, EntityKind::Address);
+    fn invalid_model_spans_are_rejected() {
+        let body = "नमस्ते Ravi";
+        assert!(valid_span(body, Span::new(0, 3)));
+        assert!(!valid_span(body, Span::new(0, 1)), "not a char boundary");
+        assert!(!valid_span(body, Span::new(5, 5)), "empty");
+        assert!(!valid_span(body, Span::new(9, 3)), "reversed");
+        assert!(!valid_span(body, Span::new(0, 99)), "out of bounds");
     }
 }

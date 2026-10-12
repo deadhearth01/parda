@@ -16,5 +16,5 @@ pub use config::{
 pub use detection::{Detection, Source, Span};
 pub use error::{Error, Result};
 pub use kind::EntityKind;
-pub use merge::merge;
+pub use merge::{SpanSet, merge, preference};
 pub use ml::MlDetector;

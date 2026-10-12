@@ -84,3 +84,69 @@ pub fn ml_config(mode: parda_core::Mode, timeout_ms: u64) -> Config {
     c.detect.ml_timeout_ms = timeout_ms;
     c
 }
+
+/// ML stub that "finds" fixed names: every occurrence in its input window
+/// is reported as a Person, with an optional score.
+pub struct NameMl {
+    pub names: Vec<String>,
+    pub score: f32,
+}
+
+impl NameMl {
+    pub fn new(names: &[&str]) -> Arc<Self> {
+        Arc::new(NameMl {
+            names: names.iter().map(|s| s.to_string()).collect(),
+            score: 0.9,
+        })
+    }
+}
+
+impl MlDetector for NameMl {
+    fn name(&self) -> &str {
+        "names"
+    }
+    fn detect_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<Detection>>> {
+        Ok(texts
+            .iter()
+            .map(|t| {
+                let mut v = Vec::new();
+                for n in &self.names {
+                    for (i, _) in t.match_indices(n.as_str()) {
+                        v.push(Detection {
+                            span: parda_core::Span::new(i, i + n.len()),
+                            kind: parda_core::EntityKind::Person,
+                            score: self.score,
+                            source: parda_core::Source::Ml,
+                        });
+                    }
+                }
+                v
+            })
+            .collect())
+    }
+}
+
+/// ML stub returning nonsense spans (out of bounds, reversed, mid-character).
+pub struct BadSpanMl;
+
+impl MlDetector for BadSpanMl {
+    fn name(&self) -> &str {
+        "bad-spans"
+    }
+    fn detect_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<Detection>>> {
+        Ok(texts
+            .iter()
+            .map(|t| {
+                [(0, t.len() + 10), (5, 2), (1, 2), (3, 3)]
+                    .into_iter()
+                    .map(|(s, e)| Detection {
+                        span: parda_core::Span { start: s, end: e },
+                        kind: parda_core::EntityKind::Person,
+                        score: 0.99,
+                        source: parda_core::Source::Ml,
+                    })
+                    .collect()
+            })
+            .collect())
+    }
+}
