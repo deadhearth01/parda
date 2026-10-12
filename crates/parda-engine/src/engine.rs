@@ -111,6 +111,9 @@ pub struct EngineStats {
     pub ml_skipped: u64,
     pub ml_ms_total: u64,
     pub entities: BTreeMap<String, u64>,
+    /// Replacements by the tier that found them: `dictionary`,
+    /// `rules (checksum)`, `rules`, `model`.
+    pub by_source: BTreeMap<String, u64>,
     pub model: Option<String>,
     pub cache_entries: usize,
 }
@@ -287,29 +290,57 @@ fn create_private_dir(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Detections strictly inside a structured detection (an e-mail, URL, …)
-/// that came from the dictionary or the model are dropped: "ravi" inside
-/// "ravi.k@gmail.com" must not split the address.
+/// Human label of a detection tier, for statistics.
+pub fn source_label(source: &Source) -> &'static str {
+    match source {
+        Source::Dictionary => "dictionary",
+        Source::Rule { validated: true } => "rules (checksum)",
+        Source::Rule { validated: false } => "rules",
+        Source::Ml => "model",
+    }
+}
+
+fn strictly_inside(inner: &Span, outer: &Span) -> bool {
+    outer.start <= inner.start && inner.end <= outer.end && outer.len() > inner.len()
+}
+
+/// Resolve tier conflicts before the rank-based merge:
+///
+/// * anything strictly inside a format match (an e-mail, URL, UPI id, …) is
+///   part of it: "ravi" inside "ravi.k@gmail.com", or a phone number inside
+///   "9876543210@ybl", must not split it;
+/// * a model guess never overrides a format match it does not fully cover:
+///   the model calling a Voter ID a passport number, or an API key an
+///   e-mail, loses to the rule. A model span that strictly contains a rule
+///   match (an address around a PIN code) still competes in the merge.
 fn absorb_contained(mut dets: Vec<Detection>) -> Vec<Detection> {
-    let structured: Vec<Span> = dets
+    let rules: Vec<(Span, bool)> = dets
         .iter()
-        .filter(|d| {
-            matches!(d.source, Source::Rule { .. })
-                && !matches!(
-                    d.kind,
-                    EntityKind::Person
-                        | EntityKind::Address
-                        | EntityKind::Organization
-                        | EntityKind::Custom(_)
-                )
+        .filter(|d| matches!(d.source, Source::Rule { .. }))
+        .map(|d| {
+            let structured = !matches!(
+                d.kind,
+                EntityKind::Person
+                    | EntityKind::Address
+                    | EntityKind::Organization
+                    | EntityKind::Custom(_)
+            );
+            (d.span, structured)
         })
-        .map(|d| d.span)
         .collect();
     dets.retain(|d| {
-        matches!(d.source, Source::Rule { .. })
-            || !structured
+        if rules
+            .iter()
+            .any(|(s, structured)| *structured && strictly_inside(&d.span, s))
+        {
+            return false;
+        }
+        if d.source == Source::Ml {
+            return !rules
                 .iter()
-                .any(|s| s.start <= d.span.start && d.span.end <= s.end && s.len() > d.span.len())
+                .any(|(s, _)| s.overlaps(&d.span) && !strictly_inside(s, &d.span));
+        }
+        true
     });
     dets
 }
@@ -576,6 +607,7 @@ impl Inner {
         let style = det.config.replace.style;
         let mut out = Vec::with_capacity(texts.len());
         let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+        let mut sources: BTreeMap<String, u64> = BTreeMap::new();
         for (text, (dets, blocked, warned)) in texts.iter().zip(plans) {
             let mut new = String::with_capacity(text.len() + 16);
             let mut replaced = Vec::with_capacity(dets.len());
@@ -587,6 +619,9 @@ impl Inner {
                 new.push_str(&sur);
                 pos = d.span.end;
                 *counts.entry(d.kind.to_string()).or_insert(0) += 1;
+                *sources
+                    .entry(source_label(&d.source).to_string())
+                    .or_insert(0) += 1;
                 replaced.push(Replacement {
                     kind: d.kind,
                     source: d.source,
@@ -607,6 +642,9 @@ impl Inner {
         drop(indexes);
         let mut s = self.stats.lock();
         s.redactions += texts.len() as u64;
+        for (k, n) in sources {
+            *s.by_source.entry(k).or_insert(0) += n;
+        }
         for (k, n) in counts {
             *s.entities.entry(k).or_insert(0) += n;
         }
@@ -858,5 +896,51 @@ mod tests {
         let out = merge(absorb_contained(dets));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, EntityKind::Email);
+    }
+
+    fn d(s: usize, e: usize, kind: EntityKind, source: Source) -> Detection {
+        Detection {
+            span: Span::new(s, e),
+            kind,
+            score: 0.9,
+            source,
+        }
+    }
+
+    #[test]
+    fn longer_format_match_wins_over_validated_inner_match() {
+        // "9876543210@ybl": a validated phone inside an (unvalidated) UPI id.
+        let out = merge(absorb_contained(vec![
+            d(0, 10, EntityKind::Phone, Source::Rule { validated: true }),
+            d(0, 14, EntityKind::Upi, Source::Rule { validated: false }),
+        ]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, EntityKind::Upi);
+    }
+
+    #[test]
+    fn model_does_not_relabel_a_format_match() {
+        let out = merge(absorb_contained(vec![
+            d(7, 17, EntityKind::Passport, Source::Ml),
+            d(
+                7,
+                17,
+                EntityKind::VoterId,
+                Source::Rule { validated: false },
+            ),
+        ]));
+        assert_eq!(out[0].kind, EntityKind::VoterId);
+        // …but a model address that covers a PIN code still wins.
+        let out = merge(absorb_contained(vec![
+            d(0, 40, EntityKind::Address, Source::Ml),
+            d(
+                34,
+                40,
+                EntityKind::Custom("Pin".into()),
+                Source::Rule { validated: false },
+            ),
+        ]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, EntityKind::Address);
     }
 }

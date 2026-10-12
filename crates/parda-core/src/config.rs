@@ -112,7 +112,7 @@ impl Default for DetectConfig {
                 .to_vec(),
             dates: false,
             model: "default".into(),
-            ml_threshold: 0.5,
+            ml_threshold: 0.4,
             ml_timeout_ms: 250,
             execution_provider: "auto".into(),
             actions: BTreeMap::new(),

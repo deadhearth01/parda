@@ -38,7 +38,7 @@ enum Cmd {
         models: Option<PathBuf>,
         #[arg(long, default_value = "auto")]
         ep: String,
-        #[arg(long, default_value_t = 0.5)]
+        #[arg(long, default_value_t = 0.4)]
         threshold: f32,
         #[arg(long)]
         out: Option<PathBuf>,
@@ -152,6 +152,61 @@ fn run_eval(
             restored,
             ms,
         });
+    }
+    if std::env::var_os("PARDA_BENCH_MISSES").is_some() {
+        // The corpus is synthetic, so printing its values is fine.
+        for o in &outcomes {
+            for g in &o.case.entities {
+                let gs = parda_core::Span::new(g.start, g.end);
+                if !o
+                    .detections
+                    .iter()
+                    .any(|d| d.kind.to_string() == g.kind && eval::matches(&d.span, &gs))
+                {
+                    let near: Vec<String> = o
+                        .detections
+                        .iter()
+                        .filter(|d| d.span.overlaps(&gs))
+                        .map(|d| {
+                            format!(
+                                "{}:{:?}:{:?}",
+                                d.kind,
+                                d.source,
+                                &o.case.text[d.span.start..d.span.end]
+                            )
+                        })
+                        .collect();
+                    eprintln!(
+                        "MISS {} {:?} in {:?} — overlapping: {}",
+                        g.kind,
+                        &o.case.text[g.start..g.end],
+                        o.case.text,
+                        if near.is_empty() {
+                            "none".into()
+                        } else {
+                            near.join(", ")
+                        }
+                    );
+                }
+            }
+            for d in &o.detections {
+                let k = d.kind.to_string();
+                if o.case.entities.iter().any(|g| g.kind == k) || o.case.region() == "NEG" {
+                    let ok = o.case.entities.iter().any(|g| {
+                        g.kind == k
+                            && eval::matches(&d.span, &parda_core::Span::new(g.start, g.end))
+                    });
+                    if !ok {
+                        eprintln!(
+                            "FALSE {k}:{:?} {:?} in {:?}",
+                            d.source,
+                            &o.case.text[d.span.start..d.span.end],
+                            o.case.text
+                        );
+                    }
+                }
+            }
+        }
     }
     let report = eval::score(model, &outcomes);
     eprintln!(

@@ -138,20 +138,18 @@ pub fn default_model_id() -> &'static str {
 }
 
 /// Natural-language labels asked of the model and the kinds they map to.
-/// Organizations are deliberately absent in v0.1 (redacting company names
-/// costs answer quality for little privacy gain).
+///
+/// Kept to what the rule tier cannot do well. Identifier formats (Aadhaar,
+/// PAN, UPI, cards, passports …) are left to the checksum-validated rules:
+/// asking the model for them lowered Person recall on the golden corpus
+/// (0.93 with 11 labels) and made it relabel format matches. Organizations
+/// are absent on purpose (masking company names costs answer quality for
+/// little privacy gain).
 pub fn ml_labels() -> Vec<(&'static str, EntityKind)> {
     vec![
         ("person", EntityKind::Person),
         ("address", EntityKind::Address),
         ("email", EntityKind::Email),
         ("phone number", EntityKind::Phone),
-        ("date of birth", EntityKind::DateOfBirth),
-        ("aadhaar number", EntityKind::Aadhaar),
-        ("pan number", EntityKind::Pan),
-        ("upi id", EntityKind::Upi),
-        ("bank account number", EntityKind::BankAccount),
-        ("passport number", EntityKind::Passport),
-        ("credit card number", EntityKind::CreditCard),
     ]
 }

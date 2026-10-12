@@ -18,13 +18,13 @@ fn catalog_default_is_permissive_and_present() {
 }
 
 #[test]
-fn label_map_covers_people_and_indian_ids() {
+fn label_map_covers_people_and_leaves_formats_to_rules() {
     let labels = ml_labels();
     let kind = |l: &str| labels.iter().find(|(x, _)| *x == l).map(|(_, k)| k.clone());
     assert_eq!(kind("person"), Some(EntityKind::Person));
     assert_eq!(kind("address"), Some(EntityKind::Address));
-    assert_eq!(kind("aadhaar number"), Some(EntityKind::Aadhaar));
-    assert_eq!(kind("upi id"), Some(EntityKind::Upi));
+    // Checksum-bearing identifiers are the rule tier's job.
+    assert!(kind("aadhaar number").is_none());
     assert!(
         kind("organization").is_none(),
         "organizations are not redacted by default in v0.1"
