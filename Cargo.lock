@@ -2791,6 +2791,7 @@ dependencies = [
  "parda-vault",
  "parking_lot",
  "proptest",
+ "rusqlite",
  "serde",
  "tempfile",
  "thiserror 2.0.21",
