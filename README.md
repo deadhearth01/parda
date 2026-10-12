@@ -108,7 +108,7 @@ More: [architecture](docs/architecture.md) · [configuration](docs/configuration
 
 ## The model
 
-The default name/address detector is [knowledgator/gliner-pii-edge-v1.0](https://huggingface.co/knowledgator/gliner-pii-edge-v1.0) (Apache-2.0), INT8 ONNX, run with ONNX Runtime (CoreML / DirectML / CUDA when built with those features). On the bundled golden corpus it reaches Person recall 1.00 on Indian and global names at ~9 ms p95 per paragraph on an M-series CPU — see [bench/README.md](bench/README.md) and the [model card](MODEL_CARD.md). `parda model list` shows alternatives; `parda model import` installs your own fine-tuned export.
+The name/address detector is a small on-device GLiNER model run with ONNX Runtime. parda ships two: [knowledgator/gliner-pii-edge-v1.0](https://huggingface.co/knowledgator/gliner-pii-edge-v1.0) (Apache-2.0, INT8, ~9 ms per paragraph) and **parda-pii-edge**, our India-first fine-tune of it, which reaches person recall 1.00 on Indian and global names, precision 1.00 and zero leaked values on the golden corpus (base: 0.97 / 0.955, 0.92, 0.995). See [bench/README.md](bench/README.md), the [model card](MODEL_CARD.md) and the [data card](DATA_CARD.md). `parda model list` shows the options; `parda model import` installs your own export.
 
 ## Commands
 
