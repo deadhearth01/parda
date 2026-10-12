@@ -24,8 +24,8 @@ mod server;
 mod sse;
 mod walk;
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use parda_core::ProxyConfig;
@@ -35,7 +35,7 @@ use tokio::sync::broadcast;
 
 pub use route::{Provider, normalize_path};
 pub use server::{SCOPE_HEADER, bind, router, serve, serve_with_shutdown};
-pub use sse::{SseEvent, parse_sse, serialize};
+pub use sse::{SseEvent, SseParser, parse_sse, serialize};
 
 /// One proxied request, for the event feed. Never holds raw values.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -59,9 +59,14 @@ pub struct ProxyEvent {
     pub error: Option<String>,
 }
 
+/// Distinct vault scopes (`x-parda-scope`) one proxy accepts: each one
+/// keeps an in-memory restore index for the life of the daemon.
+pub const MAX_SCOPES: usize = 256;
+
 pub struct ProxyState {
     pub engine: Engine,
     cfg: RwLock<Arc<ProxyConfig>>,
+    scopes: Mutex<HashSet<String>>,
     pub events: broadcast::Sender<ProxyEvent>,
     pub http: reqwest::Client,
 }
@@ -81,6 +86,7 @@ impl ProxyState {
         Ok(Arc::new(ProxyState {
             engine,
             cfg: RwLock::new(Arc::new(cfg)),
+            scopes: Mutex::new(HashSet::new()),
             events,
             http,
         }))
@@ -89,6 +95,19 @@ impl ProxyState {
     /// The settings in force; each request uses one snapshot.
     pub fn config(&self) -> Arc<ProxyConfig> {
         self.cfg.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Admit a scope unless [`MAX_SCOPES`] others are already in use.
+    pub(crate) fn admit_scope(&self, scope: &str) -> bool {
+        let mut seen = self.scopes.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(scope) {
+            return true;
+        }
+        if seen.len() >= MAX_SCOPES {
+            return false;
+        }
+        seen.insert(scope.to_string());
+        true
     }
 
     /// Apply new settings to the running proxy. `listen` and `enabled` only

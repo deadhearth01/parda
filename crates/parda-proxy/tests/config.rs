@@ -84,3 +84,27 @@ async fn request_without_any_host_is_refused() {
     );
     assert_eq!(s.mock.count(), 0);
 }
+
+#[tokio::test]
+async fn distinct_scopes_are_capped() {
+    let s = setup(responder(|_| {
+        Reply::Json(StatusCode::OK, json!({"ok": true}))
+    }))
+    .await;
+    let send = |scope: String| {
+        s.client
+            .post(s.url("/v1/messages"))
+            .header("x-parda-scope", scope)
+            .json(&json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+    };
+    for i in 0..parda_proxy::MAX_SCOPES {
+        assert_eq!(send(format!("s{i}")).await.unwrap().status(), 200);
+    }
+    let resp = send("one-too-many".into()).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "parda_too_many_scopes");
+    // Scopes already in use keep working.
+    assert_eq!(send("s0".into()).await.unwrap().status(), 200);
+}

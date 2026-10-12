@@ -377,6 +377,19 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         return finish(&state, event, resp, Some("parda_forbidden".into()));
     }
     let scope = scope_of(&parts.headers);
+    if provider.rewrites() && !state.admit_scope(&scope) {
+        let resp = error_response(
+            provider,
+            StatusCode::BAD_REQUEST,
+            "parda_too_many_scopes",
+            &format!(
+                "this proxy already serves {} vault scopes (x-parda-scope); restart the \
+                 daemon to reset them",
+                crate::MAX_SCOPES
+            ),
+        );
+        return finish(&state, event, resp, Some("parda_too_many_scopes".into()));
+    }
     let body = match axum::body::to_bytes(body, cfg.max_body_bytes).await {
         Ok(b) => b,
         Err(_) => {

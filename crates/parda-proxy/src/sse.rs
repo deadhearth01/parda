@@ -16,6 +16,9 @@ use crate::jsonfrag::JsonFragRestorer;
 pub struct SseEvent {
     pub event: Option<String>,
     pub data: String,
+    /// `id:` and `retry:` fields, kept when the event is rewritten.
+    pub id: Option<String>,
+    pub retry: Option<String>,
     pub raw: Option<Bytes>,
 }
 
@@ -24,6 +27,8 @@ impl SseEvent {
         SseEvent {
             event: event.map(str::to_string),
             data,
+            id: None,
+            retry: None,
             raw: None,
         }
     }
@@ -35,32 +40,115 @@ impl SseEvent {
     }
 }
 
-/// Find the end of the first complete event: index just past its blank line.
-fn event_end(buf: &[u8]) -> Option<(usize, usize)> {
-    let mut i = 0;
-    while i < buf.len() {
-        if buf[i] == b'\n' {
-            if buf.get(i + 1) == Some(&b'\n') {
-                return Some((i, i + 2));
-            }
-            if buf.get(i + 1) == Some(&b'\r') && buf.get(i + 2) == Some(&b'\n') {
-                return Some((i, i + 3));
+/// Where the next event in `buf` ends, scanning from `from` (a line start).
+enum Scan {
+    /// `body_end` excludes the blank line; `total` includes it. `skip_lf`:
+    /// the blank line ended in a CR at the very end of the buffer, so a
+    /// following LF belongs to it.
+    Event {
+        body_end: usize,
+        total: usize,
+        skip_lf: bool,
+    },
+    /// No complete event yet; resume scanning at this line start.
+    Incomplete(usize),
+}
+
+fn scan(buf: &[u8], from: usize) -> Scan {
+    let mut pos = from;
+    loop {
+        let Some(off) = buf[pos..].iter().position(|&b| b == b'\r' || b == b'\n') else {
+            return Scan::Incomplete(pos);
+        };
+        let i = pos + off;
+        let blank = i == pos;
+        let (len, skip_lf) = if buf[i] == b'\n' {
+            (1, false)
+        } else if i + 1 < buf.len() {
+            (if buf[i + 1] == b'\n' { 2 } else { 1 }, false)
+        } else if blank {
+            // A blank line ended by a CR: the event is complete now.
+            (1, true)
+        } else {
+            // A CR at the end of a line: maybe half of a CRLF; wait.
+            return Scan::Incomplete(pos);
+        };
+        if blank {
+            return Scan::Event {
+                body_end: pos,
+                total: i + len,
+                skip_lf,
+            };
+        }
+        pos = i + len;
+    }
+}
+
+/// Incremental SSE parser for one stream. Lines may end in LF, CRLF or CR,
+/// and bytes already scanned are never scanned again.
+#[derive(Default)]
+pub struct SseParser {
+    buf: BytesMut,
+    /// Start of the first line not yet known to be complete and non-blank.
+    scanned: usize,
+    /// Drop a leading LF (the second half of a CRLF already used).
+    skip_lf: bool,
+}
+
+impl SseParser {
+    /// Add bytes; returns every event completed by them.
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
+        let chunk = match (self.skip_lf, chunk.first()) {
+            (true, Some(b'\n')) => &chunk[1..],
+            _ => chunk,
+        };
+        if !chunk.is_empty() {
+            self.skip_lf = false;
+        }
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        loop {
+            match scan(&self.buf, self.scanned) {
+                Scan::Event {
+                    body_end,
+                    total,
+                    skip_lf,
+                } => {
+                    let raw = self.buf.split_to(total).freeze();
+                    self.scanned = 0;
+                    self.skip_lf = skip_lf;
+                    if let Some(ev) = parse_block(&raw[..body_end], raw.clone()) {
+                        out.push(ev);
+                    }
+                    if self.skip_lf && self.buf.first() == Some(&b'\n') {
+                        let _ = self.buf.split_to(1);
+                        self.skip_lf = false;
+                    }
+                }
+                Scan::Incomplete(at) => {
+                    self.scanned = at;
+                    return out;
+                }
             }
         }
-        i += 1;
     }
-    None
+
+    /// Whatever is left when the stream ends without a final blank line.
+    pub fn finish(&mut self) -> Option<SseEvent> {
+        self.scanned = 0;
+        parse_rest(&mut self.buf)
+    }
 }
 
 /// Take every complete event out of `buf`; a trailing partial event stays.
 pub fn parse_sse(buf: &mut BytesMut) -> Vec<SseEvent> {
-    let mut out = Vec::new();
-    while let Some((body_end, total)) = event_end(buf) {
-        let raw = buf.split_to(total).freeze();
-        if let Some(ev) = parse_block(&raw[..body_end], raw.clone()) {
-            out.push(ev);
-        }
-    }
+    let mut p = SseParser {
+        buf: std::mem::take(buf),
+        scanned: 0,
+        skip_lf: false,
+    };
+    let out = p.feed(&[]);
+    *buf = p.buf;
     out
 }
 
@@ -76,12 +164,34 @@ pub(crate) fn parse_rest(buf: &mut BytesMut) -> Option<SseEvent> {
     parse_block(&raw, Bytes::from(with_end))
 }
 
+/// Split on LF, CRLF or CR.
+fn lines(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        match rest.find(['\r', '\n']) {
+            Some(i) => {
+                let line = &rest[..i];
+                let len = if rest[i..].starts_with("\r\n") { 2 } else { 1 };
+                rest = &rest[i + len..];
+                Some(line)
+            }
+            None => {
+                let line = rest;
+                rest = "";
+                Some(line)
+            }
+        }
+    })
+}
+
 fn parse_block(block: &[u8], raw: Bytes) -> Option<SseEvent> {
     let text = String::from_utf8_lossy(block);
-    let mut event = None;
+    let mut ev = SseEvent::new(None, String::new());
     let mut data: Option<String> = None;
-    for line in text.split('\n') {
-        let line = line.strip_suffix('\r').unwrap_or(line);
+    for line in lines(&text) {
         if line.is_empty() || line.starts_with(':') {
             continue;
         }
@@ -90,7 +200,7 @@ fn parse_block(block: &[u8], raw: Bytes) -> Option<SseEvent> {
             None => (line, ""),
         };
         match field {
-            "event" => event = Some(value.to_string()),
+            "event" => ev.event = Some(value.to_string()),
             "data" => match &mut data {
                 Some(d) => {
                     d.push('\n');
@@ -98,14 +208,14 @@ fn parse_block(block: &[u8], raw: Bytes) -> Option<SseEvent> {
                 }
                 None => data = Some(value.to_string()),
             },
+            "id" => ev.id = Some(value.to_string()),
+            "retry" => ev.retry = Some(value.to_string()),
             _ => {}
         }
     }
-    Some(SseEvent {
-        event,
-        data: data.unwrap_or_default(),
-        raw: Some(raw),
-    })
+    ev.data = data.unwrap_or_default();
+    ev.raw = Some(raw);
+    Some(ev)
 }
 
 pub fn serialize(ev: &SseEvent) -> Bytes {
@@ -113,6 +223,16 @@ pub fn serialize(ev: &SseEvent) -> Bytes {
         return raw.clone();
     }
     let mut s = String::with_capacity(ev.data.len() + 32);
+    if let Some(id) = &ev.id {
+        s.push_str("id: ");
+        s.push_str(id);
+        s.push('\n');
+    }
+    if let Some(retry) = &ev.retry {
+        s.push_str("retry: ");
+        s.push_str(retry);
+        s.push('\n');
+    }
     if let Some(e) = &ev.event {
         s.push_str("event: ");
         s.push_str(e);
@@ -207,6 +327,27 @@ impl Restorers {
     }
 }
 
+/// Run the rewriter off the async workers: restoring may wait on the
+/// engine's index lock, read the vault (SQLite) or rebuild an automaton.
+async fn rewrite(
+    mut rw: Box<dyn StreamRewriter>,
+    events: Vec<SseEvent>,
+    end: bool,
+) -> Option<(Box<dyn StreamRewriter>, Vec<SseEvent>)> {
+    tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        for ev in events {
+            rw.on_event(ev, &mut out);
+        }
+        if end {
+            rw.on_end(&mut out);
+        }
+        (rw, out)
+    })
+    .await
+    .ok()
+}
+
 /// Read the upstream body, rewrite events and send them to the client as
 /// soon as they are complete.
 pub(crate) async fn pump(
@@ -215,16 +356,21 @@ pub(crate) async fn pump(
     mut tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) {
     let mut stream = upstream.bytes_stream();
-    let mut buf = BytesMut::new();
-    let mut out = Vec::new();
+    let mut parser = SseParser::default();
+    let failed = || Err(std::io::Error::other("parda failed to rewrite the stream"));
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(b) => {
-                buf.extend_from_slice(&b);
-                for ev in parse_sse(&mut buf) {
-                    rw.on_event(ev, &mut out);
+                let events = parser.feed(&b);
+                if events.is_empty() {
+                    continue;
                 }
-                for ev in out.drain(..) {
+                let Some((back, out)) = rewrite(rw, events, false).await else {
+                    let _ = tx.send(failed()).await;
+                    return;
+                };
+                rw = back;
+                for ev in out {
                     if tx.send(Ok(serialize(&ev))).await.is_err() {
                         return; // client went away
                     }
@@ -237,11 +383,12 @@ pub(crate) async fn pump(
             }
         }
     }
-    if let Some(ev) = parse_rest(&mut buf) {
-        rw.on_event(ev, &mut out);
-    }
-    rw.on_end(&mut out);
-    for ev in out.drain(..) {
+    let rest: Vec<SseEvent> = parser.finish().into_iter().collect();
+    let Some((_, out)) = rewrite(rw, rest, true).await else {
+        let _ = tx.send(failed()).await;
+        return;
+    };
+    for ev in out {
         if tx.send(Ok(serialize(&ev))).await.is_err() {
             return;
         }
@@ -280,6 +427,55 @@ mod tests {
             serialize(&ev),
             Bytes::from_static(b"event: x\ndata: line1\ndata: line2\n\n")
         );
+    }
+
+    #[test]
+    fn id_and_retry_survive_a_rewrite() {
+        let mut buf = BytesMut::from(&b"id: 7\nretry: 1500\nevent: x\ndata: a\n\n"[..]);
+        let mut evs = parse_sse(&mut buf);
+        assert_eq!(evs.len(), 1);
+        evs[0].set_data("b".into());
+        assert_eq!(
+            serialize(&evs[0]),
+            Bytes::from_static(b"id: 7\nretry: 1500\nevent: x\ndata: b\n\n")
+        );
+    }
+
+    #[test]
+    fn cr_only_and_mixed_line_endings() {
+        let mut buf = BytesMut::from(&b"data: a\r\rdata: b\r\nevent: e\r\r\n"[..]);
+        let evs = parse_sse(&mut buf);
+        assert_eq!(evs.len(), 2, "{evs:?}");
+        assert_eq!(evs[0].data, "a");
+        assert_eq!(evs[1].data, "b");
+        assert_eq!(evs[1].event.as_deref(), Some("e"));
+
+        // A CRLF split across chunks is one line ending, not two.
+        let mut p = SseParser::default();
+        assert!(p.feed(b"data: x\r").is_empty());
+        let evs = p.feed(b"\n\r\ndata: y\n\n");
+        assert_eq!(evs.len(), 2);
+        assert_eq!((evs[0].data.as_str(), evs[1].data.as_str()), ("x", "y"));
+        // An event ended by a lone CR is delivered at once; a following LF
+        // (the rest of a CRLF) does not start an empty event.
+        let evs = p.feed(b"data: z\r\r");
+        assert_eq!(evs.len(), 1);
+        let evs = p.feed(b"\ndata: w\n\n");
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data, "w");
+    }
+
+    #[test]
+    fn chunks_are_not_rescanned() {
+        let mut p = SseParser::default();
+        for _ in 0..1000 {
+            assert!(p.feed(b"data: 0123456789\n").is_empty());
+        }
+        // Everything up to the last complete line is known to hold no
+        // event end and is not scanned again.
+        assert_eq!(p.scanned, p.buf.len());
+        assert_eq!(p.feed(b"\n").len(), 1);
+        assert!(p.buf.is_empty());
     }
 
     #[test]
