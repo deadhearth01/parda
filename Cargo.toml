@@ -71,7 +71,7 @@ ndarray = "0.16"
 # os integration
 interprocess = { version = "2", features = ["tokio"] }
 arboard = "3"
-global-hotkey = "0.7"
+global-hotkey = "0.8"
 enigo = "0.6"
 
 # ui / cli
