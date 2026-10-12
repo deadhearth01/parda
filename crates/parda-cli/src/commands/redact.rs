@@ -30,9 +30,14 @@ pub fn redact(text: Option<String>, scope: Option<String>, json: bool) -> anyhow
             let scope = scope.unwrap_or_else(|| engine.config().clipboard.scope);
             let r = engine.redact(&text, &scope)?;
             json!({"text": r.text, "replaced": r.replaced, "warned": r.warned,
-                   "ml_ms": r.ml_ms, "ml_skipped": r.ml_skipped})
+                   "ml_ms": r.ml_ms, "ml_skipped": r.ml_skipped, "paused": r.paused})
         }
     };
+    if result["paused"].as_bool() == Some(true) {
+        eprintln!(
+            "parda: protection is OFF — text was not redacted (turn it on with `parda on` or `p` in the TUI)"
+        );
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {

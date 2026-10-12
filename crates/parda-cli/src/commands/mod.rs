@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod env;
 pub mod model;
+pub mod protection;
 pub mod redact;
 pub mod rules;
 pub mod service;

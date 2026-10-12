@@ -1,10 +1,13 @@
 //! `parda tui`: a ratatui dashboard over the daemon's IPC socket.
 //!
-//! Tabs: 1 Dashboard · 2 Live · 3 Inspector · 4 Rules · 5 Vault · 6 Setup.
+//! Tabs: 1 Dashboard · 2 Live · 3 Inspector · 4 Rules · 5 Vault · 6 Settings.
+//! Keyboard and mouse: click tabs, rows and the protection switch; the wheel
+//! scrolls lists.
 //! The [`App`] is independent of the terminal and of the socket (see
 //! [`Backend`]) so it can be tested with ratatui's `TestBackend`.
 
 mod app;
+pub mod settings;
 mod tabs;
 
 use std::path::Path;
@@ -12,10 +15,13 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use parda_ipc::{Client, Event, Request};
-use ratatui::crossterm::event::{self, Event as TermEvent, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyEventKind,
+};
+use ratatui::crossterm::execute;
 use serde_json::Value;
 
-pub use app::{App, Tab};
+pub use app::{App, Hit, Tab};
 
 /// Where the app sends requests (the daemon, or a fake in tests).
 pub trait Backend {
@@ -83,17 +89,23 @@ pub fn run(runtime_dir: &Path) -> anyhow::Result<()> {
     });
 
     let mut terminal = ratatui::init();
+    // Mouse: click tabs/rows/switch, wheel scrolls. Text selection needs
+    // Shift (Option on macOS) while capture is on.
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let mut app = App::new();
     app.refresh(&mut client);
     let mut last_refresh = Instant::now();
     let result = (|| -> anyhow::Result<()> {
         while !app.should_quit() {
             terminal.draw(|f| app.draw(f))?;
-            if event::poll(Duration::from_millis(250))?
-                && let TermEvent::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                app.on_key(key, &mut client);
+            if event::poll(Duration::from_millis(250))? {
+                match event::read()? {
+                    TermEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                        app.on_key(key, &mut client)
+                    }
+                    TermEvent::Mouse(m) => app.on_mouse(m, &mut client),
+                    _ => {}
+                }
             }
             while let Ok(ev) = rx.try_recv() {
                 app.on_event(ev);
@@ -105,6 +117,7 @@ pub fn run(runtime_dir: &Path) -> anyhow::Result<()> {
         }
         Ok(())
     })();
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }

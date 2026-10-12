@@ -160,3 +160,25 @@ fn doctor_runs() {
         .success()
         .stdout(predicate::str::contains("daemon"));
 }
+
+#[test]
+fn off_passes_text_through_with_warning_and_on_resumes() {
+    let h = home();
+    parda(&h)
+        .arg("off")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OFF"));
+    parda(&h)
+        .args(["redact", "mail ravi.k@gmail.com"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ravi.k@gmail.com"))
+        .stderr(predicate::str::contains("protection is OFF"));
+    parda(&h).arg("on").assert().success();
+    parda(&h)
+        .args(["redact", "mail ravi.k@gmail.com"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ravi.k@").not());
+}

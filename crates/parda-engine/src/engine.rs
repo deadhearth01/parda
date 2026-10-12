@@ -88,6 +88,8 @@ pub struct Redaction {
     pub ml_ms: u64,
     /// The ML tier did not run (fast mode after a failure, or no model).
     pub ml_skipped: bool,
+    /// Protection is switched off: the text was passed through unchanged.
+    pub paused: bool,
 }
 
 impl Redaction {
@@ -257,7 +259,24 @@ impl Engine {
 
     /// Redact several texts (e.g. every string of one API request) with one
     /// ML batch. Fails as a whole if any text holds a blocked kind.
+    ///
+    /// With protection switched off every text comes back unchanged and
+    /// marked [`Redaction::paused`].
     pub fn redact_many(&self, texts: &[&str], scope: &str) -> Result<Vec<Redaction>> {
+        if !self.inner.detectors.read().config.protection.enabled {
+            return Ok(texts
+                .iter()
+                .map(|t| Redaction {
+                    text: (*t).to_string(),
+                    replaced: Vec::new(),
+                    blocked: Vec::new(),
+                    warned: Vec::new(),
+                    ml_ms: 0,
+                    ml_skipped: true,
+                    paused: true,
+                })
+                .collect());
+        }
         self.inner.redact_many(texts, scope)
     }
 
@@ -745,6 +764,7 @@ impl Inner {
                 warned,
                 ml_ms,
                 ml_skipped,
+                paused: false,
             });
         }
         drop(indexes);

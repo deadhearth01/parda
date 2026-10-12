@@ -320,3 +320,24 @@ fn stream_holds_back_only_partial_prefix() {
     assert_eq!(sr.push(&format!("{tail}!")), "Ravi Kumar!");
     assert_eq!(sr.finish(), "");
 }
+
+#[test]
+fn paused_protection_passes_text_through_but_still_restores() {
+    let (_d, e) = engine();
+    let sur = e.redact("Ravi Kumar", "global").unwrap().text;
+    let mut c = e.config();
+    c.protection.enabled = false;
+    e.set_config(c);
+    let t = "Mail Ravi Kumar at ravi.k@gmail.com";
+    let r = e.redact(t, "global").unwrap();
+    assert!(r.paused);
+    assert_eq!(r.text, t);
+    assert!(r.replaced.is_empty());
+    // Surrogates sent earlier keep mapping back while paused.
+    assert_eq!(e.restore(&format!("Hi {sur}"), "global"), "Hi Ravi Kumar");
+    let mut c = e.config();
+    c.protection.enabled = true;
+    e.set_config(c);
+    let r = e.redact(t, "global").unwrap();
+    assert!(!r.paused && !r.text.contains("Ravi"));
+}

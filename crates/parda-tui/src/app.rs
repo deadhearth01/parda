@@ -1,15 +1,20 @@
 //! Application state and key handling.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use parda_core::{Config, Mode, Style};
 use parda_detect::{PersonBlock, RulesFile};
 use parda_ipc::{Event, Request};
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 use serde_json::Value;
 
 use crate::Backend;
+use crate::settings::{self, Setting};
 use crate::tabs;
 
 const MAX_EVENTS: usize = 500;
@@ -21,7 +26,7 @@ pub enum Tab {
     Inspector,
     Rules,
     Vault,
-    Setup,
+    Settings,
 }
 
 impl Tab {
@@ -31,7 +36,7 @@ impl Tab {
         Tab::Inspector,
         Tab::Rules,
         Tab::Vault,
-        Tab::Setup,
+        Tab::Settings,
     ];
 
     pub fn title(self) -> &'static str {
@@ -41,13 +46,32 @@ impl Tab {
             Tab::Inspector => "Inspector",
             Tab::Rules => "Rules",
             Tab::Vault => "Vault",
-            Tab::Setup => "Setup",
+            Tab::Settings => "Settings",
         }
     }
 
     fn index(self) -> usize {
         Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
     }
+}
+
+/// A clickable screen region, recorded while drawing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hit {
+    Tab(Tab),
+    /// The protection ON/OFF switch in the header.
+    Protection,
+    /// Row `n` of the current tab's list (rules, settings).
+    Row(usize),
+    /// The inspector's input box.
+    Input,
+}
+
+/// An action waiting for `y`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Confirm {
+    WipeVault,
+    Setting(Setting),
 }
 
 /// What a line-input prompt is for.
@@ -80,8 +104,15 @@ pub struct App {
     pub rules_sel: usize,
     pub vault: Vec<Value>,
     pub prompt: Option<(Prompt, String)>,
-    pub confirm_wipe: bool,
+    pub confirm: Option<Confirm>,
     pub message: Option<String>,
+    /// The daemon's configuration (None until read).
+    pub config: Option<Config>,
+    pub settings_sel: usize,
+    /// Live feed: how many newest events are scrolled off the bottom.
+    pub live_scroll: usize,
+    /// Clickable regions of the last frame (topmost last).
+    pub hits: RefCell<Vec<(Rect, Hit)>>,
 }
 
 impl Default for App {
@@ -104,8 +135,23 @@ impl App {
             rules_sel: 0,
             vault: Vec::new(),
             prompt: None,
-            confirm_wipe: false,
+            confirm: None,
             message: None,
+            config: None,
+            settings_sel: 0,
+            live_scroll: 0,
+            hits: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Whether protection is on (as far as this client knows).
+    pub fn protection_on(&self) -> bool {
+        match &self.config {
+            Some(c) => c.protection.enabled,
+            None => self
+                .status
+                .as_ref()
+                .is_none_or(|s| s["protection"].as_bool() != Some(false)),
         }
     }
 
@@ -135,10 +181,20 @@ impl App {
                 self.message = Some(format!("daemon unreachable: {e}"));
             }
         }
+        self.load_config(b);
         match self.tab {
             Tab::Rules => self.load_rules(b),
             Tab::Vault => self.load_vault(b),
             _ => {}
+        }
+    }
+
+    fn load_config(&mut self, b: &mut dyn Backend) {
+        if let Ok(v) = b.call(Request::ConfigGet)
+            && let Some(t) = v["toml"].as_str()
+            && let Ok(c) = Config::from_toml_str(t)
+        {
+            self.config = Some(c);
         }
     }
 
@@ -207,22 +263,29 @@ impl App {
             self.inspector_edit(key, b);
             return;
         }
-        if self.confirm_wipe {
-            self.confirm_wipe = false;
-            if key.code == KeyCode::Char('y') {
-                match b.call(Request::VaultWipe { scope: None }) {
-                    Ok(v) => self.message = Some(format!("removed {} mapping(s)", v["removed"])),
-                    Err(e) => self.message = Some(format!("wipe failed: {e}")),
+        if let Some(pending) = self.confirm.take() {
+            if key.code != KeyCode::Char('y') {
+                self.message = Some("cancelled".into());
+                return;
+            }
+            match pending {
+                Confirm::WipeVault => {
+                    match b.call(Request::VaultWipe { scope: None }) {
+                        Ok(v) => {
+                            self.message = Some(format!("removed {} mapping(s)", v["removed"]))
+                        }
+                        Err(e) => self.message = Some(format!("wipe failed: {e}")),
+                    }
+                    self.load_vault(b);
                 }
-                self.load_vault(b);
-            } else {
-                self.message = Some("wipe cancelled".into());
+                Confirm::Setting(s) => self.toggle_config(b, |c| settings::step(&s, c, true)),
             }
             return;
         }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.help = !self.help,
+            KeyCode::Char('p') => self.toggle_protection(b),
             KeyCode::Char(c @ '1'..='6') => {
                 let i = (c as u8 - b'1') as usize;
                 self.switch(Tab::ALL[i], b);
@@ -254,11 +317,25 @@ impl App {
             }
             Tab::Vault => {
                 if key.code == KeyCode::Char('w') {
-                    self.confirm_wipe = true;
+                    self.confirm = Some(Confirm::WipeVault);
                     self.message = Some("wipe ALL mappings? press y to confirm".into());
                 }
             }
-            Tab::Setup => match key.code {
+            Tab::Live => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.scroll(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll(1),
+                KeyCode::End => self.live_scroll = 0,
+                _ => {}
+            },
+            Tab::Settings => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.scroll(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll(1),
+                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Char('l') => {
+                    self.change_setting(self.settings_sel, true, b)
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.change_setting(self.settings_sel, false, b)
+                }
                 KeyCode::Char('m') => self.toggle_config(b, |c| {
                     c.detect.mode = match c.detect.mode {
                         Mode::Strict => Mode::Fast,
@@ -293,10 +370,110 @@ impl App {
             .map_err(anyhow::Error::from)
             .and_then(|toml| b.call(Request::ConfigSet { toml }));
         self.message = Some(match res {
-            Ok(_) => "configuration updated".into(),
+            Ok(v) if v["restart_required"].as_bool() == Some(true) => {
+                "saved — restart the daemon to apply (parda stop, then parda daemon / service)"
+                    .into()
+            }
+            Ok(_) => "saved and applied".into(),
             Err(e) => format!("update failed: {e}"),
         });
         self.refresh(b);
+    }
+
+    pub fn toggle_protection(&mut self, b: &mut dyn Backend) {
+        self.toggle_config(b, |c| c.protection.enabled = !c.protection.enabled);
+        if self.message.as_deref() == Some("saved and applied") {
+            self.message = Some(if self.protection_on() {
+                "protection ON — personal data is replaced before it leaves this machine".into()
+            } else {
+                "protection OFF — text is sent as typed until you press p again".into()
+            });
+        }
+    }
+
+    /// Change setting row `i` (forward = next value).
+    fn change_setting(&mut self, i: usize, forward: bool, b: &mut dyn Backend) {
+        let all = settings::all();
+        let Some(s) = all.get(i).cloned() else { return };
+        self.settings_sel = i;
+        if let Some(c) = &self.config
+            && settings::needs_confirm(&s, c)
+        {
+            self.message = Some(format!(
+                "turn on '{}'? logs will contain personal data — press y to confirm",
+                settings::row(&s, c).label
+            ));
+            self.confirm = Some(Confirm::Setting(s));
+            return;
+        }
+        if s == Setting::Protection {
+            self.toggle_protection(b);
+        } else {
+            self.toggle_config(b, |c| settings::step(&s, c, forward));
+        }
+    }
+
+    /// Move the selection (Rules, Settings) or the live feed by `delta` rows.
+    fn scroll(&mut self, delta: isize) {
+        let step = |v: usize, max: usize| v.saturating_add_signed(delta).min(max);
+        match self.tab {
+            Tab::Rules => {
+                let n = self.rule_rows().len();
+                self.rules_sel = step(self.rules_sel, n.saturating_sub(1));
+            }
+            Tab::Settings => {
+                let n = settings::all().len();
+                self.settings_sel = step(self.settings_sel, n - 1);
+            }
+            Tab::Live => {
+                // Up (negative) shows older events.
+                self.live_scroll = self
+                    .live_scroll
+                    .saturating_add_signed(-delta)
+                    .min(self.events.len().saturating_sub(1));
+            }
+            _ => {}
+        }
+    }
+
+    pub fn on_mouse(&mut self, m: MouseEvent, b: &mut dyn Backend) {
+        match m.kind {
+            MouseEventKind::ScrollUp => self.scroll(-1),
+            MouseEventKind::ScrollDown => self.scroll(1),
+            MouseEventKind::Down(button) => {
+                if self.help {
+                    self.help = false;
+                    return;
+                }
+                if self.prompt.is_some() || self.confirm.is_some() {
+                    return;
+                }
+                let at = Position::new(m.column, m.row);
+                let hit = self
+                    .hits
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|(r, _)| r.contains(at))
+                    .map(|(_, h)| *h);
+                match hit {
+                    Some(Hit::Tab(t)) => self.switch(t, b),
+                    Some(Hit::Protection) => self.toggle_protection(b),
+                    Some(Hit::Input) => self.inspector.editing = true,
+                    Some(Hit::Row(i)) => match self.tab {
+                        Tab::Rules => self.rules_sel = i,
+                        Tab::Settings => self.change_setting(i, button != MouseButton::Right, b),
+                        _ => {}
+                    },
+                    None => {
+                        if self.tab == Tab::Inspector {
+                            self.inspector.editing = false;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn inspector_edit(&mut self, key: KeyEvent, b: &mut dyn Backend) {

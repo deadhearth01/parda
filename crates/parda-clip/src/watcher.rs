@@ -52,6 +52,8 @@ pub enum ClipEvent {
     Pasted { counts: BTreeMap<String, u32> },
     /// Nothing to redact; the original was pasted.
     PastedOriginal,
+    /// Protection is switched off; the original was pasted unfiltered.
+    PastedUnfiltered,
     /// The keystroke failed; the redacted text stays on the clipboard.
     PasteFailed { reason: String },
     /// Paste refused: the text holds blocked kinds.
@@ -192,6 +194,11 @@ impl<B: ClipboardBackend, P: Paster> ClipService<B, P> {
             }
             Err(e) => return Err(e.into()),
         };
+        if red.paused {
+            self.paster.paste()?;
+            (self.on_event)(ClipEvent::PastedUnfiltered);
+            return Ok(PasteOutcome::PastedOriginal);
+        }
         if red.replaced.is_empty() {
             self.paster.paste()?;
             (self.on_event)(ClipEvent::PastedOriginal);

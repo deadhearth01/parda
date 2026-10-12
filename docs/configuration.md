@@ -3,6 +3,9 @@
 `config.toml` lives in the config directory (`parda doctor` prints it; `PARDA_HOME=/some/dir` puts everything under one folder). Every key is optional; this is the full default:
 
 ```toml
+[protection]
+enabled = true                     # master switch: false sends text as typed (answers still restored)
+
 [proxy]
 enabled = true
 listen = "127.0.0.1:8787"
@@ -45,6 +48,17 @@ log_values = false
 ```
 
 Kinds: `Person Email Phone Address Url IpAddress MacAddress CreditCard Iban BankAccount Ifsc Aadhaar Pan Gstin Upi VoterId DrivingLicence IndianVehicleReg Passport UsSsn UkNino DateOfBirth Secret Organization`, plus any custom kind you use in `rules.toml`.
+
+## Changing settings
+
+- **TUI** (`parda tui`, tab 6 *Settings*): every option above as a list. ↑↓ or the mouse wheel selects,
+  Enter / Space / click changes the value, ← or right-click goes back. Options marked ↻ take effect
+  after the daemon restarts. Turning on `privacy.log_values` asks for confirmation.
+- **Protection switch**: `p` anywhere in the TUI, a click on the header switch, or `parda off` /
+  `parda on`. While off, every surface (proxy, paste-safe, `parda redact`) passes text through
+  unchanged and records a warning event; stand-ins sent earlier are still restored in answers.
+- **By hand**: edit `config.toml`, then `parda` picks it up on the next daemon start (or send a reload
+  from the TUI by changing any setting).
 
 ## rules.toml
 

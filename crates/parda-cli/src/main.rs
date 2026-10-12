@@ -40,6 +40,10 @@ enum Command {
     },
     /// Stop the running daemon.
     Stop,
+    /// Turn protection on (the default).
+    On,
+    /// Pause protection: text is sent unredacted until `parda on`.
+    Off,
     /// Show daemon status.
     Status {
         #[arg(long)]
@@ -172,6 +176,8 @@ fn main() {
         } => commands::daemon::run(!no_proxy, !no_clipboard, !no_hotkey, verbose),
         Command::Tui { dump } => commands::tui::run(dump),
         Command::Stop => commands::status::stop(),
+        Command::On => commands::protection::set(true),
+        Command::Off => commands::protection::set(false),
         Command::Status { json } => commands::status::run(json),
         Command::Redact { text, scope, json } => commands::redact::redact(text, scope, json),
         Command::Restore { text, scope } => commands::redact::restore(text, scope),

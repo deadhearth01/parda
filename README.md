@@ -45,9 +45,12 @@ parda setup
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8787     # Claude Code, Anthropic SDKs
 export OPENAI_BASE_URL=http://127.0.0.1:8787/v1     # Codex, OpenAI SDKs
 
-# 4. watch it work
+# 4. watch it work (keyboard or mouse; tab 6 has every setting)
 parda tui
 ```
+
+Need to send something unfiltered for a moment? `parda off` (or `p` in the TUI) pauses protection on
+every surface; `parda on` resumes it. The TUI header turns red while it is off.
 
 Chat apps: copy your text, then press **⌘⌥V** (macOS) / **Ctrl+Alt+V** (Windows, Linux) instead of paste. parda pastes a redacted version and puts your original back on the clipboard. Copying the AI's answer restores the real names automatically.
 
@@ -110,7 +113,7 @@ The default name/address detector is [knowledgator/gliner-pii-edge-v1.0](https:/
 ## Commands
 
 ```text
-parda setup | doctor | status | tui
+parda setup | doctor | status | tui | on | off | stop
 parda redact|restore|scan [TEXT|-] [--scope S] [--json]
 parda paste-safe
 parda rules show|edit|add-person NAME|allow TERM

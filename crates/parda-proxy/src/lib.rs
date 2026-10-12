@@ -48,6 +48,8 @@ pub struct ProxyEvent {
     pub unscanned_media: u32,
     pub status: u16,
     pub streaming: bool,
+    /// Protection was switched off: the request went upstream unfiltered.
+    pub paused: bool,
     pub error: Option<String>,
 }
 

@@ -404,6 +404,7 @@ impl DaemonHandle {
             "model": s.engine.model_name(),
             "model_configured": config.detect.model,
             "model_error": s.model_error,
+            "protection": config.protection.enabled,
             "mode": config.detect.mode,
             "style": config.replace.style,
             "stats": s.engine.stats(),
@@ -460,6 +461,7 @@ impl DaemonHandle {
                             "warned": r.warned,
                             "ml_ms": r.ml_ms,
                             "ml_skipped": r.ml_skipped,
+                            "paused": r.paused,
                         }))
                     }
                     Err(e) => engine_err(e),

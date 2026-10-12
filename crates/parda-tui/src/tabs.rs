@@ -9,11 +9,26 @@ use ratatui::widgets::{
 };
 use serde_json::Value;
 
-use crate::app::{App, Prompt, Tab};
+use crate::app::{App, Hit, Prompt, Tab};
+use crate::settings;
 
 const ACCENT: Color = Color::Cyan;
 
+fn hit(app: &App, r: Rect, h: Hit) {
+    app.hits.borrow_mut().push((r, h));
+}
+
+/// First visible row so that `sel` stays inside a window of `height` rows.
+fn window_start(sel: usize, height: usize) -> usize {
+    if height == 0 || sel < height {
+        0
+    } else {
+        sel + 1 - height
+    }
+}
+
 pub fn draw(app: &App, f: &mut Frame) {
+    app.hits.borrow_mut().clear();
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -35,21 +50,69 @@ pub fn draw(app: &App, f: &mut Frame) {
     } else {
         "○ daemon offline"
     };
-    let tabs = Tabs::new(titles)
+    let on = app.protection_on();
+    let switch = if on {
+        Span::styled(
+            " ■ PROTECTION ON ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            " □ PROTECTION OFF — p to resume ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let switch_w = switch.width() as u16;
+    let header = chunks[0];
+    let tabs = Tabs::new(titles.clone())
         .select(selected)
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(if on {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::Red)
+                })
                 .title(Line::from(vec![
                     Span::styled(
                         " parda ",
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(format!("{state} ")),
-                ])),
+                ]))
+                .title_top(Line::from(switch).right_aligned()),
         )
         .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
-    f.render_widget(tabs, chunks[0]);
+    f.render_widget(tabs, header);
+    // Clickable regions: the switch (right end of the top border) and each
+    // tab title (Tabs draws " title " separated by a 1-cell divider).
+    if header.width > switch_w + 2 {
+        hit(
+            app,
+            Rect::new(header.right() - 1 - switch_w, header.y, switch_w, 1),
+            Hit::Protection,
+        );
+    }
+    let mut x = header.x + 1;
+    for (t, title) in Tab::ALL.iter().zip(&titles) {
+        let w = title.width() as u16 + 2;
+        if x >= header.right() {
+            break;
+        }
+        hit(
+            app,
+            Rect::new(x, header.y + 1, w.min(header.right() - x), 1),
+            Hit::Tab(*t),
+        );
+        x += w + 1;
+    }
 
     match app.tab {
         Tab::Dashboard => dashboard(app, f, chunks[1]),
@@ -57,18 +120,24 @@ pub fn draw(app: &App, f: &mut Frame) {
         Tab::Inspector => inspector(app, f, chunks[1]),
         Tab::Rules => rules(app, f, chunks[1]),
         Tab::Vault => vault(app, f, chunks[1]),
-        Tab::Setup => setup(app, f, chunks[1]),
+        Tab::Settings => settings_tab(app, f, chunks[1]),
     }
 
     let footer = match (&app.message, app.tab) {
         (Some(m), _) => m.clone(),
         (None, Tab::Inspector) => {
-            "i/Enter edit · Enter run · r restore preview · Esc clear · q quit".into()
+            "i/Enter/click edit · Enter run · r restore preview · Esc clear · q quit".into()
         }
-        (None, Tab::Rules) => "a add person · w allow term · d delete · ↑↓ select · q quit".into(),
+        (None, Tab::Rules) => {
+            "a add person · w allow term · d delete · ↑↓/wheel/click select · q quit".into()
+        }
         (None, Tab::Vault) => "w wipe all · q quit".into(),
-        (None, Tab::Setup) => "m strict/fast · s surrogate/token · q quit".into(),
-        _ => "1-6 tabs · Tab next · ? help · q quit".into(),
+        (None, Tab::Live) => "↑↓/wheel scroll · End newest · p protection · q quit".into(),
+        (None, Tab::Settings) => {
+            "↑↓ select · Enter/Space/click change · ←/right-click back · p protection · q quit"
+                .into()
+        }
+        _ => "1-6 or click tabs · p protection on/off · ? help · q quit".into(),
     };
     f.render_widget(
         Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
@@ -89,17 +158,22 @@ pub fn draw(app: &App, f: &mut Frame) {
         );
     }
     if app.help {
-        let r = centered(area, 64, 12);
+        let r = centered(area, 72, 15);
         f.render_widget(Clear, r);
         f.render_widget(
             Paragraph::new(vec![
-                Line::from("1 Dashboard  2 Live  3 Inspector  4 Rules  5 Vault  6 Setup"),
+                Line::from("1 Dashboard  2 Live  3 Inspector  4 Rules  5 Vault  6 Settings"),
                 Line::from(""),
+                Line::from("p (anywhere) or click the header switch: protection on / off"),
                 Line::from("Inspector: type text, Enter shows what would be sent"),
                 Line::from("Rules: a add a person, w allow a term, d delete"),
                 Line::from("Vault: w wipes every mapping (asks first)"),
-                Line::from("Setup: m strict/fast mode, s surrogate/token style"),
+                Line::from(
+                    "Settings: Enter/Space/click changes a value, ← or right-click goes back",
+                ),
                 Line::from(""),
+                Line::from("Mouse: click tabs, rows and the switch; wheel scrolls lists."),
+                Line::from("Hold Shift (Option on macOS) while dragging to select text."),
                 Line::from("Values are never shown in the live feed: kinds and counts only."),
                 Line::from("? closes this help · q quits"),
             ])
@@ -220,7 +294,27 @@ fn dashboard(app: &App, f: &mut Frame, area: Rect) {
         "-".into()
     };
     let total: u64 = kv_rows(&stats["entities"]).iter().map(|(_, n)| n).sum();
+    let protection = if app.protection_on() {
+        Line::from(vec![
+            Span::styled("protection ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "ON",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("protection ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "OFF — text is sent unfiltered (press p)",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    };
     let lines = vec![
+        protection,
         Line::from(vec![
             Span::styled("filtered   ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -338,10 +432,12 @@ fn uptime(s: u64) -> String {
 
 fn live(app: &App, f: &mut Frame, area: Rect) {
     let height = area.height.saturating_sub(2) as usize;
+    let scroll = app.live_scroll.min(app.events.len().saturating_sub(1));
     let items: Vec<ListItem> = app
         .events
         .iter()
         .rev()
+        .skip(scroll)
         .take(height.max(1))
         .rev()
         .map(|e| {
@@ -367,7 +463,14 @@ fn live(app: &App, f: &mut Frame, area: Rect) {
             ]))
         })
         .collect();
-    let title = format!("Live ({} events · values never shown)", app.events.len());
+    let title = if scroll > 0 {
+        format!(
+            "Live ({} events · {scroll} newer hidden, End to jump · values never shown)",
+            app.events.len()
+        )
+    } else {
+        format!("Live ({} events · values never shown)", app.events.len())
+    };
     f.render_widget(List::new(items).block(block(&title)), area);
 }
 
@@ -393,6 +496,7 @@ fn inspector(app: &App, f: &mut Frame, area: Rect) {
             .block(block(title)),
         rows[0],
     );
+    hit(app, rows[0], Hit::Input);
     let (out_title, out) = match (&ins.error, ins.show_restore) {
         (Some(e), _) => ("Error", e.clone()),
         (None, false) => ("Sent to the AI", ins.redacted.clone().unwrap_or_default()),
@@ -440,33 +544,51 @@ fn inspector(app: &App, f: &mut Frame, area: Rect) {
 
 fn rules(app: &App, f: &mut Frame, area: Rect) {
     let rows = app.rule_rows();
-    let items: Vec<ListItem> = if rows.is_empty() {
-        vec![ListItem::new(
-            "no rules yet — press a to add a person to always mask",
-        )]
-    } else {
-        rows.iter()
-            .map(|(section, t)| {
-                let color = match *section {
-                    "person" => Color::Green,
-                    "term" => Color::Magenta,
-                    _ => Color::Blue,
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("{section:<7}"), Style::default().fg(color)),
-                    Span::raw(t.clone()),
-                ]))
-            })
-            .collect()
-    };
-    let mut state = ListState::default();
-    if !rows.is_empty() {
-        state.select(Some(app.rules_sel.min(rows.len() - 1)));
+    let title = "Rules (people & terms always masked · allow-list never masked)";
+    if rows.is_empty() {
+        f.render_widget(
+            List::new(vec![ListItem::new(
+                "no rules yet — press a to add a person to always mask",
+            )])
+            .block(block(title)),
+            area,
+        );
+        return;
     }
+    let height = area.height.saturating_sub(2) as usize;
+    let sel = app.rules_sel.min(rows.len() - 1);
+    let start = window_start(sel, height);
+    let items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(height)
+        .map(|(i, (section, t))| {
+            let color = match *section {
+                "person" => Color::Green,
+                "term" => Color::Magenta,
+                _ => Color::Blue,
+            };
+            hit(
+                app,
+                Rect::new(
+                    area.x + 1,
+                    area.y + 1 + (i - start) as u16,
+                    area.width.saturating_sub(2),
+                    1,
+                ),
+                Hit::Row(i),
+            );
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{section:<7}"), Style::default().fg(color)),
+                Span::raw(t.clone()),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(sel - start));
     let list = List::new(items)
-        .block(block(
-            "Rules (people & terms always masked · allow-list never masked)",
-        ))
+        .block(block(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, area, &mut state);
 }
@@ -495,46 +617,115 @@ fn vault(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(table, area);
 }
 
-fn setup(app: &App, f: &mut Frame, area: Rect) {
+fn settings_tab(app: &App, f: &mut Frame, area: Rect) {
     let null = Value::Null;
     let st = app.status.as_ref().unwrap_or(&null);
     let url = st["proxy"]
         .as_str()
         .map(|a| format!("http://{a}"))
         .unwrap_or_else(|| "http://127.0.0.1:8787".into());
-    let lines = vec![
-        Line::styled("Agents", Style::default().add_modifier(Modifier::BOLD)),
-        Line::from(format!("  Claude Code   export ANTHROPIC_BASE_URL={url}")),
-        Line::from(format!("  Codex / SDKs  export OPENAI_BASE_URL={url}/v1")),
-        Line::from(""),
-        Line::styled("Chat apps", Style::default().add_modifier(Modifier::BOLD)),
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(4),
+            Constraint::Length(4),
+        ])
+        .split(area);
+    let connect = vec![
+        Line::from(format!("Claude Code   export ANTHROPIC_BASE_URL={url}")),
+        Line::from(format!("Codex / SDKs  export OPENAI_BASE_URL={url}/v1")),
         Line::from(format!(
-            "  copy, then press the paste-safe hotkey ({}) instead of paste",
-            text(&st["hotkey"])
+            "Chat apps     copy, then press the paste-safe hotkey ({}) instead of paste · config {}",
+            text(&st["hotkey"]),
+            text(s(st, &["paths", "config"]))
         )),
-        Line::from(""),
-        Line::styled("Behaviour", Style::default().add_modifier(Modifier::BOLD)),
-        Line::from(format!(
-            "  mode   {}   (m: strict refuses when the model fails; fast continues rules-only)",
-            text(&st["mode"])
-        )),
-        Line::from(format!(
-            "  style  {}   (s: realistic stand-ins or ⟦TOKENS⟧)",
-            text(&st["style"])
-        )),
-        Line::from(format!(
-            "  model  {}",
-            st["model"].as_str().unwrap_or("none")
-        )),
-        Line::from(""),
-        Line::from(format!("  config {}", text(s(st, &["paths", "config"])))),
-        Line::from("  run `parda doctor` for a full check"),
     ];
     f.render_widget(
-        Paragraph::new(lines)
-            .block(block("Setup"))
+        Paragraph::new(connect)
+            .block(block("Connect"))
             .wrap(Wrap { trim: false }),
-        area,
+        parts[0],
+    );
+
+    let Some(cfg) = &app.config else {
+        f.render_widget(
+            Paragraph::new("configuration not loaded — is the daemon running?")
+                .block(block("Settings")),
+            parts[1],
+        );
+        return;
+    };
+    let all = settings::all();
+    let rows: Vec<settings::Row> = all.iter().map(|x| settings::row(x, cfg)).collect();
+    let list_area = parts[1];
+    let height = list_area.height.saturating_sub(2) as usize;
+    let sel = app.settings_sel.min(rows.len() - 1);
+    let start = window_start(sel, height);
+    let label_w = list_area.width.saturating_sub(2).saturating_sub(12 + 26) as usize;
+    let items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(height)
+        .map(|(i, r)| {
+            hit(
+                app,
+                Rect::new(
+                    list_area.x + 1,
+                    list_area.y + 1 + (i - start) as u16,
+                    list_area.width.saturating_sub(2),
+                    1,
+                ),
+                Hit::Row(i),
+            );
+            let value_style = match (r.on, r.risky) {
+                (Some(true), true) => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                (Some(true), false) => Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+                (Some(false), _) => Style::default().fg(Color::DarkGray),
+                (None, _) => Style::default().fg(ACCENT),
+            };
+            let value = match r.on {
+                Some(true) => format!("● {}", r.value),
+                Some(false) => format!("○ {}", r.value),
+                None => format!("◆ {}", r.value),
+            };
+            let mut label: String = r.label.chars().take(label_w.max(8)).collect();
+            if r.restart {
+                label.push_str(" ↻");
+            }
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<11} ", r.group),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(format!("{label:<width$} ", width = label_w.max(8) + 2)),
+                Span::styled(value, value_style),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(sel - start));
+    let title = format!(
+        "Settings ({}/{}) · ↻ = applies after a daemon restart",
+        sel + 1,
+        rows.len()
+    );
+    f.render_stateful_widget(
+        List::new(items)
+            .block(block(&title))
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+        list_area,
+        &mut state,
+    );
+    let r = &rows[sel];
+    f.render_widget(
+        Paragraph::new(r.help)
+            .wrap(Wrap { trim: true })
+            .block(block(&r.label)),
+        parts[2],
     );
 }
 
@@ -545,11 +736,14 @@ mod tests {
     use parda_ipc::{Event, Request};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use serde_json::json;
 
     struct Fake {
         rules: String,
+        config: String,
         calls: Vec<String>,
     }
 
@@ -589,6 +783,13 @@ mod tests {
                 Request::VaultStats => {
                     json!({"stats": [{"scope": "global", "kind": "Person", "count": 5}]})
                 }
+                Request::ConfigGet => json!({"toml": self.config}),
+                Request::ConfigSet { toml } => {
+                    let old = parda_core::Config::from_toml_str(&self.config).unwrap();
+                    let new = parda_core::Config::from_toml_str(&toml).unwrap();
+                    self.config = toml;
+                    json!({"restart_required": old.proxy.enabled != new.proxy.enabled})
+                }
                 _ => json!({}),
             })
         }
@@ -597,12 +798,62 @@ mod tests {
     fn fake() -> Fake {
         Fake {
             rules: "[[person]]\nname = \"Ravi Kumar\"\n".into(),
+            config: parda_core::Config::default().to_toml_string().unwrap(),
             calls: vec![],
         }
     }
 
     fn key(c: KeyCode) -> KeyEvent {
         KeyEvent::new(c, KeyModifiers::NONE)
+    }
+
+    fn cfg(b: &Fake) -> parda_core::Config {
+        parda_core::Config::from_toml_str(&b.config).unwrap()
+    }
+
+    fn click_at(app: &mut App, b: &mut Fake, x: u16, y: u16, button: MouseButton) {
+        app.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(button),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            },
+            b,
+        );
+    }
+
+    fn wheel(app: &mut App, b: &mut Fake, down: bool) {
+        app.on_mouse(
+            MouseEvent {
+                kind: if down {
+                    MouseEventKind::ScrollDown
+                } else {
+                    MouseEventKind::ScrollUp
+                },
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+            b,
+        );
+    }
+
+    /// Render, then return the cell position of `needle` (ASCII) on screen.
+    fn find(app: &App, needle: &str) -> (u16, u16) {
+        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| app.draw(f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let want: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+        for y in 0..buf.area.height {
+            let row: Vec<String> = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(x) = row.windows(want.len()).position(|w| w == want.as_slice()) {
+                return (x as u16, y);
+            }
+        }
+        panic!("{needle:?} not on screen");
     }
 
     fn render(app: &App) -> String {
@@ -703,5 +954,127 @@ mod tests {
         assert!(!app.should_quit());
         app.on_key(key(KeyCode::Char('q')), &mut b);
         assert!(app.should_quit());
+    }
+
+    #[test]
+    fn p_toggles_protection_and_header_shows_it() {
+        let mut b = fake();
+        let mut app = App::new();
+        app.refresh(&mut b);
+        assert!(render(&app).contains("PROTECTION ON"));
+        app.on_key(key(KeyCode::Char('p')), &mut b);
+        assert!(!cfg(&b).protection.enabled);
+        let screen = render(&app);
+        assert!(screen.contains("PROTECTION OFF"), "{screen}");
+        assert!(screen.contains("text is sent unfiltered"), "{screen}");
+        app.on_key(key(KeyCode::Char('p')), &mut b);
+        assert!(cfg(&b).protection.enabled);
+    }
+
+    #[test]
+    fn clicking_tabs_and_the_switch() {
+        let mut b = fake();
+        let mut app = App::new();
+        app.refresh(&mut b);
+        let (x, y) = find(&app, "3 Inspector");
+        click_at(&mut app, &mut b, x + 2, y, MouseButton::Left);
+        assert_eq!(app.tab, Tab::Inspector);
+        let (x, y) = find(&app, "6 Settings");
+        click_at(&mut app, &mut b, x, y, MouseButton::Left);
+        assert_eq!(app.tab, Tab::Settings);
+        let (x, y) = find(&app, "PROTECTION ON");
+        click_at(&mut app, &mut b, x + 3, y, MouseButton::Left);
+        assert!(!cfg(&b).protection.enabled);
+        // Clicking the inspector's input box starts editing.
+        app.on_key(key(KeyCode::Char('3')), &mut b);
+        let (x, y) = find(&app, "Input (press i to type)");
+        click_at(&mut app, &mut b, x, y + 1, MouseButton::Left);
+        assert!(app.inspector.editing);
+    }
+
+    #[test]
+    fn settings_tab_lists_options_and_changes_them() {
+        let mut b = fake();
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Char('6')), &mut b);
+        let screen = render(&app);
+        for want in [
+            "protection",
+            "when the model fails",
+            "agent proxy",
+            "india (Aadhaar",
+            "ANTHROPIC_BASE_URL",
+        ] {
+            assert!(screen.contains(want), "missing {want:?}:\n{screen}");
+        }
+        // Down to "when the model fails", Enter switches strict → fast.
+        app.on_key(key(KeyCode::Down), &mut b);
+        app.on_key(key(KeyCode::Enter), &mut b);
+        assert_eq!(cfg(&b).detect.mode, parda_core::Mode::Fast);
+        // Clicking the replacement-style row changes it; right-click changes it back.
+        let (x, y) = find(&app, "replacement style");
+        click_at(&mut app, &mut b, x, y, MouseButton::Left);
+        assert_eq!(cfg(&b).replace.style, parda_core::Style::Token);
+        click_at(&mut app, &mut b, x, y, MouseButton::Right);
+        assert_eq!(cfg(&b).replace.style, parda_core::Style::Surrogate);
+        // Restart-required settings say so.
+        let (x, y) = find(&app, "agent proxy");
+        click_at(&mut app, &mut b, x, y, MouseButton::Left);
+        assert!(!cfg(&b).proxy.enabled);
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("restart"),
+            "{:?}",
+            app.message
+        );
+    }
+
+    #[test]
+    fn risky_setting_asks_first_and_wheel_moves_selection() {
+        let mut b = fake();
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Char('6')), &mut b);
+        let i = crate::settings::all()
+            .iter()
+            .position(|s| *s == crate::settings::Setting::LogValues)
+            .unwrap();
+        for _ in 0..i {
+            wheel(&mut app, &mut b, true);
+        }
+        assert_eq!(app.settings_sel, i);
+        app.on_key(key(KeyCode::Enter), &mut b);
+        assert!(!cfg(&b).privacy.log_values, "must not change before y");
+        app.on_key(key(KeyCode::Char('n')), &mut b);
+        assert!(!cfg(&b).privacy.log_values);
+        app.on_key(key(KeyCode::Enter), &mut b);
+        app.on_key(key(KeyCode::Char('y')), &mut b);
+        assert!(cfg(&b).privacy.log_values);
+        // The selected row stays visible after scrolling far down.
+        let last = crate::settings::all().len() - 1;
+        for _ in 0..last + 5 {
+            wheel(&mut app, &mut b, true);
+        }
+        assert_eq!(app.settings_sel, last);
+        assert!(render(&app).contains("Organization"));
+    }
+
+    #[test]
+    fn live_feed_scrolls_with_wheel() {
+        let mut b = fake();
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Char('2')), &mut b);
+        for i in 0..60 {
+            app.on_event(Event::now("proxy", format!("request number {i:02}")));
+        }
+        assert!(render(&app).contains("request number 59"));
+        for _ in 0..40 {
+            wheel(&mut app, &mut b, false);
+        }
+        let screen = render(&app);
+        assert!(
+            !screen.contains("request number 59") && screen.contains("newer hidden"),
+            "{screen}"
+        );
+        app.on_key(key(KeyCode::End), &mut b);
+        assert!(render(&app).contains("request number 59"));
     }
 }

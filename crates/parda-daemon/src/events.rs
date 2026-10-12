@@ -106,6 +106,7 @@ pub fn from_proxy(ev: &ProxyEvent) -> Event {
     let mut summary = format!("{} {} → {}", ev.provider, ev.path, ev.status);
     match &ev.error {
         Some(code) => summary.push_str(&format!(" ({code})")),
+        None if ev.paused => summary.push_str(" · PAUSED, sent unfiltered"),
         None => {
             summary.push_str(&format!(" · {total} redacted"));
             if ev.unscanned_media > 0 {
@@ -119,7 +120,7 @@ pub fn from_proxy(ev: &ProxyEvent) -> Event {
     let mut e = Event::now("proxy", summary);
     e.counts = ev.counts.clone();
     e.latency_ms = Some(ev.added_ms);
-    if ev.error.is_some() || ev.status >= 400 {
+    if ev.error.is_some() || ev.status >= 400 || ev.paused {
         e.level = "warn".into();
     }
     e
@@ -152,6 +153,11 @@ pub fn from_clip(ev: &ClipEvent) -> Event {
             "pasted (nothing to redact)".to_string(),
             Default::default(),
             false,
+        ),
+        ClipEvent::PastedUnfiltered => (
+            "PAUSED — pasted unfiltered (protection is off)".to_string(),
+            Default::default(),
+            true,
         ),
         ClipEvent::PasteFailed { reason } => (
             format!(
@@ -213,6 +219,7 @@ mod tests {
             unscanned_media: 1,
             status: 200,
             streaming: true,
+            paused: false,
             error: None,
         };
         let e = from_proxy(&ev);
@@ -223,5 +230,12 @@ mod tests {
         );
         assert_eq!(e.latency_ms, Some(15));
         assert_eq!(e.level, "info");
+        let paused = from_proxy(&ProxyEvent {
+            paused: true,
+            counts: BTreeMap::new(),
+            ..ev
+        });
+        assert!(paused.summary.contains("PAUSED"), "{}", paused.summary);
+        assert_eq!(paused.level, "warn");
     }
 }

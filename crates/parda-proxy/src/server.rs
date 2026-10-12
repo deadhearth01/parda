@@ -118,6 +118,7 @@ struct Redacted {
     counts: BTreeMap<String, u32>,
     ml_ms: u64,
     unscanned: u32,
+    paused: bool,
 }
 
 fn redact_body(
@@ -132,6 +133,7 @@ fn redact_body(
     let reds = engine.redact_many(&refs, scope)?;
     let mut counts = BTreeMap::new();
     let mut ml_ms = 0;
+    let paused = reds.iter().any(|r| r.paused);
     for r in &reds {
         for (k, n) in r.counts() {
             *counts.entry(k).or_insert(0) += n;
@@ -150,6 +152,7 @@ fn redact_body(
         counts,
         ml_ms,
         unscanned,
+        paused,
     })
 }
 
@@ -259,6 +262,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         unscanned_media: 0,
         status: 0,
         streaming: false,
+        paused: false,
         error: None,
     };
 
@@ -298,6 +302,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
                 event.counts = r.counts;
                 event.ml_ms = r.ml_ms;
                 event.unscanned_media = r.unscanned;
+                event.paused = r.paused;
                 event.added_ms = redact_ms;
                 if r.unscanned > 0 && state.cfg.unscanned_media == UnscannedMedia::Block {
                     let resp = error_response(

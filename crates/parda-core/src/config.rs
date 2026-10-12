@@ -51,12 +51,27 @@ pub enum UnscannedMedia {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub protection: ProtectionConfig,
     pub proxy: ProxyConfig,
     pub detect: DetectConfig,
     pub replace: ReplaceConfig,
     pub vault: VaultConfig,
     pub clipboard: ClipboardConfig,
     pub privacy: PrivacyConfig,
+}
+
+/// The master switch. When off, nothing is redacted on any surface (text is
+/// sent as typed) while surrogates sent earlier still restore in answers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProtectionConfig {
+    pub enabled: bool,
+}
+
+impl Default for ProtectionConfig {
+    fn default() -> Self {
+        ProtectionConfig { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +238,15 @@ mod tests {
         assert_eq!(c.clipboard.poll_ms, 300);
         assert_eq!(c.clipboard.scope, "global");
         assert!(!c.privacy.log_values);
+        assert!(c.protection.enabled);
+    }
+
+    #[test]
+    fn protection_switch_roundtrips() {
+        let c = Config::from_toml_str("[protection]\nenabled = false\n").unwrap();
+        assert!(!c.protection.enabled);
+        let back = Config::from_toml_str(&c.to_toml_string().unwrap()).unwrap();
+        assert!(!back.protection.enabled);
     }
 
     #[test]

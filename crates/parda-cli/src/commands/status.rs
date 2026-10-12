@@ -38,6 +38,14 @@ pub fn run(json: bool) -> anyhow::Result<()> {
             .map(|e| format!("  (not loaded: {e})"))
             .unwrap_or_default()
     );
+    println!(
+        "protection: {}",
+        if s["protection"].as_bool() == Some(false) {
+            "OFF (paused — `parda on` to resume)"
+        } else {
+            "on"
+        }
+    );
     println!("mode:      {}", s["mode"].as_str().unwrap_or("?"));
     println!(
         "clipboard: {}",
