@@ -12,16 +12,16 @@ authors = ["The parda contributors"]
 
 [workspace.dependencies]
 # internal
-parda-core = { path = "crates/parda-core" }
-parda-detect = { path = "crates/parda-detect" }
-parda-vault = { path = "crates/parda-vault" }
-parda-ml = { path = "crates/parda-ml" }
-parda-engine = { path = "crates/parda-engine" }
-parda-proxy = { path = "crates/parda-proxy" }
-parda-ipc = { path = "crates/parda-ipc" }
-parda-daemon = { path = "crates/parda-daemon" }
-parda-clip = { path = "crates/parda-clip" }
-parda-tui = { path = "crates/parda-tui" }
+parda-core = { path = "crates/parda-core", version = "0.1.0" }
+parda-detect = { path = "crates/parda-detect", version = "0.1.0" }
+parda-vault = { path = "crates/parda-vault", version = "0.1.0" }
+parda-ml = { path = "crates/parda-ml", version = "0.1.0" }
+parda-engine = { path = "crates/parda-engine", version = "0.1.0" }
+parda-proxy = { path = "crates/parda-proxy", version = "0.1.0" }
+parda-ipc = { path = "crates/parda-ipc", version = "0.1.0" }
+parda-daemon = { path = "crates/parda-daemon", version = "0.1.0" }
+parda-clip = { path = "crates/parda-clip", version = "0.1.0" }
+parda-tui = { path = "crates/parda-tui", version = "0.1.0" }
 
 # general
 serde = { version = "1", features = ["derive"] }
@@ -35,7 +35,7 @@ tracing-appender = "0.2"
 regex = "1"
 aho-corasick = "1"
 blake3 = "1"
-lru = "0.16"
+lru = "0.18"
 once_cell = "1"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"

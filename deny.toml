@@ -1,0 +1,47 @@
+# cargo-deny: licenses, security advisories, banned / duplicate crates, sources.
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "warn"
+ignore = [
+  # Unmaintained, no vulnerability: number_prefix (via indicatif 0.17, which
+  # tokenizers' hf-hub pins) only formats byte counts in progress bars.
+  { id = "RUSTSEC-2025-0119", reason = "unmaintained helper, no safe upgrade via hf-hub; no security impact" },
+  # Unmaintained, no vulnerability: paste is a compile-time macro used by ratatui 0.29.
+  { id = "RUSTSEC-2024-0436", reason = "compile-time macro only; goes away with a ratatui upgrade" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "MIT-0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "CC0-1.0",
+  "BSL-1.0",
+  "MPL-2.0",
+  "CDLA-Permissive-2.0",
+  "OpenSSL",
+  "0BSD",
+  "bzip2-1.0.6",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
