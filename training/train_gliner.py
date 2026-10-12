@@ -27,15 +27,16 @@ def main() -> None:
     ap.add_argument("--train", default=str(ROOT / "data/train.jsonl"))
     ap.add_argument("--dev", default=str(ROOT / "data/dev.jsonl"))
     ap.add_argument("--name", default="parda-pii-edge")
-    ap.add_argument("--max-steps", type=int, default=3000)
+    ap.add_argument("--max-steps", type=int, default=2500)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--grad-accum", type=int, default=4)
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--others-lr", type=float, default=5e-5)
-    ap.add_argument("--eval-steps", type=int, default=500)
+    ap.add_argument("--eval-steps", type=int, default=250)
     ap.add_argument("--dev-limit", type=int, default=600)
     ap.add_argument("--cpu", action="store_true")
-    ap.add_argument("--smoke", action="store_true", help="200 steps on a small slice")
+    ap.add_argument("--smoke", action="store_true", help="short run on a small slice")
+    ap.add_argument("--threads", type=int, default=8, help="CPU threads (CPU training)")
     ap.add_argument("--seed", type=int, default=13)
     args = ap.parse_args()
 
@@ -47,13 +48,17 @@ def main() -> None:
     if args.smoke:
         train = train[:1600]
         dev = dev[:100]
-        args.max_steps = 200
-        args.eval_steps = 100
+        args.max_steps = min(args.max_steps, 200)
+        args.eval_steps = max(10, args.max_steps // 2)
         args.name += "-smoke"
     random.shuffle(train)
 
     out_dir = ROOT / "runs" / args.name
+    # MPS recompiles a graph for every new sequence shape and caches the graphs on
+    # the boot disk; CPU training is slower per FLOP but steady and disk-safe.
     device = "cpu" if args.cpu or not torch.backends.mps.is_available() else "mps"
+    if device == "cpu":
+        torch.set_num_threads(args.threads)
     print(f"train={len(train)} dev={len(dev)} device={device} out={out_dir}", flush=True)
 
     model = GLiNER.from_pretrained(args.base)
@@ -75,6 +80,9 @@ def main() -> None:
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_total_limit=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         logging_steps=25,
         use_cpu=device == "cpu",
         bf16=False,
