@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -85,6 +85,10 @@ struct Shared {
     activity: Arc<Activity>,
     clip: Option<ClipHandle>,
     proxy_addr: RwLock<Option<SocketAddr>>,
+    /// The running proxy, for settings that apply without a restart.
+    proxy: RwLock<Option<Arc<parda_proxy::ProxyState>>>,
+    /// Serialises ConfigSet / Reload (write the file, then apply).
+    config_lock: Mutex<()>,
     model_error: Option<String>,
     shutdown: watch::Sender<bool>,
     stopped: Arc<AtomicBool>,
@@ -101,6 +105,14 @@ impl Daemon {
     /// thread. Blocking (model loading takes a moment).
     pub fn open(paths: Paths, opts: RunOptions) -> anyhow::Result<Daemon> {
         paths.ensure().context("creating parda directories")?;
+        // Before loading the model or touching the clipboard: a second
+        // daemon must not start services, nor clean up the live one's files.
+        if opts.ipc && parda_ipc::Client::connect(&paths.runtime_dir).is_ok() {
+            anyhow::bail!(
+                "another parda daemon is already running (its IPC socket is in use); \
+                 stop it first with `parda stop`"
+            );
+        }
         let config = load_config(&paths)?;
         let rules = load_rules(&paths)?;
         let (ml, model_error) = load_model(&paths, &config);
@@ -143,6 +155,8 @@ impl Daemon {
                 activity,
                 clip,
                 proxy_addr: RwLock::new(None),
+                proxy: RwLock::new(None),
+                config_lock: Mutex::new(()),
                 model_error,
                 shutdown,
                 stopped: Arc::new(AtomicBool::new(false)),
@@ -185,7 +199,15 @@ impl Daemon {
         if let Some(c) = &shared.clip {
             c.stop();
         }
-        let _ = std::fs::remove_file(shared.paths.proxy_addr_file());
+        // Only remove the address file this daemon wrote (and nobody
+        // replaced since).
+        let ours = *shared.proxy_addr.read().unwrap_or_else(|e| e.into_inner());
+        let file = shared.paths.proxy_addr_file();
+        if let Some(addr) = ours
+            && std::fs::read_to_string(&file).is_ok_and(|s| s.trim() == addr.to_string())
+        {
+            let _ = std::fs::remove_file(file);
+        }
         tracing::info!("parda daemon stopped");
         result
     }
@@ -199,15 +221,15 @@ impl Daemon {
             .clone();
         let mut proxy_task = None;
         if self.opts.proxy && config.proxy.enabled {
-            let listener = tokio::net::TcpListener::bind(&config.proxy.listen)
-                .await
-                .with_context(|| format!("binding the proxy on {}", config.proxy.listen))?;
+            // Refuses a non-loopback address unless allow_non_loopback.
+            let listener = parda_proxy::bind(&config.proxy).await?;
             let addr = listener.local_addr()?;
             *shared.proxy_addr.write().unwrap_or_else(|e| e.into_inner()) = Some(addr);
             write_private(&shared.paths.proxy_addr_file(), &addr.to_string())?;
             let (ptx, mut prx) = broadcast::channel(256);
             let state =
                 parda_proxy::ProxyState::new(shared.engine.clone(), config.proxy.clone(), ptx)?;
+            *shared.proxy.write().unwrap_or_else(|e| e.into_inner()) = Some(state.clone());
             let events = shared.events.clone();
             let activity = shared.activity.clone();
             tokio::spawn(async move {
@@ -419,6 +441,9 @@ impl DaemonHandle {
         }))
     }
 
+    /// Apply a configuration to the running daemon. Returns true if part
+    /// of it (listen address, service on/off, model, hotkey) only takes
+    /// effect after a restart; everything else applies now.
     fn apply_config(&self, config: Config) -> bool {
         let old = self.config();
         let restart = old.proxy.listen != config.proxy.listen
@@ -426,10 +451,14 @@ impl DaemonHandle {
             || old.detect.model != config.detect.model
             || old.detect.execution_provider != config.detect.execution_provider
             || old.clipboard.enabled != config.clipboard.enabled
-            || old.clipboard.hotkey != config.clipboard.hotkey
-            || old.proxy.anthropic_upstream != config.proxy.anthropic_upstream
-            || old.proxy.openai_upstream != config.proxy.openai_upstream;
+            || old.clipboard.hotkey != config.clipboard.hotkey;
         self.shared.engine.set_config(config.clone());
+        if let Some(proxy) = &*self.shared.proxy.read().unwrap_or_else(|e| e.into_inner()) {
+            proxy.set_config(config.proxy.clone());
+        }
+        if let Some(clip) = &self.shared.clip {
+            clip.set_config(config.clipboard.clone());
+        }
         *self
             .shared
             .config
@@ -512,6 +541,7 @@ impl DaemonHandle {
             Request::ConfigGet => Response::ok(json!({"toml": self.config().to_toml_string()?})),
             Request::ConfigSet { toml } => match Config::from_toml_str(&toml) {
                 Ok(config) => {
+                    let _serial = s.config_lock.lock().unwrap_or_else(|e| e.into_inner());
                     write_private(&s.paths.config_file(), &config.to_toml_string()?)?;
                     let restart = self.apply_config(config);
                     Response::ok(json!({"restart_required": restart}))
@@ -519,6 +549,7 @@ impl DaemonHandle {
                 Err(e) => Response::err("invalid_config", e.to_string()),
             },
             Request::Reload => {
+                let _serial = s.config_lock.lock().unwrap_or_else(|e| e.into_inner());
                 let config = load_config(&s.paths)?;
                 let rules = load_rules(&s.paths)?;
                 s.engine.reload_rules(rules);

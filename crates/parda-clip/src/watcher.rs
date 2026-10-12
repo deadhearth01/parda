@@ -119,6 +119,15 @@ impl<B: ClipboardBackend, P: Paster> ClipService<B, P> {
         }
     }
 
+    /// Apply new clipboard settings (`restore_on_copy`, `scope`, `poll_ms`).
+    pub fn set_config(&mut self, cfg: ClipboardConfig) {
+        self.cfg = cfg;
+    }
+
+    pub fn config(&self) -> &ClipboardConfig {
+        &self.cfg
+    }
+
     /// Pauses around the synthetic paste (tests use zero).
     pub fn with_delays(mut self, settle: Duration, restore_delay: Duration) -> Self {
         self.settle = settle;
@@ -225,10 +234,27 @@ impl<B: ClipboardBackend, P: Paster> ClipService<B, P> {
 
 type PasteReply = Sender<Result<PasteOutcome, String>>;
 
+/// A request for the clipboard thread.
+enum Msg {
+    Paste(PasteReply),
+    Config(ClipboardConfig),
+}
+
+impl<B: ClipboardBackend, P: Paster> ClipService<B, P> {
+    fn handle(&mut self, msg: Msg) {
+        match msg {
+            Msg::Paste(reply) => {
+                let _ = reply.send(self.paste_safe().map_err(|e| e.to_string()));
+            }
+            Msg::Config(cfg) => self.set_config(cfg),
+        }
+    }
+}
+
 /// Control handle for the clipboard thread.
 #[derive(Clone)]
 pub struct ClipHandle {
-    tx: Sender<PasteReply>,
+    tx: Sender<Msg>,
     stop: Arc<AtomicBool>,
 }
 
@@ -237,11 +263,17 @@ impl ClipHandle {
     pub fn paste_safe(&self) -> anyhow::Result<PasteOutcome> {
         let (reply, rx) = crossbeam_channel::bounded(1);
         self.tx
-            .send(reply)
+            .send(Msg::Paste(reply))
             .map_err(|_| anyhow::anyhow!("the clipboard service has stopped"))?;
         rx.recv_timeout(Duration::from_secs(15))
             .map_err(|_| anyhow::anyhow!("the clipboard service did not answer"))?
             .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// Apply new settings to the running clipboard service (`enabled` and
+    /// `hotkey` need a restart).
+    pub fn set_config(&self, cfg: ClipboardConfig) {
+        let _ = self.tx.send(Msg::Config(cfg));
     }
 
     pub fn stop(&self) {
@@ -259,10 +291,9 @@ pub fn spawn(
     cfg: ClipboardConfig,
     on_event: Box<dyn Fn(ClipEvent) + Send>,
 ) -> anyhow::Result<ClipHandle> {
-    let (tx, rx) = crossbeam_channel::unbounded::<PasteReply>();
+    let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
     let stop = Arc::new(AtomicBool::new(false));
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<Result<(), String>>(1);
-    let poll = Duration::from_millis(cfg.poll_ms.max(50));
     let stop2 = stop.clone();
     std::thread::Builder::new()
         .name("parda-clipboard".into())
@@ -280,10 +311,9 @@ pub fn spawn(
             };
             let mut svc = ClipService::new(engine, cfg, backend, EnigoPaster, on_event);
             while !stop2.load(Ordering::SeqCst) {
+                let poll = Duration::from_millis(svc.config().poll_ms.max(50));
                 match rx.recv_timeout(poll) {
-                    Ok(reply) => {
-                        let _ = reply.send(svc.paste_safe().map_err(|e| e.to_string()));
-                    }
+                    Ok(msg) => svc.handle(msg),
                     Err(RecvTimeoutError::Timeout) => svc.tick(),
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
@@ -459,6 +489,21 @@ mod tests {
         svc.tick();
         assert!(shared.events.lock().unwrap().is_empty());
         assert!(svc.paste_safe().is_err());
+    }
+
+    #[test]
+    fn settings_apply_to_the_running_service() {
+        let (_d, engine, shared, mut svc) = service(false);
+        let sur = engine.redact("Ravi Kumar", "global").unwrap().text;
+        let mut cfg = svc.config().clone();
+        cfg.restore_on_copy = false;
+        svc.handle(Msg::Config(cfg));
+        set(&shared, &format!("Thanks {sur}!"));
+        svc.tick();
+        assert_eq!(
+            shared.clip.lock().unwrap().as_deref(),
+            Some(format!("Thanks {sur}!").as_str())
+        );
     }
 
     #[test]
