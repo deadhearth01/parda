@@ -1,0 +1,36 @@
+[package]
+name = "parda-clip"
+description = "Clipboard watcher, paste-safe and restore-on-copy for parda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+parda-core.workspace = true
+parda-engine.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+blake3.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+arboard.workspace = true
+enigo.workspace = true
+global-hotkey.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { workspace = true, features = ["wayland-data-control"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+parda-detect.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
