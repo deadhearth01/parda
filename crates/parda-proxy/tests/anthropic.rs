@@ -134,19 +134,60 @@ async fn thinking_blocks_untouched() {
 #[tokio::test]
 async fn unknown_block_types_pass_through() {
     let s = setup(echo_first_user_text()).await;
-    let server_tool = json!({"type": "server_tool_use", "id": "x", "name": "web_search", "input": {"query": "Ravi Kumar"}});
     let future = json!({"type": "future_block", "x": 1, "note": "Ravi Kumar"});
+    let thinking = json!({"type": "redacted_thinking", "data": "Ravi Kumar"});
     s.post(
         "/v1/messages",
         &json!({"model": "m", "messages": [
             {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": [server_tool.clone(), future.clone()]}
+            {"role": "assistant", "content": [future.clone(), thinking.clone()]}
         ]}),
     )
     .await;
     let seen = s.mock.last().json();
-    assert_eq!(seen["messages"][1]["content"][0], server_tool);
-    assert_eq!(seen["messages"][1]["content"][1], future);
+    assert_eq!(seen["messages"][1]["content"][0], future);
+    assert_eq!(seen["messages"][1]["content"][1], thinking);
+}
+
+#[tokio::test]
+async fn server_and_mcp_tool_use_inputs_are_redacted_and_restored() {
+    // The answer echoes the (redacted) query back in a server tool call.
+    let s = setup(responder(|seen| {
+        let v = seen.json();
+        let q = v["messages"][0]["content"].as_str().unwrap().to_string();
+        Reply::Json(
+            StatusCode::OK,
+            json!({"type": "message", "role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {"query": q}},
+                {"type": "mcp_tool_use", "id": "m1", "name": "crm", "server_name": "crm", "input": {"who": q}}
+            ]}),
+        )
+    }))
+    .await;
+    let resp = s
+        .post(
+            "/v1/messages",
+            &json!({"model": "m", "messages": [{"role": "user", "content": "Ravi Kumar"}]}),
+        )
+        .await;
+    let body: Value = resp.json().await.unwrap();
+    // Restored for the client ...
+    assert_eq!(body["content"][0]["input"]["query"], "Ravi Kumar");
+    assert_eq!(body["content"][1]["input"]["who"], "Ravi Kumar");
+
+    // ... so the next turn carries the real name back, and parda must
+    // redact it again.
+    s.post(
+        "/v1/messages",
+        &json!({"model": "m", "messages": [
+            {"role": "user", "content": "Ravi Kumar"},
+            {"role": "assistant", "content": body["content"].clone()},
+            {"role": "user", "content": "thanks"}
+        ]}),
+    )
+    .await;
+    let up = s.mock.last().text();
+    assert!(!up.contains("Ravi"), "{up}");
 }
 
 #[tokio::test]

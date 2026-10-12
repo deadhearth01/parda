@@ -235,3 +235,125 @@ async fn upstream_error_status_with_json_is_restored() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["message"], "slow down Ravi Kumar");
 }
+
+fn json_delta(index: u64, partial: &str) -> String {
+    sse(
+        Some("content_block_delta"),
+        &json!({"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": partial}}),
+    )
+}
+
+fn block_start(index: u64, block: Value) -> String {
+    sse(
+        Some("content_block_start"),
+        &json!({"type": "content_block_start", "index": index, "content_block": block}),
+    )
+}
+
+fn block_stop(index: u64) -> String {
+    sse(
+        Some("content_block_stop"),
+        &json!({"type": "content_block_stop", "index": index}),
+    )
+}
+
+#[tokio::test]
+async fn server_tool_use_stream_restored_and_tail_flushed() {
+    let s = setup(responder(|seen| {
+        let sur = sur_from(seen);
+        let first = sur.split(' ').next().unwrap().to_string();
+        Reply::Sse(vec![
+            (0, block_start(0, json!({"type": "server_tool_use", "id": "s", "name": "web_search", "input": {}}))),
+            (5, json_delta(0, "{\"query\": \"")),
+            (5, json_delta(0, &format!("{sur}\"}}"))),
+            (0, block_stop(0)),
+            // The model hit max_tokens mid-input: the JSON ends in a value
+            // that could still grow into a surrogate.
+            (0, block_start(1, json!({"type": "mcp_tool_use", "id": "m", "name": "crm", "server_name": "crm", "input": {}}))),
+            (5, json_delta(1, &format!("{{\"who\": \"x {first}"))),
+            (0, block_stop(1)),
+            (0, sse(Some("message_stop"), &json!({"type": "message_stop"}))),
+        ])
+    }))
+    .await;
+    let resp = s
+        .post(
+            "/v1/messages",
+            &json!({"model": "m", "stream": true, "messages": [{"role": "user", "content": "Say hi to Ravi Kumar"}]}),
+        )
+        .await;
+    let body = resp.text().await.unwrap();
+    let events = parse_events(&body);
+    let per_block = |i: u64| -> String {
+        events
+            .iter()
+            .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
+            .filter(|v| v["type"] == "content_block_delta" && v["index"] == i)
+            .map(|v| {
+                v["delta"]["partial_json"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect()
+    };
+    let v: Value = serde_json::from_str(&per_block(0)).unwrap();
+    assert_eq!(v["query"], "Ravi Kumar");
+    let sur = s.engine.redact("Ravi Kumar", "global").unwrap().text;
+    let first = sur.split(' ').next().unwrap();
+    // The held-back tail is flushed at content_block_stop (restored the
+    // way a complete text would be: a lone first name maps back too).
+    let tail = per_block(1);
+    assert_eq!(
+        tail,
+        s.engine
+            .restore(&format!("{{\"who\": \"x {first}"), "global")
+    );
+    assert!(tail.len() > "{\"who\": \"x ".len(), "{tail}");
+    // Every delta of a block precedes its stop event.
+    for i in [0u64, 1] {
+        let stop = events
+            .iter()
+            .position(|e| {
+                e.data.contains("content_block_stop") && e.data.contains(&format!("\"index\":{i}"))
+            })
+            .unwrap();
+        assert!(events[stop..].iter().all(|e| {
+            let v: Value = serde_json::from_str(&e.data).unwrap_or(Value::Null);
+            !(v["type"] == "content_block_delta" && v["index"] == i)
+        }));
+    }
+}
+
+#[tokio::test]
+async fn unknown_block_json_delta_passes_through_unchanged() {
+    let s = setup(responder(|seen| {
+        let sur = sur_from(seen);
+        Reply::Sse(vec![
+            (
+                0,
+                block_start(
+                    0,
+                    json!({"type": "future_tool_use", "id": "f", "input": {}}),
+                ),
+            ),
+            (0, json_delta(0, &format!("{{\"q\": \"{sur}\"}}"))),
+            (0, block_stop(0)),
+            (
+                0,
+                sse(Some("message_stop"), &json!({"type": "message_stop"})),
+            ),
+        ])
+    }))
+    .await;
+    let resp = s
+        .post(
+            "/v1/messages",
+            &json!({"model": "m", "stream": true, "messages": [{"role": "user", "content": "Say hi to Ravi Kumar"}]}),
+        )
+        .await;
+    let body = resp.text().await.unwrap();
+    let sur = s.engine.redact("Ravi Kumar", "global").unwrap().text;
+    let json_text = collect_text(&parse_events(&body), "input_json_delta", "partial_json");
+    assert_eq!(json_text, format!("{{\"q\": \"{sur}\"}}"));
+}

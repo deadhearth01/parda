@@ -56,7 +56,9 @@ fn request_block(b: &mut Value, f: Visit<'_>) -> u32 {
             Some(Value::Array(inner)) => inner.iter_mut().map(|x| request_block(x, f)).sum(),
             _ => 0,
         },
-        "tool_use" => {
+        // Tool calls the model made. Their inputs are restored in answers,
+        // so the client's copy holds real values: redact them again.
+        "tool_use" | "server_tool_use" | "mcp_tool_use" => {
             if let Some(input) = b.get_mut("input") {
                 leaves(input, f);
             }
@@ -100,7 +102,9 @@ pub(crate) fn walk_response(v: &mut Value, f: Visit<'_>) {
         for b in blocks {
             match type_of(b) {
                 "text" => str_field(b, "text", f),
-                "tool_use" => {
+                // Must match the request walker: whatever is restored here
+                // comes back in the next request and is redacted there.
+                "tool_use" | "server_tool_use" | "mcp_tool_use" => {
                     if let Some(input) = b.get_mut("input") {
                         leaves(input, f);
                     }
@@ -113,9 +117,23 @@ pub(crate) fn walk_response(v: &mut Value, f: Visit<'_>) {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BlockKind {
+    /// `text`: `text_delta.text` is restored.
     Text,
+    /// A tool call (`tool_use`, `server_tool_use`, `mcp_tool_use`):
+    /// `input_json_delta.partial_json` is restored.
     Json,
+    /// Anything else (thinking, tool results, future types): untouched.
     Other,
+}
+
+impl BlockKind {
+    fn of_block(block_type: &str) -> Self {
+        match block_type {
+            "text" => BlockKind::Text,
+            "tool_use" | "server_tool_use" | "mcp_tool_use" => BlockKind::Json,
+            _ => BlockKind::Other,
+        }
+    }
 }
 
 pub(crate) struct AnthropicStream {
@@ -138,29 +156,37 @@ impl AnthropicStream {
         }
     }
 
-    fn flush(&mut self, index: u64, out: &mut Vec<SseEvent>) {
-        let kind = self.blocks.get(&index).copied().unwrap_or(BlockKind::Text);
-        let rest = self.restorers.finish(&Self::key(index, kind));
+    /// Flush one restorer key; the delta type follows the key it was pushed
+    /// under, never the block's recorded kind.
+    fn flush_key(&mut self, key: &str, out: &mut Vec<SseEvent>) {
+        let Some((prefix, index)) = key.split_once(':') else {
+            return;
+        };
+        let Ok(index) = index.parse::<u64>() else {
+            return;
+        };
+        let rest = self.restorers.finish(key);
         if rest.is_empty() {
             return;
         }
-        let delta = match kind {
-            BlockKind::Json => json!({"type": "input_json_delta", "partial_json": rest}),
-            _ => json!({"type": "text_delta", "text": rest}),
+        let delta = if prefix == "json" {
+            json!({"type": "input_json_delta", "partial_json": rest})
+        } else {
+            json!({"type": "text_delta", "text": rest})
         };
         let data = json!({"type": "content_block_delta", "index": index, "delta": delta});
         out.push(SseEvent::new(Some("content_block_delta"), data.to_string()));
     }
 
+    fn flush(&mut self, index: u64, out: &mut Vec<SseEvent>) {
+        for kind in [BlockKind::Text, BlockKind::Json] {
+            self.flush_key(&Self::key(index, kind), out);
+        }
+    }
+
     fn flush_all(&mut self, out: &mut Vec<SseEvent>) {
-        let open: Vec<u64> = self
-            .restorers
-            .open_keys()
-            .iter()
-            .filter_map(|k| k.split_once(':')?.1.parse().ok())
-            .collect();
-        for index in open {
-            self.flush(index, out);
+        for key in self.restorers.open_keys() {
+            self.flush_key(&key, out);
         }
     }
 }
@@ -175,11 +201,7 @@ impl StreamRewriter for AnthropicStream {
         match type_of(&v) {
             "content_block_start" => {
                 let block = v.get("content_block").map(type_of).unwrap_or_default();
-                let kind = match block {
-                    "text" => BlockKind::Text,
-                    "tool_use" => BlockKind::Json,
-                    _ => BlockKind::Other,
-                };
+                let kind = BlockKind::of_block(block);
                 self.blocks.insert(index, kind);
                 if kind == BlockKind::Text
                     && let Some(Value::String(t)) =
@@ -203,7 +225,12 @@ impl StreamRewriter for AnthropicStream {
                         return;
                     }
                 };
-                self.blocks.entry(index).or_insert(kind);
+                // Only restore deltas of blocks whose type says so (a block
+                // never announced is judged by its delta).
+                if *self.blocks.entry(index).or_insert(kind) != kind {
+                    out.push(ev);
+                    return;
+                }
                 let key = Self::key(index, kind);
                 let Some(Value::String(t)) = v.get_mut("delta").and_then(|d| d.get_mut(field))
                 else {
