@@ -20,6 +20,18 @@ pub(crate) fn walk_request(v: &mut Value, f: Visit<'_>) -> u32 {
     unscanned
 }
 
+/// `POST /v1/conversations` and `POST /v1/conversations/{id}/items`: the
+/// `items` are Responses input items.
+pub(crate) fn walk_conversation_request(v: &mut Value, f: Visit<'_>) -> u32 {
+    let mut unscanned = 0;
+    if let Some(Value::Array(items)) = v.get_mut("items") {
+        for item in items {
+            unscanned += input_item(item, f);
+        }
+    }
+    unscanned
+}
+
 #[cfg(test)]
 pub(crate) fn count_unscanned(v: &mut Value) -> u32 {
     walk_request(v, &mut |_| {})

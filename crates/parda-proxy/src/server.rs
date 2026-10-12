@@ -19,9 +19,10 @@ use serde_json::Value;
 use crate::body::{self, BodyError};
 use crate::error::error_response;
 use crate::route::{Provider, route};
+use crate::route::{SUPPORTED, normalize_path};
 use crate::sse::{Restorers, StreamRewriter};
 use crate::walk::{Visit, leaves};
-use crate::{ProxyEvent, ProxyState, anthropic, guard, openai_chat, openai_responses, sse};
+use crate::{ProxyEvent, ProxyState, anthropic, guard, legacy, openai_chat, openai_responses, sse};
 
 /// Header naming the vault scope of a request (default `global`).
 pub const SCOPE_HEADER: &str = "x-parda-scope";
@@ -56,10 +57,31 @@ type Walker = fn(&mut Value, Visit<'_>) -> u32;
 fn request_walker(p: Provider) -> Option<Walker> {
     match p {
         Provider::Anthropic => Some(anthropic::walk_request),
+        Provider::AnthropicBatches => Some(legacy::walk_batch_request),
+        Provider::AnthropicComplete => Some(legacy::walk_complete_request),
         Provider::OpenAiChat => Some(openai_chat::walk_request),
         Provider::OpenAiResponses => Some(openai_responses::walk_request),
-        _ => None,
+        Provider::OpenAiCompletions => Some(legacy::walk_completions_request),
+        Provider::OpenAiEmbeddings => Some(legacy::walk_embeddings_request),
+        Provider::OpenAiConversations => Some(openai_responses::walk_conversation_request),
+        Provider::PassAnthropic | Provider::PassOpenAi => None,
     }
+}
+
+/// True if a body sent to an endpoint parda does not know holds no text at
+/// all: JSON with no strings (keys included), e.g. `{}` for a cancel call.
+fn carries_no_text(headers: &HeaderMap, body: &Bytes, max: usize) -> bool {
+    fn has_text(v: &Value) -> bool {
+        match v {
+            Value::String(_) => true,
+            Value::Array(a) => a.iter().any(has_text),
+            Value::Object(m) => !m.is_empty(),
+            _ => false,
+        }
+    }
+    body::decode(headers, body.clone(), max)
+        .and_then(|raw| body::parse_json(&raw))
+        .is_ok_and(|v| !has_text(&v))
 }
 
 fn scope_of(headers: &HeaderMap) -> String {
@@ -172,8 +194,10 @@ fn restore_body(
     if success {
         match provider {
             Provider::Anthropic => anthropic::walk_response(&mut v, &mut f),
+            Provider::AnthropicComplete => legacy::walk_complete_response(&mut v, &mut f),
             Provider::OpenAiChat => openai_chat::walk_response(&mut v, &mut f),
             Provider::OpenAiResponses => openai_responses::walk_response(&mut v, &mut f),
+            Provider::OpenAiCompletions => legacy::walk_completions_response(&mut v, &mut f),
             _ => {}
         }
     } else {
@@ -283,10 +307,13 @@ fn finish(
 
 async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
-    let provider = route(&parts.method, parts.uri.path(), &parts.headers);
+    // Route (and forward) the path the way the upstream will read it, so
+    // `/v1//messages` or `/v1/%6Dessages` cannot slip past the walkers.
+    let path = normalize_path(parts.uri.path());
+    let provider = route(&parts.method, &path, &parts.headers);
     let mut event = ProxyEvent {
         provider: provider.name(),
-        path: parts.uri.path().to_string(),
+        path: path.clone(),
         counts: BTreeMap::new(),
         ml_ms: 0,
         added_ms: 0,
@@ -314,6 +341,24 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
             return finish(&state, event, resp, Some("parda_body_too_large".into()));
         }
     };
+
+    // An endpoint parda cannot redact may only carry bodies without text.
+    if !provider.rewrites()
+        && !body.is_empty()
+        && !carries_no_text(&parts.headers, &body, state.cfg.max_body_bytes)
+    {
+        let resp = error_response(
+            provider,
+            StatusCode::BAD_REQUEST,
+            "parda_unknown_endpoint",
+            &format!(
+                "parda does not know which fields of {} {path} carry text, so it cannot redact \
+                 them; the request was not sent. Endpoints parda redacts: {SUPPORTED}",
+                parts.method
+            ),
+        );
+        return finish(&state, event, resp, Some("parda_unknown_endpoint".into()));
+    }
 
     // Redact the request. A body parda cannot read is refused, never
     // forwarded as is.
@@ -380,8 +425,10 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
     } else {
         &state.cfg.openai_upstream
     };
-    let pq = parts.uri.path_and_query().map_or("/", |p| p.as_str());
-    let url = format!("{}{pq}", base.trim_end_matches('/'));
+    let url = match parts.uri.query() {
+        Some(q) => format!("{}{path}?{q}", base.trim_end_matches('/')),
+        None => format!("{}{path}", base.trim_end_matches('/')),
+    };
     let mut rb = state.http.request(parts.method.clone(), &url);
     for (k, v) in &parts.headers {
         if forward_request_header(k) && !(decoded && k == header::CONTENT_ENCODING) {
@@ -417,11 +464,13 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         .and_then(|v| v.to_str().ok())
         .is_some_and(|c| c.starts_with("text/event-stream"));
 
-    if is_sse && provider.rewrites() {
+    if is_sse && provider.restores() {
         let restorers = Restorers::new(state.engine.clone(), &scope);
         let rw: Box<dyn StreamRewriter> = match provider {
             Provider::Anthropic => Box::new(anthropic::AnthropicStream::new(restorers)),
+            Provider::AnthropicComplete => Box::new(legacy::CompleteStream::new(restorers)),
             Provider::OpenAiChat => Box::new(openai_chat::ChatStream::new(restorers)),
+            Provider::OpenAiCompletions => Box::new(legacy::CompletionsStream::new(restorers)),
             _ => Box::new(openai_responses::ResponsesStream::new(restorers)),
         };
         let (tx, rx) = futures::channel::mpsc::channel(32);
@@ -447,7 +496,12 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         }
     };
     let mut restore_ms = 0;
-    let body = if provider.rewrites() && !bytes.is_empty() {
+    let restore = if status.is_success() {
+        provider.restores()
+    } else {
+        provider.rewrites()
+    };
+    let body = if restore && !bytes.is_empty() {
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(v) => {
                 let started = Instant::now();

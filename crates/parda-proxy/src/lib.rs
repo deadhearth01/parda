@@ -15,6 +15,7 @@ mod anthropic;
 mod body;
 mod error;
 mod guard;
+mod legacy;
 mod openai_chat;
 mod openai_responses;
 mod route;
@@ -31,7 +32,7 @@ use parda_engine::Engine;
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-pub use route::Provider;
+pub use route::{Provider, normalize_path};
 pub use server::{SCOPE_HEADER, router, serve, serve_with_shutdown};
 pub use sse::{SseEvent, parse_sse, serialize};
 
