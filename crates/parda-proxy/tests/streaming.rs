@@ -357,3 +357,67 @@ async fn unknown_block_json_delta_passes_through_unchanged() {
     let json_text = collect_text(&parse_events(&body), "input_json_delta", "partial_json");
     assert_eq!(json_text, format!("{{\"q\": \"{sur}\"}}"));
 }
+
+/// Split `s` into three pieces at char boundaries, cutting through `needle`.
+fn split3(s: &str, needle: &str) -> (String, String, String) {
+    let at = s.find(needle).unwrap();
+    let mut a = at + needle.len() / 3;
+    while !s.is_char_boundary(a) {
+        a += 1;
+    }
+    let mut b = at + 2 * needle.len() / 3;
+    while !s.is_char_boundary(b) {
+        b += 1;
+    }
+    (s[..a].to_string(), s[a..b].to_string(), s[b..].to_string())
+}
+
+/// The surrogate the upstream saw for ADDRESS ("ship to <surrogate>").
+fn address_sur(seen: &Seen) -> String {
+    let v = seen.json();
+    v["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("ship to ")
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn streamed_tool_json_escapes_restored_values() {
+    let s = setup(responder(|seen| {
+        let sur = address_sur(seen);
+        let json_text = serde_json::to_string(&json!({"addr": sur, "n": 1})).unwrap();
+        let (a, b, c) = split3(&json_text, &sur);
+        Reply::Sse(vec![
+            (
+                0,
+                block_start(
+                    0,
+                    json!({"type": "tool_use", "id": "t", "name": "ship", "input": {}}),
+                ),
+            ),
+            (5, json_delta(0, &a)),
+            (5, json_delta(0, &b)),
+            (5, json_delta(0, &c)),
+            (0, block_stop(0)),
+            (
+                0,
+                sse(Some("message_stop"), &json!({"type": "message_stop"})),
+            ),
+        ])
+    }))
+    .await;
+    let resp = s
+        .post(
+            "/v1/messages",
+            &json!({"model": "m", "stream": true, "messages": [{"role": "user", "content": format!("ship to {ADDRESS}")}]}),
+        )
+        .await;
+    assert!(!s.mock.last().text().contains("Lotus"));
+    let body = resp.text().await.unwrap();
+    let json_text = collect_text(&parse_events(&body), "input_json_delta", "partial_json");
+    let v: Value = serde_json::from_str(&json_text).unwrap_or_else(|e| panic!("{e}: {json_text}"));
+    assert_eq!(v["addr"], ADDRESS);
+    assert_eq!(v["n"], 1);
+}

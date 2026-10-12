@@ -257,7 +257,11 @@ impl StreamRewriter for AnthropicStream {
                     out.push(ev);
                     return;
                 };
-                let restored = self.restorers.push(&key, t);
+                let restored = if kind == BlockKind::Json {
+                    self.restorers.push_json(&key, t)
+                } else {
+                    self.restorers.push(&key, t)
+                };
                 if restored.is_empty() {
                     return; // everything held back for now
                 }

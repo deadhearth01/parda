@@ -8,6 +8,8 @@ use futures::channel::mpsc;
 use futures::{SinkExt, StreamExt};
 use parda_engine::{Engine, StreamRestorer};
 
+use crate::jsonfrag::JsonFragRestorer;
+
 /// One SSE event. `raw` holds the original bytes until the event is changed,
 /// so untouched events are forwarded byte-for-byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,11 +134,17 @@ pub(crate) trait StreamRewriter: Send {
     fn on_end(&mut self, out: &mut Vec<SseEvent>);
 }
 
+/// One stream's restorer: plain text, or JSON text (tool-call arguments).
+enum KeyRestorer {
+    Text(StreamRestorer),
+    Json(JsonFragRestorer),
+}
+
 /// Stream restorers keyed by content block / choice / output item.
 pub(crate) struct Restorers {
     engine: Engine,
     scope: String,
-    map: HashMap<String, StreamRestorer>,
+    map: HashMap<String, KeyRestorer>,
     order: Vec<String>,
 }
 
@@ -150,25 +158,43 @@ impl Restorers {
         }
     }
 
-    pub(crate) fn push(&mut self, key: &str, text: &str) -> String {
+    fn entry(&mut self, key: &str, json: bool) -> &mut KeyRestorer {
         if !self.map.contains_key(key) {
-            self.map
-                .insert(key.to_string(), self.engine.stream_restorer(&self.scope));
+            let r = if json {
+                KeyRestorer::Json(JsonFragRestorer::new(self.engine.clone(), &self.scope))
+            } else {
+                KeyRestorer::Text(self.engine.stream_restorer(&self.scope))
+            };
+            self.map.insert(key.to_string(), r);
             self.order.push(key.to_string());
         }
-        self.map
-            .get_mut(key)
-            .map(|r| r.push(text))
-            .unwrap_or_default()
+        self.map.get_mut(key).expect("just inserted")
+    }
+
+    /// Restore a chunk of plain text.
+    pub(crate) fn push(&mut self, key: &str, text: &str) -> String {
+        match self.entry(key, false) {
+            KeyRestorer::Text(r) => r.push(text),
+            KeyRestorer::Json(r) => r.push(text),
+        }
+    }
+
+    /// Restore a chunk of a JSON document (real values are JSON-escaped).
+    pub(crate) fn push_json(&mut self, key: &str, fragment: &str) -> String {
+        match self.entry(key, true) {
+            KeyRestorer::Text(r) => r.push(fragment),
+            KeyRestorer::Json(r) => r.push(fragment),
+        }
     }
 
     /// Flush and forget one key.
     pub(crate) fn finish(&mut self, key: &str) -> String {
         self.order.retain(|k| k != key);
-        self.map
-            .remove(key)
-            .map(|mut r| r.finish())
-            .unwrap_or_default()
+        match self.map.remove(key) {
+            Some(KeyRestorer::Text(mut r)) => r.finish(),
+            Some(KeyRestorer::Json(mut r)) => r.finish(),
+            None => String::new(),
+        }
     }
 
     /// Keys still open, oldest first.

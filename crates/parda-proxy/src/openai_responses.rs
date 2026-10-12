@@ -253,7 +253,7 @@ impl StreamRewriter for ResponsesStream {
             "response.function_call_arguments.delta" => {
                 let key = Self::args_key(&v);
                 if let Some(Value::String(d)) = v.get_mut("delta") {
-                    let restored = self.restorers.push(&key, d);
+                    let restored = self.restorers.push_json(&key, d);
                     if restored.is_empty() {
                         return;
                     }

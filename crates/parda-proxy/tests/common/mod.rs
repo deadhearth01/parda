@@ -145,10 +145,17 @@ impl Setup {
     }
 }
 
+/// A custom term whose real value needs JSON escaping.
+pub const ADDRESS: &str = "Flat 4\\B, \"Lotus\"\nPune";
+
 pub fn rules() -> RulesFile {
     RulesFile {
         person: vec![PersonBlock {
             name: "Ravi Kumar".into(),
+            ..Default::default()
+        }],
+        term: vec![parda_detect::Term {
+            text: ADDRESS.into(),
             ..Default::default()
         }],
         ..Default::default()

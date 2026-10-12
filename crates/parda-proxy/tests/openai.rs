@@ -219,3 +219,173 @@ async fn gzip_upstream_handled() {
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "for Ravi Kumar");
 }
+
+fn chat_chunk(delta: Value, finish: Value) -> String {
+    sse(
+        None,
+        &json!({"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}),
+    )
+}
+
+fn user_sur(seen: &Seen, prefix: &str) -> String {
+    let v = seen.json();
+    let text = v["messages"][0]["content"]
+        .as_str()
+        .or_else(|| v["input"].as_str())
+        .unwrap()
+        .to_string();
+    text.strip_prefix(prefix).unwrap().to_string()
+}
+
+fn chat_text(body: &str) -> (String, String) {
+    let events: Vec<Value> = parse_events(body)
+        .iter()
+        .filter_map(|e| serde_json::from_str(&e.data).ok())
+        .collect();
+    let content = events
+        .iter()
+        .filter_map(|v| {
+            v["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    let args = events
+        .iter()
+        .filter_map(|v| {
+            v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    (content, args)
+}
+
+#[tokio::test]
+async fn chat_tail_stays_in_the_chunk_that_finishes_the_choice() {
+    // vLLM / Ollama / Groq put the last text and finish_reason in one chunk.
+    let s = setup(responder(|seen| {
+        let sur = user_sur(seen, "Say hi to ");
+        Reply::Sse(vec![
+            (
+                0,
+                chat_chunk(json!({"role": "assistant", "content": "Hi! "}), Value::Null),
+            ),
+            (
+                5,
+                chat_chunk(json!({"content": format!("Thanks, {sur}")}), json!("stop")),
+            ),
+            (0, "data: [DONE]\n\n".into()),
+        ])
+    }))
+    .await;
+    let resp = s
+        .post(
+            "/v1/chat/completions",
+            &json!({"model": "gpt", "stream": true, "messages": [{"role": "user", "content": "Say hi to Ravi Kumar"}]}),
+        )
+        .await;
+    let body = resp.text().await.unwrap();
+    assert_eq!(chat_text(&body).0, "Hi! Thanks, Ravi Kumar");
+    // The finishing chunk is still the last one before [DONE].
+    let events = parse_events(&body);
+    let n = events.len();
+    assert_eq!(events[n - 1].data, "[DONE]");
+    let last: Value = serde_json::from_str(&events[n - 2].data).unwrap();
+    assert_eq!(last["choices"][0]["finish_reason"], "stop");
+}
+
+#[tokio::test]
+async fn chat_tool_arguments_escape_restored_values_and_keep_order() {
+    let s = setup(responder(|seen| {
+        let sur = user_sur(seen, "ship to ");
+        let args = serde_json::to_string(&json!({"addr": sur})).unwrap();
+        let mut at = args.find(&sur).unwrap() + sur.len() / 2;
+        while !args.is_char_boundary(at) {
+            at += 1;
+        }
+        let (a, b) = args.split_at(at);
+        let call = |args: &str, first: bool| {
+            if first {
+                json!({"tool_calls": [{"index": 0, "id": "t", "type": "function", "function": {"name": "ship", "arguments": args}}]})
+            } else {
+                json!({"tool_calls": [{"index": 0, "function": {"arguments": args}}]})
+            }
+        };
+        Reply::Sse(vec![
+            (0, chat_chunk(call(a, true), Value::Null)),
+            (5, chat_chunk(call(b, false), json!("tool_calls"))),
+            (0, "data: [DONE]\n\n".into()),
+        ])
+    }))
+    .await;
+    let resp = s
+        .post(
+            "/v1/chat/completions",
+            &json!({"model": "gpt", "stream": true, "messages": [{"role": "user", "content": format!("ship to {ADDRESS}")}]}),
+        )
+        .await;
+    assert!(!s.mock.last().text().contains("Lotus"));
+    let body = resp.text().await.unwrap();
+    let args = chat_text(&body).1;
+    let v: Value = serde_json::from_str(&args).unwrap_or_else(|e| panic!("{e}: {args}"));
+    assert_eq!(v["addr"], ADDRESS);
+}
+
+#[tokio::test]
+async fn responses_function_arguments_escape_restored_values() {
+    let s = setup(responder(|seen| {
+        let sur = user_sur(seen, "ship to ");
+        let args = serde_json::to_string(&json!({"addr": sur})).unwrap();
+        let mut at = args.find(&sur).unwrap() + sur.len() / 2;
+        while !args.is_char_boundary(at) {
+            at += 1;
+        }
+        let (a, b) = args.split_at(at);
+        let delta = |d: &str, n: u64| {
+            sse(
+                Some("response.function_call_arguments.delta"),
+                &json!({"type": "response.function_call_arguments.delta",
+                "item_id": "fc_1", "output_index": 0, "delta": d, "sequence_number": n}),
+            )
+        };
+        Reply::Sse(vec![
+            (0, delta(a, 1)),
+            (5, delta(b, 2)),
+            (
+                0,
+                sse(
+                    Some("response.function_call_arguments.done"),
+                    &json!({"type": "response.function_call_arguments.done",
+                "item_id": "fc_1", "output_index": 0, "arguments": args, "sequence_number": 3}),
+                ),
+            ),
+        ])
+    }))
+    .await;
+    let resp = s
+        .post(
+            "/v1/responses",
+            &json!({"model": "gpt", "stream": true, "input": format!("ship to {ADDRESS}")}),
+        )
+        .await;
+    let body = resp.text().await.unwrap();
+    let events: Vec<Value> = parse_events(&body)
+        .iter()
+        .filter_map(|e| serde_json::from_str(&e.data).ok())
+        .collect();
+    let streamed: String = events
+        .iter()
+        .filter(|v| v["type"] == "response.function_call_arguments.delta")
+        .map(|v| v["delta"].as_str().unwrap().to_string())
+        .collect();
+    let v: Value = serde_json::from_str(&streamed).unwrap_or_else(|e| panic!("{e}: {streamed}"));
+    assert_eq!(v["addr"], ADDRESS);
+    let done = events
+        .iter()
+        .find(|v| v["type"] == "response.function_call_arguments.done")
+        .unwrap();
+    let v: Value = serde_json::from_str(done["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(v["addr"], ADDRESS);
+}

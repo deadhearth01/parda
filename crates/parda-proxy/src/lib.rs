@@ -15,6 +15,7 @@ mod anthropic;
 mod body;
 mod error;
 mod guard;
+mod jsonfrag;
 mod legacy;
 mod openai_chat;
 mod openai_responses;
