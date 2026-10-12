@@ -43,8 +43,16 @@ fn deleting_the_key_file_makes_the_vault_unreadable() {
             .unwrap();
     }
     std::fs::remove_file(dir.path().join("vault.key")).unwrap();
-    let (new_key, _) = load_or_create_key(dir.path(), false).unwrap();
-    let err = Store::open(&db, new_key).err().unwrap();
+    // No new key is minted for a vault that has data: that key could never
+    // open it.
+    assert!(matches!(
+        load_or_create_key(dir.path(), false),
+        Err(Error::Key(_))
+    ));
+    // Any other key is refused by the vault itself.
+    let err = Store::open(&db, parda_vault::VaultKey::generate())
+        .err()
+        .unwrap();
     assert!(matches!(err, Error::WrongKey));
 }
 

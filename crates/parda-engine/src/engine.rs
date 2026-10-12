@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use parda_core::{Action, Config, Detection, EntityKind, MlDetector, Mode, Source, Span, Style};
 use parda_detect::{AllowList, Detector, DictionaryDetector, RuleDetector, RulesFile};
 use parda_vault::surrogate::{SurrogateGen, apply_case, token};
-use parda_vault::{Store, load_or_create_key};
+use parda_vault::{Store, open_vault};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 
@@ -183,8 +183,7 @@ impl Engine {
     /// strict mode refuses to redact.
     pub fn open(opts: EngineOptions, ml: Option<Arc<dyn MlDetector>>) -> Result<Engine> {
         create_private_dir(&opts.data_dir)?;
-        let (key, _source) = load_or_create_key(&opts.data_dir, opts.use_keyring)?;
-        let store = Store::open(&opts.data_dir.join("vault.db"), key)?;
+        let (store, _source) = open_vault(&opts.data_dir, opts.use_keyring)?;
         let pruned = store.prune(opts.config.vault.ttl_days)?;
         if pruned > 0 {
             tracing::info!(pruned, "expired vault mappings removed");
