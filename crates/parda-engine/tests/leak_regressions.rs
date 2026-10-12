@@ -204,3 +204,117 @@ fn url_contents_are_redacted_inside_the_url() {
     );
     assert_eq!(e.restore(&r.text, "global"), t);
 }
+
+/// The stand-in `Ravi Kumar` gets in a vault keyed by `dir`'s key.
+fn surrogate_under_key_of(dir: &std::path::Path) -> String {
+    let e = engine_at(dir, rules_only_config(), None);
+    e.redact("Ravi Kumar", "global").unwrap().text
+}
+
+/// A fresh vault (no mappings) that shares `dir`'s key, so stand-ins are
+/// generated exactly as they were there.
+fn fresh_vault_with_key_of(dir: &std::path::Path) -> tempfile::TempDir {
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::copy(dir.join("vault.key"), fresh.path().join("vault.key")).unwrap();
+    fresh
+}
+
+/// Review A finding 4(a): a new stand-in (or one of its name words) that
+/// already occurs in the input would make restore rewrite what the user
+/// wrote. "Ravi Kumar met Arjun" must never map Ravi Kumar to "Arjun …".
+#[test]
+fn new_surrogate_never_reuses_a_word_of_the_input() {
+    let probe = tempfile::tempdir().unwrap();
+    let sur = surrogate_under_key_of(probe.path());
+    let first = sur.split_whitespace().next().unwrap().to_string();
+
+    let fresh = fresh_vault_with_key_of(probe.path());
+    let e = engine_at(fresh.path(), rules_only_config(), None);
+    let t = format!("Ravi Kumar met {first}");
+    let r = e.redact(&t, "global").unwrap();
+    assert_eq!(e.restore(&r.text, "global"), t, "sent {:?}", r.text);
+    assert!(!r.text.starts_with(&first), "{}", r.text);
+
+    // Across a batch: an undetected word in another message counts too.
+    let fresh = fresh_vault_with_key_of(probe.path());
+    let e = engine_at(fresh.path(), rules_only_config(), None);
+    let texts = ["Ravi Kumar".to_string(), format!("{first} said hi")];
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let out = e.redact_many(&refs, "global").unwrap();
+    for (o, t) in out.iter().zip(&texts) {
+        assert_eq!(&e.restore(&o.text, "global"), t, "sent {:?}", o.text);
+    }
+}
+
+/// Review A finding 4(b): a model span covering part of an echoed stand-in
+/// ("Arjun" of "Arjun Mehta") must not split it.
+#[test]
+fn partial_detection_of_an_echoed_surrogate_restores_exactly() {
+    let ml = NameMl::new(&[]);
+    let (_d, e) = engine_with(
+        ml_config(parda_core::Mode::Strict, 1000),
+        Some(ml.clone() as std::sync::Arc<dyn parda_core::MlDetector>),
+    );
+    let sur = e.redact("Ravi Kumar", "global").unwrap().text;
+    let first = sur.split_whitespace().next().unwrap().to_string();
+    ml.set(&[first.as_str()]);
+    let t = format!("{sur} said hi");
+    let r = e.redact(&t, "global").unwrap();
+    assert_eq!(e.restore(&r.text, "global"), t, "sent {:?}", r.text);
+}
+
+/// Review A finding 4(c): token numbering skips tokens already in the input.
+#[test]
+fn token_numbers_skip_tokens_present_in_the_input() {
+    let mut c = rules_only_config();
+    c.replace.style = parda_core::Style::Token;
+    let (_d, e) = engine_with(c, None);
+    for t in [
+        "⟦EMAIL_1⟧ and ravi@x.com",
+        "a@b.in c@d.in e@f.in g@h.in",
+        "⟦EMAIL_6⟧ and amit@y.com",
+    ] {
+        let r = e.redact(t, "global").unwrap();
+        assert_eq!(e.restore(&r.text, "global"), t, "sent {:?}", r.text);
+    }
+}
+
+/// Review A finding 4 (self-check): output that would not restore to the
+/// input is never sent. A model span that is not word-bounded ("Zubin" in
+/// "Zubinx") would give a stand-in restore cannot find.
+#[test]
+fn output_always_restores_to_the_input() {
+    let ml = NameMl::new(&["Zubin"]);
+    let (_d, e) = engine_with(
+        ml_config(parda_core::Mode::Strict, 1000),
+        Some(ml as std::sync::Arc<dyn parda_core::MlDetector>),
+    );
+    for t in ["Zubinx is here", "ask Zubin_dev or xZubin", "Zubin"] {
+        let r = e.redact(t, "global").unwrap();
+        assert_eq!(e.restore(&r.text, "global"), t, "sent {:?}", r.text);
+        assert!(!r.text.contains("Zubin"), "{}", r.text);
+    }
+}
+
+/// Review A finding 5: name-part mappings ("Ravi" → "Arjun") live as long
+/// as the full name is in use; pruning must not drop them.
+#[test]
+fn name_parts_survive_while_the_full_name_is_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let sur = {
+        let e = engine_at(dir.path(), rules_only_config(), None);
+        e.redact("Ravi Kumar", "global").unwrap().text
+    };
+    let first = sur.split_whitespace().next().unwrap().to_string();
+    // 20 days later the full name is used again (a new process)…
+    age_vault(dir.path(), -20);
+    {
+        let e = engine_at(dir.path(), rules_only_config(), None);
+        assert_eq!(e.redact("Ravi Kumar", "global").unwrap().text, sur);
+    }
+    // …and 15 days after that the hourly prune runs (TTL 30 days).
+    age_vault(dir.path(), -15);
+    let e = engine_at(dir.path(), rules_only_config(), None);
+    assert_eq!(e.restore(&format!("Hi {first}"), "global"), "Hi Ravi");
+    assert_eq!(e.restore(&sur, "global"), "Ravi Kumar");
+}

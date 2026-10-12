@@ -24,6 +24,7 @@ serde.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
+rusqlite.workspace = true
 
 [lints]
 workspace = true

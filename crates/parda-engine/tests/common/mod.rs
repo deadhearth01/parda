@@ -88,16 +88,19 @@ pub fn ml_config(mode: parda_core::Mode, timeout_ms: u64) -> Config {
 /// ML stub that "finds" fixed names: every occurrence in its input window
 /// is reported as a Person, with an optional score.
 pub struct NameMl {
-    pub names: Vec<String>,
+    pub names: std::sync::Mutex<Vec<String>>,
     pub score: f32,
 }
 
 impl NameMl {
     pub fn new(names: &[&str]) -> Arc<Self> {
         Arc::new(NameMl {
-            names: names.iter().map(|s| s.to_string()).collect(),
+            names: std::sync::Mutex::new(names.iter().map(|s| s.to_string()).collect()),
             score: 0.9,
         })
+    }
+    pub fn set(&self, names: &[&str]) {
+        *self.names.lock().unwrap() = names.iter().map(|s| s.to_string()).collect();
     }
 }
 
@@ -110,7 +113,7 @@ impl MlDetector for NameMl {
             .iter()
             .map(|t| {
                 let mut v = Vec::new();
-                for n in &self.names {
+                for n in self.names.lock().unwrap().iter() {
                     for (i, _) in t.match_indices(n.as_str()) {
                         v.push(Detection {
                             span: parda_core::Span::new(i, i + n.len()),
@@ -149,4 +152,29 @@ impl MlDetector for BadSpanMl {
             })
             .collect())
     }
+}
+
+/// Open an engine over an existing data directory (rules-only unless
+/// `config` says otherwise).
+pub fn engine_at(dir: &std::path::Path, config: Config, ml: Option<Arc<dyn MlDetector>>) -> Engine {
+    Engine::open(
+        EngineOptions {
+            config,
+            rules: rules(),
+            data_dir: dir.to_path_buf(),
+            use_keyring: false,
+        },
+        ml,
+    )
+    .unwrap()
+}
+
+/// Shift every vault row's timestamps by `days` (negative: into the past).
+pub fn age_vault(dir: &std::path::Path, days: i64) {
+    let c = rusqlite::Connection::open(dir.join("vault.db")).unwrap();
+    c.execute(
+        "UPDATE mappings SET created_at = created_at + ?1, last_used_at = last_used_at + ?1",
+        [days * 86_400],
+    )
+    .unwrap();
 }

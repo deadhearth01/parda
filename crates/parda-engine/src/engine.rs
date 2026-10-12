@@ -31,6 +31,8 @@ const MAX_ML_BUDGET: Duration = Duration::from_secs(30);
 const MAX_ATTEMPTS: u32 = 64;
 /// Vault `last_used_at` is refreshed at most this often per mapping.
 const TOUCH_INTERVAL: Duration = Duration::from_secs(3600);
+/// Rounds of the post-redaction self-check before a request is refused.
+const MAX_REPAIR_ROUNDS: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct EngineOptions {
@@ -376,6 +378,244 @@ enum Shape<'a> {
     },
 }
 
+/// Per-request context for choosing stand-ins.
+struct Req<'a> {
+    scope: &'a str,
+    style: Style,
+    input: InputWords<'a>,
+}
+
+/// One stand-in to find.
+struct Ask<'a> {
+    kind: &'a EntityKind,
+    real: &'a str,
+    shape: Shape<'a>,
+    /// Values a format match swallowed: its stand-in must not repeat them.
+    absorbed: &'a [&'a str],
+}
+
+/// A redacted text and where each top-level stand-in sits in it.
+struct Rendered {
+    text: String,
+    replaced: Vec<Replacement>,
+    placed: Vec<Placed>,
+}
+
+struct Placed {
+    /// Span of the stand-in in the output.
+    out: Span,
+    /// Span of the real value in the input.
+    input: Span,
+    kind: EntityKind,
+}
+
+/// The words of every input text of a request, for "is this string already
+/// written somewhere?" checks on new stand-ins. Built on first use only (most
+/// requests reuse existing mappings and never ask).
+struct InputWords<'a> {
+    texts: &'a [&'a str],
+    /// The scope's restore table before this request. Its stand-ins are
+    /// echo-guarded (every occurrence in the input is being replaced), so a
+    /// new stand-in may reuse them ("Arjun" for "Ravi" in "Ravi Verma").
+    pre: Arc<RestoreTable>,
+    /// ASCII-lower-cased word → (text, byte offset) of each occurrence.
+    index: std::sync::OnceLock<HashMap<String, Vec<(usize, usize)>>>,
+}
+
+impl<'a> InputWords<'a> {
+    fn new(texts: &'a [&'a str], pre: Arc<RestoreTable>) -> Self {
+        InputWords {
+            texts,
+            pre,
+            index: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn index(&self) -> &HashMap<String, Vec<(usize, usize)>> {
+        self.index.get_or_init(|| {
+            let mut m: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+            for (ti, text) in self.texts.iter().enumerate() {
+                for (start, end) in alnum_runs(text) {
+                    m.entry(text[start..end].to_ascii_lowercase())
+                        .or_default()
+                        .push((ti, start));
+                }
+            }
+            m
+        })
+    }
+
+    /// Does `s` occur word-bounded (ignoring ASCII case, as restore
+    /// matches) in some input text?
+    fn occurs(&self, s: &str) -> bool {
+        // An occurrence of `s` starts its first word at a word start of the
+        // text, so only those positions need checking.
+        let Some((w_start, w_end)) = alnum_runs(s).next() else {
+            return false;
+        };
+        let Some(hits) = self.index().get(&s[w_start..w_end].to_ascii_lowercase()) else {
+            return false;
+        };
+        hits.iter().any(|&(ti, at)| {
+            let t = self.texts[ti];
+            let Some(p) = at.checked_sub(w_start) else {
+                return false;
+            };
+            let end = p + s.len();
+            end <= t.len()
+                && t.is_char_boundary(p)
+                && t.is_char_boundary(end)
+                && t[p..end].eq_ignore_ascii_case(s)
+                && word_bounded(t, p, end)
+        })
+    }
+
+    /// Would `s` as a new stand-in also match text the user wrote?
+    fn clashes(&self, s: &str) -> bool {
+        !self.pre.contains(s) && self.occurs(s)
+    }
+}
+
+/// Byte ranges of the maximal runs of letters and digits in `s`.
+fn alnum_runs(s: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut chars = s.char_indices().peekable();
+    std::iter::from_fn(move || {
+        let (start, _) = chars.by_ref().find(|(_, c)| c.is_alphanumeric())?;
+        let mut end = s.len();
+        while let Some(&(i, c)) = chars.peek() {
+            if !c.is_alphanumeric() {
+                end = i;
+                break;
+            }
+            chars.next();
+        }
+        Some((start, end))
+    })
+}
+
+/// No letter or digit on either side of `t[start..end]` where the match
+/// itself begins / ends with one (restore's boundary rule).
+fn word_bounded(t: &str, start: usize, end: usize) -> bool {
+    let m = &t[start..end];
+    let first = m.chars().next().is_some_and(char::is_alphanumeric);
+    let last = m.chars().next_back().is_some_and(char::is_alphanumeric);
+    !(first
+        && t[..start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric))
+        && !(last && t[end..].chars().next().is_some_and(char::is_alphanumeric))
+}
+
+/// Does `needle` occur word-bounded, ignoring ASCII case, in `hay`?
+fn contains_word(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return false;
+    }
+    let (h, n) = (hay.to_ascii_lowercase(), needle.to_ascii_lowercase());
+    h.match_indices(&n)
+        .any(|(i, _)| word_bounded(hay, i, i + needle.len()))
+}
+
+enum Check {
+    Ok,
+    /// Regions of the input to redact as a whole next round.
+    Repair(Vec<Detection>),
+    /// Mismatch with nothing left to repair.
+    Fail,
+}
+
+/// Does `r` restore to `input` with `table`? If not, which input regions
+/// caused it: a stand-in restore does not find where it was placed (cut
+/// inside a word), or a match that is not one of the placed stand-ins (a
+/// stand-in running into neighbouring text that together read as another
+/// stand-in). Each region is widened to whole words.
+fn self_check(table: &RestoreTable, input: &str, r: &Rendered) -> Check {
+    if table.apply(&r.text, None) == input {
+        return Check::Ok;
+    }
+    let found = table.find(&r.text, None);
+    let mut regions: Vec<(Span, EntityKind)> = Vec::new();
+    for p in &r.placed {
+        let ok = found.iter().any(|f| {
+            f.start == p.out.start
+                && f.end == p.out.end
+                && table.replacement(f.pattern, &r.text[f.start..f.end])
+                    == input[p.input.start..p.input.end]
+        });
+        if !ok {
+            regions.push((p.input, p.kind.clone()));
+        }
+    }
+    for f in &found {
+        if r.placed
+            .iter()
+            .any(|p| p.out.start == f.start && p.out.end == f.end)
+        {
+            continue;
+        }
+        let span = Span::new(
+            map_to_input(&r.placed, f.start, false),
+            map_to_input(&r.placed, f.end, true),
+        );
+        regions.push((span, table.kind(f.pattern).clone()));
+    }
+    let repairs: Vec<Detection> = regions
+        .into_iter()
+        .map(|(span, kind)| Detection {
+            span: widen_to_words(input, span),
+            kind,
+            score: 1.0,
+            source: Source::Dictionary,
+        })
+        // A region that cannot grow would fail the same way again.
+        .filter(|d| !r.placed.iter().any(|p| p.input == d.span))
+        .collect();
+    if repairs.is_empty() {
+        Check::Fail
+    } else {
+        Check::Repair(repairs)
+    }
+}
+
+/// Input offset of output offset `o`: inside a stand-in it maps to the start
+/// (or, for an `end` offset, the end) of the real value it replaced.
+fn map_to_input(placed: &[Placed], o: usize, end: bool) -> usize {
+    let (mut out_pos, mut in_pos) = (0usize, 0usize);
+    for p in placed {
+        let inside = if end {
+            p.out.start < o && o <= p.out.end
+        } else {
+            p.out.start <= o && o < p.out.end
+        };
+        if inside {
+            return if end { p.input.end } else { p.input.start };
+        }
+        if p.out.start >= o {
+            break;
+        }
+        (out_pos, in_pos) = (p.out.end, p.input.end);
+    }
+    in_pos + (o - out_pos)
+}
+
+/// `span` grown left and right over adjacent letters and digits.
+fn widen_to_words(text: &str, span: Span) -> Span {
+    let mut start = span.start;
+    while let Some(c) = text[..start]
+        .chars()
+        .next_back()
+        .filter(|c| c.is_alphanumeric())
+    {
+        start -= c.len_utf8();
+    }
+    let mut end = span.end;
+    while let Some(c) = text[end..].chars().next().filter(|c| c.is_alphanumeric()) {
+        end += c.len_utf8();
+    }
+    Span::new(start, end)
+}
+
 fn push_unique(v: &mut Vec<EntityKind>, k: &EntityKind) {
     if !v.contains(k) {
         v.push(k.clone());
@@ -668,47 +908,81 @@ impl Inner {
         // one) gets its own mapping, so restore cannot confuse the two. It
         // takes part in resolution like any finding, so a partial detection
         // over the echo ("Arjun" of "Arjun Mehta") cannot split it.
-        let table = idx.table();
-        let style = det.config.replace.style;
-        let mut out = Vec::with_capacity(texts.len());
-        let mut counts: BTreeMap<String, u64> = BTreeMap::new();
-        let mut sources: BTreeMap<String, u64> = BTreeMap::new();
+        let pre = idx.table();
+        let req = Req {
+            scope,
+            style: det.config.replace.style,
+            input: InputWords::new(texts, pre.clone()),
+        };
+        let mut keeps: Vec<Vec<Detection>> = Vec::with_capacity(texts.len());
+        let mut verdicts = Vec::with_capacity(texts.len());
         for (text, (mut keep, blocked, warned)) in texts.iter().zip(plans) {
-            for f in table.find(text, None) {
+            for f in pre.find(text, None) {
                 keep.push(Detection {
                     span: Span::new(f.start, f.end),
-                    kind: table.kind(f.pattern).clone(),
+                    kind: pre.kind(f.pattern).clone(),
                     score: 1.0,
                     source: Source::Dictionary,
                 });
             }
-            let items = resolve(text, keep);
-            let mut new = String::with_capacity(text.len() + 16);
-            let mut replaced = Vec::with_capacity(items.len());
-            let mut pos = 0;
-            for item in &items {
-                let sur = self.item_surrogate(idx, scope, text, item, style, &mut replaced)?;
-                new.push_str(&text[pos..item.det.span.start]);
-                new.push_str(&sur);
-                pos = item.det.span.end;
-                replaced.push(Replacement {
-                    kind: item.det.kind.clone(),
-                    source: item.det.source,
-                    original_span: item.det.span,
-                    surrogate: sur,
-                });
+            keeps.push(keep);
+            verdicts.push((blocked, warned));
+        }
+
+        // Self-check: every output must restore, with the table as it is
+        // after the whole batch, to exactly its input. A region that does
+        // not (a stand-in that runs into undetected text and reads as
+        // another stand-in, a detection cut inside a word) is redacted as a
+        // whole on the next round. Output that still fails is never sent.
+        let rendered = 'rounds: {
+            for _ in 0..MAX_REPAIR_ROUNDS {
+                let mut rendered = Vec::with_capacity(texts.len());
+                for (text, keep) in texts.iter().zip(&keeps) {
+                    rendered.push(self.render(idx, &req, text, keep.clone())?);
+                }
+                let table = idx.table();
+                let (mut clean, mut failed) = (true, false);
+                for (i, r) in rendered.iter().enumerate() {
+                    match self_check(&table, texts[i], r) {
+                        Check::Ok => {}
+                        Check::Repair(regions) => {
+                            clean = false;
+                            keeps[i].extend(regions);
+                        }
+                        Check::Fail => {
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+                if failed {
+                    break;
+                }
+                if clean {
+                    break 'rounds rendered;
+                }
             }
-            new.push_str(&text[pos..]);
-            replaced.sort_by_key(|r| (r.original_span.start, r.original_span.end));
-            for r in &replaced {
-                *counts.entry(r.kind.to_string()).or_insert(0) += 1;
+            tracing::error!("redacted text would not restore to its input; refusing");
+            return Err(EngineError::Other(
+                "redaction self-check failed: the redacted text would not restore to the original"
+                    .into(),
+            ));
+        };
+        drop(indexes);
+
+        let mut out = Vec::with_capacity(texts.len());
+        let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+        let mut sources: BTreeMap<String, u64> = BTreeMap::new();
+        for (r, (blocked, warned)) in rendered.into_iter().zip(verdicts) {
+            for x in &r.replaced {
+                *counts.entry(x.kind.to_string()).or_insert(0) += 1;
                 *sources
-                    .entry(source_label(&r.source).to_string())
+                    .entry(source_label(&x.source).to_string())
                     .or_insert(0) += 1;
             }
             out.push(Redaction {
-                text: new,
-                replaced,
+                text: r.text,
+                replaced: r.replaced,
                 blocked,
                 warned,
                 ml_ms,
@@ -716,7 +990,6 @@ impl Inner {
                 paused: false,
             });
         }
-        drop(indexes);
         let mut s = self.stats.lock();
         s.redactions += texts.len() as u64;
         for (k, n) in sources {
@@ -728,28 +1001,80 @@ impl Inner {
         Ok(out)
     }
 
+    /// Resolve `keep` (redact findings, echoes and repair regions) and
+    /// replace every item with its stand-in.
+    fn render(
+        &self,
+        idx: &mut ScopeIndex,
+        req: &Req,
+        text: &str,
+        keep: Vec<Detection>,
+    ) -> Result<Rendered> {
+        let items = resolve(text, keep);
+        let mut new = String::with_capacity(text.len() + 16);
+        let mut replaced = Vec::with_capacity(items.len());
+        let mut placed = Vec::with_capacity(items.len());
+        let mut pos = 0;
+        for item in &items {
+            let sur = self.item_surrogate(idx, req, text, item, &mut replaced)?;
+            new.push_str(&text[pos..item.det.span.start]);
+            let at = new.len();
+            new.push_str(&sur);
+            placed.push(Placed {
+                out: Span::new(at, new.len()),
+                input: item.det.span,
+                kind: item.det.kind.clone(),
+            });
+            pos = item.det.span.end;
+            replaced.push(Replacement {
+                kind: item.det.kind.clone(),
+                source: item.det.source,
+                original_span: item.det.span,
+                surrogate: sur,
+            });
+        }
+        new.push_str(&text[pos..]);
+        replaced.sort_by_key(|r| (r.original_span.start, r.original_span.end));
+        Ok(Rendered {
+            text: new,
+            replaced,
+            placed,
+        })
+    }
+
     /// The stand-in for one resolved item. A URL with values found inside
     /// it gets those values' own stand-ins in place (recorded in
     /// `replaced`), and the rest of the URL shaped around them.
     fn item_surrogate(
         &self,
         idx: &mut ScopeIndex,
-        scope: &str,
+        req: &Req,
         text: &str,
         item: &Item,
-        style: Style,
         replaced: &mut Vec<Replacement>,
     ) -> Result<String> {
         let d = &item.det;
         let real = &text[d.span.start..d.span.end];
-        if item.children.is_empty() || style == Style::Token {
-            return self.surrogate_for(idx, scope, &d.kind, real, style, &Shape::Plain);
+        let absorbed: Vec<&str> = item
+            .absorbed
+            .iter()
+            .filter_map(|s| text.get(s.start..s.end))
+            .filter(|a| a.chars().filter(|c| c.is_alphanumeric()).count() >= 3)
+            .collect();
+        if item.children.is_empty() || req.style == Style::Token {
+            let ask = Ask {
+                kind: &d.kind,
+                real,
+                shape: Shape::Plain,
+                absorbed: &absorbed,
+            };
+            return self.surrogate_for(idx, req, &ask);
         }
         let mut template = String::with_capacity(real.len());
         let mut pins = Vec::with_capacity(item.children.len());
         let mut pos = d.span.start;
         for child in &item.children {
-            let cs = self.item_surrogate(idx, scope, text, child, style, replaced)?;
+            let cs = self.item_surrogate(idx, req, text, child, replaced)?;
             template.push_str(&text[pos..child.det.span.start]);
             pins.push((template.len(), template.len() + cs.len()));
             template.push_str(&cs);
@@ -762,11 +1087,16 @@ impl Inner {
             });
         }
         template.push_str(&text[pos..d.span.end]);
-        let shape = Shape::Url {
-            template: &template,
-            pins: &pins,
+        let ask = Ask {
+            kind: &d.kind,
+            real,
+            shape: Shape::Url {
+                template: &template,
+                pins: &pins,
+            },
+            absorbed: &absorbed,
         };
-        self.surrogate_for(idx, scope, &d.kind, real, style, &shape)
+        self.surrogate_for(idx, req, &ask)
     }
 
     fn seed(&self, scope: &str, kind: &EntityKind, real: &str) -> [u8; 32] {
@@ -799,20 +1129,58 @@ impl Inner {
         }
     }
 
+    /// Keep the name-word mappings of a full name ("Ravi" → "Arjun" for
+    /// "Ravi Kumar") alive as long as the full name is in use: a model
+    /// answer mentioning only the first name must still restore, and an
+    /// expired "Arjun" must not be handed to someone else.
+    fn touch_name_parts(&self, idx: &ScopeIndex, scope: &str, real: &str) {
+        let parts = token_parts(real);
+        if parts.len() < 2 {
+            return;
+        }
+        for (a, b) in parts {
+            let word = core(&real[a..b]);
+            if word.chars().count() < 3 {
+                continue;
+            }
+            if let Some(e) = idx.variant(word).filter(|e| {
+                e.kind == EntityKind::Person && !e.surrogate.contains(char::is_whitespace)
+            }) {
+                self.touch(scope, &e.real);
+            }
+        }
+    }
+
+    /// Is `candidate` unusable as a new stand-in for this request?
+    fn rejected(&self, idx: &ScopeIndex, req: &Req, ask: &Ask, candidate: &str) -> bool {
+        let person = *ask.kind == EntityKind::Person && req.style == Style::Surrogate;
+        candidate.is_empty()
+            || candidate.eq_ignore_ascii_case(ask.real)
+            || idx.conflicts(candidate, ask.real)
+            || (person && self.person_tokens_conflict(idx, ask.real, candidate))
+            // Already written somewhere in the input: restore would rewrite
+            // that text too ("Ravi Kumar met Arjun" → "Arjun Desai met Arjun").
+            || req.input.clashes(candidate)
+            || (person
+                && token_parts(candidate)
+                    .into_iter()
+                    .map(|(a, b)| core(&candidate[a..b]))
+                    .any(|w| w.chars().count() >= 3 && req.input.clashes(w)))
+            // Repeats a value it was meant to hide ("ravi" in an e-mail).
+            || ask.absorbed.iter().any(|a| contains_word(candidate, a))
+    }
+
     /// The surrogate for `real`: an existing mapping, else a fresh one that
     /// is stored before it is returned.
-    fn surrogate_for(
-        &self,
-        idx: &mut ScopeIndex,
-        scope: &str,
-        kind: &EntityKind,
-        real: &str,
-        style: Style,
-        shape: &Shape,
-    ) -> Result<String> {
+    fn surrogate_for(&self, idx: &mut ScopeIndex, req: &Req, ask: &Ask) -> Result<String> {
+        let (scope, kind, real, style) = (req.scope, ask.kind, ask.real, req.style);
         if let Some(e) = idx.exact(real) {
             let s = e.surrogate.clone();
+            let is_person = e.kind == EntityKind::Person;
             self.touch(scope, real);
+            if is_person {
+                self.touch_name_parts(idx, scope, real);
+            }
             return Ok(s);
         }
         let ci = case_insensitive(kind);
@@ -825,7 +1193,7 @@ impl Inner {
                         .then(|| idx.variant(real))
                         .flatten()
                         .map(|v| apply_case(real, &v.surrogate));
-                    match (variant, shape) {
+                    match (variant, &ask.shape) {
                         (Some(v), _) => v,
                         (None, Shape::Url { template, pins }) => {
                             self.surrogates.url_with_pins(template, pins, seed, attempt)
@@ -837,13 +1205,7 @@ impl Inner {
                     }
                 }
             };
-            if candidate.is_empty()
-                || candidate.eq_ignore_ascii_case(real)
-                || idx.conflicts(&candidate, real)
-                || (style == Style::Surrogate
-                    && *kind == EntityKind::Person
-                    && self.person_tokens_conflict(idx, real, &candidate))
-            {
+            if self.rejected(idx, req, ask, &candidate) {
                 continue;
             }
             match self.store.insert(scope, kind, real, &candidate) {
@@ -854,7 +1216,7 @@ impl Inner {
                         kind: kind.clone(),
                     });
                     if style == Style::Surrogate && *kind == EntityKind::Person {
-                        self.add_name_parts(idx, scope, real, &candidate);
+                        self.add_name_parts(idx, req, real, &candidate);
                     }
                     return Ok(candidate);
                 }
@@ -873,9 +1235,9 @@ impl Inner {
             }
         }
         // Give up on realistic stand-ins; a numbered token never collides.
-        for extra in 0..MAX_ATTEMPTS {
+        for extra in 0..MAX_ATTEMPTS * 4 {
             let candidate = token(kind, idx.next_token_number(kind) + extra);
-            if idx.conflicts(&candidate, real) {
+            if idx.conflicts(&candidate, real) || req.input.clashes(&candidate) {
                 continue;
             }
             match self.store.insert(scope, kind, real, &candidate) {
@@ -955,7 +1317,8 @@ impl Inner {
 
     /// Register each name word as its own mapping ("Ravi" → "Arjun") so a
     /// model mentioning only the first or last name still restores.
-    fn add_name_parts(&self, idx: &mut ScopeIndex, scope: &str, real: &str, sur: &str) {
+    fn add_name_parts(&self, idx: &mut ScopeIndex, req: &Req, real: &str, sur: &str) {
+        let scope = req.scope;
         let rt = token_parts(real);
         let st = token_parts(sur);
         if rt.len() < 2 || rt.len() != st.len() {
@@ -969,6 +1332,7 @@ impl Inner {
                 || s.eq_ignore_ascii_case(r)
                 || idx.variant(r).is_some()
                 || idx.conflicts(s, r)
+                || req.input.clashes(s)
             {
                 continue;
             }
@@ -1033,6 +1397,56 @@ mod tests {
         let mut dict = at("Jaipur");
         dict.source = Source::Dictionary;
         assert!(!not_a_name(t, &dict));
+    }
+
+    #[test]
+    fn input_words_find_word_bounded_occurrences() {
+        let texts = [
+            "Ravi met Arjun Desai, mail ⟦EMAIL_2⟧ or +91 98765 43210",
+            "arjunx",
+        ];
+        let w = InputWords::new(&texts, Arc::new(RestoreTable::build(&[])));
+        assert!(w.occurs("Arjun"));
+        assert!(w.occurs("ARJUN DESAI"));
+        assert!(w.occurs("⟦EMAIL_2⟧"));
+        assert!(w.occurs("+91 98765 43210"));
+        assert!(!w.occurs("Arju"), "inside a word");
+        assert!(!w.occurs("⟦EMAIL_1⟧"));
+        assert!(!w.occurs("Desai Arjun"));
+        assert!(!w.occurs("..."));
+        // An existing stand-in is echo-guarded, so it may be reused.
+        let pre = RestoreTable::build(&[Entry {
+            surrogate: "Arjun".into(),
+            real: "Ravi".into(),
+            kind: EntityKind::Person,
+        }]);
+        let w = InputWords::new(&texts, Arc::new(pre));
+        assert!(!w.clashes("arjun") && w.clashes("Desai"));
+    }
+
+    #[test]
+    fn self_check_helpers() {
+        assert!(contains_word("ravi.m@gmail.com", "Ravi"));
+        assert!(!contains_word("raviraj@gmail.com", "ravi"));
+        assert_eq!(
+            widen_to_words("xZubinx is", Span::new(1, 6)),
+            Span::new(0, 7)
+        );
+        assert_eq!(
+            widen_to_words("Zubin_dev", Span::new(0, 5)),
+            Span::new(0, 5)
+        );
+        // in: "Ravi Mehta ok" → out: "Arjun Mehta ok" ("Ravi" → "Arjun")
+        let placed = [Placed {
+            out: Span::new(0, 5),
+            input: Span::new(0, 4),
+            kind: EntityKind::Person,
+        }];
+        assert_eq!(map_to_input(&placed, 0, false), 0);
+        assert_eq!(map_to_input(&placed, 3, false), 0);
+        assert_eq!(map_to_input(&placed, 3, true), 4);
+        assert_eq!(map_to_input(&placed, 11, true), 10);
+        assert_eq!(map_to_input(&placed, 6, false), 5);
     }
 
     #[test]
