@@ -180,3 +180,15 @@ fn gliner_detects_indian_and_global_names() {
         .span;
     assert_eq!(&texts[0][span.start..span.end], "Venkatesh Iyer");
 }
+
+#[test]
+fn fine_tuned_model_is_listed_with_pinned_files() {
+    let m = find_model("parda-pii-edge").expect("parda-pii-edge in catalog");
+    assert_eq!(m.license, "apache-2.0");
+    let names: Vec<&str> = m.files.iter().map(|f| f.path).collect();
+    assert_eq!(
+        names,
+        ["model.onnx", "tokenizer.json", "gliner_config.json"]
+    );
+    assert!(m.files.iter().all(|f| f.sha256.len() == 64 && f.size > 0));
+}
