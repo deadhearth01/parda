@@ -1,0 +1,31 @@
+[package]
+name = "parda-daemon"
+description = "The parda background daemon: engine, proxy, clipboard and IPC wiring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+parda-core.workspace = true
+parda-detect.workspace = true
+parda-engine.workspace = true
+parda-ml.workspace = true
+parda-proxy.workspace = true
+parda-ipc.workspace = true
+parda-clip.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+directories.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
