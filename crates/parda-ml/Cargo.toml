@@ -1,0 +1,33 @@
+[package]
+name = "parda-ml"
+description = "ONNX model catalog, verified downloads and GLiNER detector for parda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+coreml = ["gline-rs/coreml", "ort/coreml"]
+directml = ["gline-rs/directml", "ort/directml"]
+cuda = ["gline-rs/cuda", "ort/cuda"]
+
+[dependencies]
+parda-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+gline-rs.workspace = true
+ort.workspace = true
+orp = "1"
+reqwest = { workspace = true, features = ["blocking"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
