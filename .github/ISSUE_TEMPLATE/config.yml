@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability or systematic leak
+    url: https://github.com/deadhearth01/parda/security/advisories/new
+    about: Report privately — see SECURITY.md
+  - name: Questions
+    url: https://github.com/deadhearth01/parda/discussions
+    about: Usage questions and ideas

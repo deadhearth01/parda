@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest a new identifier, surface or improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to protect, and where does parda fall short today?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Proposed solution
+  - type: textarea
+    id: format
+    attributes:
+      label: For new identifier formats
+      description: Official format description / checksum, with invented examples.

@@ -1,0 +1,15 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    ignore:
+      # Pinned together: gline-rs requires this exact ONNX Runtime binding.
+      - dependency-name: ort
+      - dependency-name: tokenizers
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

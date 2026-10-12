@@ -1,0 +1,32 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never paste real personal data.** Replace names, numbers and addresses with obviously fake ones before submitting.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce (synthetic data only)
+      render: shell
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `parda doctor`
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: parda version and OS
+      placeholder: "parda 0.1.0, macOS 15.3 (arm64)"
+    validations:
+      required: true
