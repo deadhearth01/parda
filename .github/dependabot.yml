@@ -4,8 +4,14 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
+    groups:
+      rust-minor-patch:
+        update-types: [minor, patch]
     ignore:
+      # Major versions change APIs: upgrade deliberately, not by bot.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
       # Pinned together: gline-rs requires this exact ONNX Runtime binding.
       - dependency-name: ort
       - dependency-name: tokenizers
@@ -13,3 +19,6 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
