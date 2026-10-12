@@ -16,7 +16,7 @@ use crate::cache::{self, DetCache};
 use crate::fragment::{DEFAULT_MAX_FRAGMENT_BYTES, ml_windows};
 use crate::index::ScopeIndex;
 use crate::ml::MlWorker;
-use crate::resolve::{flatten, resolve};
+use crate::resolve::{Item, flatten, resolve};
 use crate::restore::{Entry, RestoreTable, case_insensitive};
 use crate::stream::StreamRestorer;
 
@@ -248,7 +248,7 @@ impl Engine {
     pub fn scan(&self, text: &str) -> Result<Vec<Detection>> {
         let det = self.inner.detectors.read().clone();
         let (mut per_text, _, _) = self.inner.detect(&det, &[text])?;
-        Ok(per_text.pop().unwrap_or_default())
+        Ok(flatten(resolve(text, per_text.pop().unwrap_or_default())))
     }
 
     pub fn redact(&self, text: &str, scope: &str) -> Result<Redaction> {
@@ -364,6 +364,24 @@ pub fn source_label(source: &Source) -> &'static str {
     }
 }
 
+/// How a stand-in is generated.
+enum Shape<'a> {
+    /// From the real value alone.
+    Plain,
+    /// A URL whose contents were already redacted in place: `template` is
+    /// the URL with those stand-ins at `pins`.
+    Url {
+        template: &'a str,
+        pins: &'a [(usize, usize)],
+    },
+}
+
+fn push_unique(v: &mut Vec<EntityKind>, k: &EntityKind) {
+    if !v.contains(k) {
+        v.push(k.clone());
+    }
+}
+
 /// ML cache key: the window text, salted with the model so results of one
 /// model are never served for another.
 fn ml_key(model: &str, window: &str) -> cache::Key {
@@ -450,8 +468,10 @@ impl Inner {
         Ok(indexes.get_mut(scope).expect("inserted above"))
     }
 
-    /// Run the tiers over `texts`. Returns per-text detections (merged,
-    /// allow-listed, sorted), ML milliseconds and whether ML was skipped.
+    /// Run the tiers over `texts`. Returns per-text findings of every tier
+    /// (allow-listed and sorted, but not yet resolved: policy must see every
+    /// finding before overlaps are resolved), ML milliseconds and whether ML
+    /// was skipped.
     ///
     /// The dictionary and rule tiers always see each text whole (they are
     /// linear and cheap), so no split can cut a value they would find. Only
@@ -460,7 +480,7 @@ impl Inner {
     fn detect(&self, det: &Detectors, texts: &[&str]) -> Result<(Vec<Vec<Detection>>, u64, bool)> {
         let keys: Vec<cache::Key> = texts
             .iter()
-            .map(|t| cache::key("final", det.epoch, t))
+            .map(|t| cache::key("found", det.epoch, t))
             .collect();
         let mut results: Vec<Option<Arc<Vec<Detection>>>> =
             keys.iter().map(|k| self.cache.get(k)).collect();
@@ -589,7 +609,9 @@ impl Inner {
                     }
                 }
             }
-            let dets = Arc::new(det.allow.filter(text, flatten(resolve(text, dets))));
+            let mut dets = det.allow.filter(text, dets);
+            dets.sort_by_key(|d| (d.span.start, d.span.end));
+            let dets = Arc::new(dets);
             if ml_ok {
                 self.cache.put(keys[ti], dets.clone());
             }
@@ -612,52 +634,25 @@ impl Inner {
         let det = self.detectors.read().clone();
         let (per_text, ml_ms, ml_skipped) = self.detect(&det, texts)?;
 
-        let mut indexes = self.indexes.lock();
-        let idx = self.index_mut(&mut indexes, scope)?;
-
-        // Surrogate-echo guard: a surrogate string already present in the
-        // input (a different, undetected value that happens to look like
-        // one) gets its own mapping, so restore cannot confuse the two.
-        let table = idx.table();
-        let mut plans: Vec<(Vec<Detection>, Vec<EntityKind>, Vec<EntityKind>)> = Vec::new();
+        // Policy first, over everything every tier found: a `block` kind
+        // refuses the request wherever it sits (inside a URL too), a `warn`
+        // kind is reported, and only `redact` findings go on to be resolved,
+        // so an ignored or warned container (a URL, a UPI id) cannot swallow
+        // a value inside it that must be redacted.
         let mut blocked_all: Vec<EntityKind> = Vec::new();
-        for (text, mut dets) in texts.iter().zip(per_text) {
-            if !table.is_empty() {
-                for f in table.find(text, None) {
-                    let span = Span::new(f.start, f.end);
-                    if !dets.iter().any(|d| d.span.overlaps(&span)) {
-                        dets.push(Detection {
-                            span,
-                            kind: table.kind(f.pattern).clone(),
-                            score: 1.0,
-                            source: Source::Dictionary,
-                        });
-                    }
-                }
-                dets.sort_by_key(|d| (d.span.start, d.span.end));
-            }
-            let mut keep = Vec::with_capacity(dets.len());
-            let (mut blocked, mut warned) = (Vec::new(), Vec::new());
+        let mut plans = Vec::with_capacity(texts.len());
+        for dets in per_text {
+            let (mut keep, mut blocked, mut warned) = (Vec::new(), Vec::new(), Vec::new());
             for d in dets {
                 match det.config.action_for(&d.kind) {
                     Action::Redact => keep.push(d),
-                    Action::Block => {
-                        if !blocked.contains(&d.kind) {
-                            blocked.push(d.kind.clone());
-                        }
-                    }
-                    Action::Warn => {
-                        if !warned.contains(&d.kind) {
-                            warned.push(d.kind.clone());
-                        }
-                    }
+                    Action::Block => push_unique(&mut blocked, &d.kind),
+                    Action::Warn => push_unique(&mut warned, &d.kind),
                     Action::Ignore => {}
                 }
             }
             for k in &blocked {
-                if !blocked_all.contains(k) {
-                    blocked_all.push(k.clone());
-                }
+                push_unique(&mut blocked_all, k);
             }
             plans.push((keep, blocked, warned));
         }
@@ -665,32 +660,52 @@ impl Inner {
             return Err(EngineError::Blocked(blocked_all));
         }
 
+        let mut indexes = self.indexes.lock();
+        let idx = self.index_mut(&mut indexes, scope)?;
+
+        // Surrogate-echo guard: a surrogate string already present in the
+        // input (a different, undetected value that happens to look like
+        // one) gets its own mapping, so restore cannot confuse the two. It
+        // takes part in resolution like any finding, so a partial detection
+        // over the echo ("Arjun" of "Arjun Mehta") cannot split it.
+        let table = idx.table();
         let style = det.config.replace.style;
         let mut out = Vec::with_capacity(texts.len());
         let mut counts: BTreeMap<String, u64> = BTreeMap::new();
         let mut sources: BTreeMap<String, u64> = BTreeMap::new();
-        for (text, (dets, blocked, warned)) in texts.iter().zip(plans) {
+        for (text, (mut keep, blocked, warned)) in texts.iter().zip(plans) {
+            for f in table.find(text, None) {
+                keep.push(Detection {
+                    span: Span::new(f.start, f.end),
+                    kind: table.kind(f.pattern).clone(),
+                    score: 1.0,
+                    source: Source::Dictionary,
+                });
+            }
+            let items = resolve(text, keep);
             let mut new = String::with_capacity(text.len() + 16);
-            let mut replaced = Vec::with_capacity(dets.len());
+            let mut replaced = Vec::with_capacity(items.len());
             let mut pos = 0;
-            for d in dets {
-                let real = &text[d.span.start..d.span.end];
-                let sur = self.surrogate_for(idx, scope, &d.kind, real, style)?;
-                new.push_str(&text[pos..d.span.start]);
+            for item in &items {
+                let sur = self.item_surrogate(idx, scope, text, item, style, &mut replaced)?;
+                new.push_str(&text[pos..item.det.span.start]);
                 new.push_str(&sur);
-                pos = d.span.end;
-                *counts.entry(d.kind.to_string()).or_insert(0) += 1;
-                *sources
-                    .entry(source_label(&d.source).to_string())
-                    .or_insert(0) += 1;
+                pos = item.det.span.end;
                 replaced.push(Replacement {
-                    kind: d.kind,
-                    source: d.source,
-                    original_span: d.span,
+                    kind: item.det.kind.clone(),
+                    source: item.det.source,
+                    original_span: item.det.span,
                     surrogate: sur,
                 });
             }
             new.push_str(&text[pos..]);
+            replaced.sort_by_key(|r| (r.original_span.start, r.original_span.end));
+            for r in &replaced {
+                *counts.entry(r.kind.to_string()).or_insert(0) += 1;
+                *sources
+                    .entry(source_label(&r.source).to_string())
+                    .or_insert(0) += 1;
+            }
             out.push(Redaction {
                 text: new,
                 replaced,
@@ -711,6 +726,47 @@ impl Inner {
             *s.entities.entry(k).or_insert(0) += n;
         }
         Ok(out)
+    }
+
+    /// The stand-in for one resolved item. A URL with values found inside
+    /// it gets those values' own stand-ins in place (recorded in
+    /// `replaced`), and the rest of the URL shaped around them.
+    fn item_surrogate(
+        &self,
+        idx: &mut ScopeIndex,
+        scope: &str,
+        text: &str,
+        item: &Item,
+        style: Style,
+        replaced: &mut Vec<Replacement>,
+    ) -> Result<String> {
+        let d = &item.det;
+        let real = &text[d.span.start..d.span.end];
+        if item.children.is_empty() || style == Style::Token {
+            return self.surrogate_for(idx, scope, &d.kind, real, style, &Shape::Plain);
+        }
+        let mut template = String::with_capacity(real.len());
+        let mut pins = Vec::with_capacity(item.children.len());
+        let mut pos = d.span.start;
+        for child in &item.children {
+            let cs = self.item_surrogate(idx, scope, text, child, style, replaced)?;
+            template.push_str(&text[pos..child.det.span.start]);
+            pins.push((template.len(), template.len() + cs.len()));
+            template.push_str(&cs);
+            pos = child.det.span.end;
+            replaced.push(Replacement {
+                kind: child.det.kind.clone(),
+                source: child.det.source,
+                original_span: child.det.span,
+                surrogate: cs,
+            });
+        }
+        template.push_str(&text[pos..d.span.end]);
+        let shape = Shape::Url {
+            template: &template,
+            pins: &pins,
+        };
+        self.surrogate_for(idx, scope, &d.kind, real, style, &shape)
     }
 
     fn seed(&self, scope: &str, kind: &EntityKind, real: &str) -> [u8; 32] {
@@ -752,6 +808,7 @@ impl Inner {
         kind: &EntityKind,
         real: &str,
         style: Style,
+        shape: &Shape,
     ) -> Result<String> {
         if let Some(e) = idx.exact(real) {
             let s = e.surrogate.clone();
@@ -768,12 +825,15 @@ impl Inner {
                         .then(|| idx.variant(real))
                         .flatten()
                         .map(|v| apply_case(real, &v.surrogate));
-                    match variant {
-                        Some(v) => v,
-                        None if *kind == EntityKind::Person => {
+                    match (variant, shape) {
+                        (Some(v), _) => v,
+                        (None, Shape::Url { template, pins }) => {
+                            self.surrogates.url_with_pins(template, pins, seed, attempt)
+                        }
+                        (None, Shape::Plain) if *kind == EntityKind::Person => {
                             self.person_candidate(idx, real, seed, attempt)
                         }
-                        None => self.surrogates.generate(kind, real, seed, attempt),
+                        (None, Shape::Plain) => self.surrogates.generate(kind, real, seed, attempt),
                     }
                 }
             };

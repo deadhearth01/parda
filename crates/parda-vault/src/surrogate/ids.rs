@@ -720,13 +720,129 @@ pub(crate) fn secret(real: &str, rng: &mut ChaCha20Rng) -> String {
     format!("{}{}", &real[..prefix], shape(&real[prefix..], rng))
 }
 
+/// Generic URL words kept verbatim as path segments and bare query items.
+/// Everything else in a path is shaped: a segment can be a user name, an
+/// e-mail address or a document title.
+const URL_WORDS: &[&str] = &[
+    "u",
+    "r",
+    "p",
+    "s",
+    "v1",
+    "v2",
+    "v3",
+    "v4",
+    "api",
+    "app",
+    "apps",
+    "admin",
+    "auth",
+    "oauth",
+    "oauth2",
+    "login",
+    "logout",
+    "signin",
+    "signup",
+    "register",
+    "callback",
+    "reset",
+    "password",
+    "verify",
+    "confirm",
+    "invite",
+    "join",
+    "account",
+    "accounts",
+    "user",
+    "users",
+    "people",
+    "profile",
+    "profiles",
+    "settings",
+    "dashboard",
+    "home",
+    "index",
+    "search",
+    "docs",
+    "doc",
+    "wiki",
+    "blob",
+    "tree",
+    "raw",
+    "main",
+    "master",
+    "src",
+    "issues",
+    "pull",
+    "pulls",
+    "commit",
+    "files",
+    "file",
+    "download",
+    "downloads",
+    "static",
+    "assets",
+    "images",
+    "img",
+    "public",
+    "share",
+    "shared",
+    "view",
+    "edit",
+    "new",
+    "www",
+    "en",
+    "id",
+    "me",
+    "page",
+    "pages",
+    "post",
+    "posts",
+    "orders",
+    "order",
+    "invoice",
+    "invoices",
+    "billing",
+    "payments",
+    "pay",
+    "messages",
+    "inbox",
+    "chat",
+    "team",
+    "teams",
+    "org",
+    "orgs",
+    "project",
+    "projects",
+    "repo",
+    "repos",
+    "ticket",
+    "tickets",
+    "support",
+    "help",
+    "embed",
+    "status",
+    "session",
+    "token",
+];
+
 pub(crate) fn url(real: &str, rng: &mut ChaCha20Rng) -> String {
-    let (scheme, rest) = match real.split_once("://") {
-        Some((s, r)) => (format!("{s}://"), r),
-        None => (String::new(), real),
-    };
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(host_end);
+    url_pinned(real, &[], rng)
+}
+
+/// A stand-in for the URL `t`. Byte ranges of `t` in `pins` (stand-ins
+/// already chosen for values found inside the URL) are kept verbatim;
+/// everything else that could identify someone is replaced: a non-public
+/// host, user info (dropped), every path segment and bare query item that is
+/// not a generic word, every query value and the fragment. The scheme, port
+/// and query parameter names stay.
+pub(crate) fn url_pinned(t: &str, pins: &[(usize, usize)], rng: &mut ChaCha20Rng) -> String {
+    let rest_start = t.find("://").map_or(0, |i| i + 3);
+    let host_end = rest_start
+        + t[rest_start..]
+            .find(['/', '?', '#'])
+            .unwrap_or(t.len() - rest_start);
+    let authority = &t[rest_start..host_end];
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => (h, format!(":{p}")),
         _ => (authority, String::new()),
@@ -736,42 +852,77 @@ pub(crate) fn url(real: &str, rng: &mut ChaCha20Rng) -> String {
     let keep_host = PUBLIC_HOSTS
         .iter()
         .any(|p| host_lc == *p || host_lc.ends_with(&format!(".{p}")));
-    let new_host = if keep_host {
-        host.to_string()
-    } else {
-        fake_domain(rng)
-    };
-    let (path, query) = tail.split_once('?').unwrap_or((tail, ""));
-    // Path segments that look like ids or tokens are replaced; words stay.
-    let path: String = path
-        .split('/')
-        .map(|seg| {
-            if seg.chars().any(|c| c.is_ascii_digit()) || seg.len() >= 16 {
-                shape(seg, rng)
-            } else {
-                seg.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/");
-    let mut out = format!("{scheme}{new_host}{port}{path}");
-    if !query.is_empty() || tail.contains('?') {
-        out.push('?');
-        let (q, frag) = query.split_once('#').unwrap_or((query, ""));
-        let q: Vec<String> = q
-            .split('&')
-            .map(|kv| match kv.split_once('=') {
-                Some((k, v)) => format!("{k}={}", shape(v, rng)),
-                None => kv.to_string(),
-            })
-            .collect();
-        out.push_str(&q.join("&"));
-        if query.contains('#') {
-            out.push('#');
-            out.push_str(&shape(frag, rng));
+    let mut out = t[..rest_start].to_string();
+    if keep_host {
+        out.push_str(host);
+    } else if !host.is_empty() {
+        out.push_str(&fake_domain(rng));
+    }
+    out.push_str(&port);
+
+    let path_end = host_end + t[host_end..].find(['?', '#']).unwrap_or(t.len() - host_end);
+    let mut pos = host_end;
+    for (i, seg) in t[host_end..path_end].split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
         }
+        out.push_str(&url_part(t, pos, pos + seg.len(), pins, true, rng));
+        pos += seg.len() + 1;
+    }
+    let mut pos = path_end;
+    if t[pos..].starts_with('?') {
+        out.push('?');
+        let q_start = pos + 1;
+        let q_end = q_start + t[q_start..].find('#').unwrap_or(t.len() - q_start);
+        let mut item_start = q_start;
+        for (i, item) in t[q_start..q_end].split('&').enumerate() {
+            if i > 0 {
+                out.push('&');
+            }
+            let item_end = item_start + item.len();
+            match item.find('=') {
+                Some(k) => {
+                    out.push_str(&item[..=k]);
+                    out.push_str(&url_part(t, item_start + k + 1, item_end, pins, false, rng));
+                }
+                None => out.push_str(&url_part(t, item_start, item_end, pins, true, rng)),
+            }
+            item_start = item_end + 1;
+        }
+        pos = q_end;
+    }
+    if t[pos..].starts_with('#') {
+        out.push('#');
+        out.push_str(&url_part(t, pos + 1, t.len(), pins, false, rng));
     }
     out
+}
+
+/// `t[a..b]` shaped, except pinned bytes; with `keep_words`, a generic URL
+/// word is kept as is.
+fn url_part(
+    t: &str,
+    a: usize,
+    b: usize,
+    pins: &[(usize, usize)],
+    keep_words: bool,
+    rng: &mut ChaCha20Rng,
+) -> String {
+    let part = &t[a..b];
+    let pinned = |i: usize| pins.iter().any(|&(s, e)| s <= i && i < e);
+    if keep_words && !(a..b).any(pinned) && URL_WORDS.contains(&part.to_ascii_lowercase().as_str())
+    {
+        return part.to_string();
+    }
+    part.char_indices()
+        .map(|(i, c)| {
+            if pinned(a + i) {
+                c.to_string()
+            } else {
+                shape(&c.to_string(), rng)
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -870,11 +1021,45 @@ mod tests {
         assert!(!s.contains("acme"));
         assert!(s.contains("/reset/") && s.contains("?token=") && s.contains("&user="));
         assert!(!s.contains("abc123XYZ"));
+        // A public host stays, but its path can name someone: shaped.
         let s = url(
             "https://github.com/acme/repo?access_token=zzz",
             &mut rng(16),
         );
-        assert!(s.starts_with("https://github.com/acme/repo?access_token="));
+        assert!(s.starts_with("https://github.com/"), "{s}");
+        assert!(s.contains("?access_token=") && !s.contains("acme"), "{s}");
+    }
+
+    #[test]
+    fn url_pins_are_kept_verbatim() {
+        let t = "https://crm.acme.in/u/vikram/x?email=arjun.m@gmail.com&token=abc";
+        let a = t.find("vikram").unwrap();
+        let b = t.find("arjun").unwrap();
+        let pins = [(a, a + 6), (b, b + 17)];
+        let s = url_pinned(t, &pins, &mut rng(19));
+        assert!(s.contains("/u/vikram/"), "{s}");
+        assert!(s.contains("?email=arjun.m@gmail.com&token="), "{s}");
+        assert!(!s.contains("acme") && !s.ends_with("abc"), "{s}");
+    }
+
+    #[test]
+    fn url_shapes_every_identifying_part() {
+        for n in 0..20 {
+            let s = url(
+                "https://crm.acme.in/u/ravikumar/profile?token=abc&ravi.k&Sunita",
+                &mut rng(n),
+            );
+            for leak in ["acme", "ravikumar", "ravi.k", "Sunita", "abc"] {
+                assert!(!s.contains(leak), "{leak} in {s}");
+            }
+            assert!(s.contains("/u/") && s.contains("/profile?token="), "{s}");
+            let s = url("https://github.com/sunitad/payroll-2024#L10", &mut rng(n));
+            assert!(s.starts_with("https://github.com/"), "{s}");
+            assert!(!s.contains("sunitad") && !s.contains("payroll"), "{s}");
+            let s = url("https://x.acme.in/users/ravi@acme.in/", &mut rng(n));
+            assert!(!s.contains("ravi") && !s.contains("acme"), "{s}");
+            assert!(s.contains("/users/"), "{s}");
+        }
     }
 
     #[test]

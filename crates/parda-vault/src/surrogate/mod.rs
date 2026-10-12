@@ -97,6 +97,20 @@ impl SurrogateGen {
         // Nothing in the value could be varied (e.g. punctuation only).
         token(kind, token_number(seed, attempt))
     }
+
+    /// A stand-in for a URL whose contents were redacted in place:
+    /// `template` is the URL with every value found inside it already
+    /// replaced by its own stand-in, at the byte ranges `pins`. Those stay
+    /// verbatim; the rest is replaced as by [`generate`](Self::generate).
+    pub fn url_with_pins(
+        &self,
+        template: &str,
+        pins: &[(usize, usize)],
+        seed: [u8; 32],
+        attempt: u32,
+    ) -> String {
+        ids::url_pinned(template, pins, &mut rng_for(seed, attempt))
+    }
 }
 
 #[cfg(test)]

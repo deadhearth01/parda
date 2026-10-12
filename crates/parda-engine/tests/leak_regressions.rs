@@ -95,3 +95,112 @@ fn invalid_model_spans_do_not_panic() {
     assert!(!r.text.contains("Ravi"));
     assert_eq!(e.restore(&r.text, "global"), t);
 }
+
+fn with_action(kind: parda_core::EntityKind, action: parda_core::Action) -> parda_core::Config {
+    let mut c = rules_only_config();
+    c.detect.actions.insert(kind, action);
+    c
+}
+
+/// Review A finding 2: a container whose action is not `redact` must not
+/// swallow the values inside it.
+#[test]
+fn ignored_or_warned_container_does_not_hide_nested_pii() {
+    use parda_core::{Action, EntityKind};
+    let url = "reset https://acme.in/r?email=ravi.k@gmail.com&token=x1 now";
+    for action in [Action::Ignore, Action::Warn] {
+        let (_d, e) = engine_with(with_action(EntityKind::Url, action), None);
+        let r = e.redact(url, "global").unwrap();
+        assert!(
+            !r.text.contains("ravi.k@gmail.com"),
+            "{action:?}: {}",
+            r.text
+        );
+        assert_eq!(e.restore(&r.text, "global"), url);
+        if action == Action::Warn {
+            assert_eq!(r.warned, vec![EntityKind::Url]);
+        }
+
+        let (_d, e) = engine_with(with_action(EntityKind::Upi, action), None);
+        let r = e.redact("pay 9876543210@ybl today", "global").unwrap();
+        assert!(!r.text.contains("9876543210"), "{action:?}: {}", r.text);
+    }
+}
+
+/// Review A finding 2: `block` applies to a kind found anywhere, including
+/// inside a URL that is itself redacted.
+#[test]
+fn blocked_kind_inside_a_url_blocks() {
+    use parda_core::{Action, EntityKind};
+    let (_d, e) = engine_with(with_action(EntityKind::Secret, Action::Block), None);
+    let err = e
+        .redact(
+            "call https://api.x.com/v1?key=sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789abcd",
+            "global",
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, parda_engine::EngineError::Blocked(ref k) if k.contains(&EntityKind::Secret)),
+        "{err:?}"
+    );
+    // A warned kind inside a redacted URL is reported too.
+    let (_d, e) = engine_with(with_action(EntityKind::Email, Action::Warn), None);
+    let r = e
+        .redact(
+            "https://acme.in/r?email=ravi.k@gmail.com&token=x1",
+            "global",
+        )
+        .unwrap();
+    assert!(r.warned.contains(&EntityKind::Email), "{:?}", r.warned);
+    assert!(!r.text.contains("acme.in"), "{}", r.text);
+}
+
+/// Review A finding 3: nothing personal survives inside a redacted URL —
+/// values found inside it are redacted in place (same stand-in as
+/// elsewhere), and unknown path segments are shaped.
+#[test]
+fn url_contents_are_redacted_inside_the_url() {
+    let (_d, e) = engine();
+    let t = "profile https://crm.acme.in/u/ravikumar/profile?token=abc";
+    let r = e.redact(t, "global").unwrap();
+    assert!(!r.text.contains("ravikumar"), "{}", r.text);
+    assert!(!r.text.contains("acme"), "{}", r.text);
+    assert_eq!(e.restore(&r.text, "global"), t);
+
+    let t = "mail https://crm.acme.in/users/ravi.k@gmail.com/?token=abc";
+    let r = e.redact(t, "global").unwrap();
+    assert!(
+        !r.text.contains("ravi.k@") && !r.text.contains("acme"),
+        "{}",
+        r.text
+    );
+    assert_eq!(e.restore(&r.text, "global"), t);
+
+    // A value inside the URL gets the same stand-in as anywhere else.
+    let t = "call 9876543210 or https://crm.acme.in/r?phone=9876543210&token=abc";
+    let r = e.redact(t, "global").unwrap();
+    let phone_sur = &r
+        .replaced
+        .iter()
+        .find(|x| x.kind == parda_core::EntityKind::Phone)
+        .unwrap()
+        .surrogate;
+    assert_eq!(r.text.matches(phone_sur.as_str()).count(), 2, "{}", r.text);
+    assert!(!r.text.contains("9876543210"), "{}", r.text);
+    assert_eq!(e.restore(&r.text, "global"), t);
+    // The model quoting only the number still restores it.
+    assert_eq!(
+        e.restore(&format!("rang {phone_sur}"), "global"),
+        "rang 9876543210"
+    );
+
+    let t = "https://intranet.acme.in/people/sunitadesai/payslips?token=x9";
+    let r = e.redact(t, "global").unwrap();
+    assert!(!r.text.contains("sunitadesai"), "{}", r.text);
+    assert!(
+        r.text.contains("/people/"),
+        "generic words stay: {}",
+        r.text
+    );
+    assert_eq!(e.restore(&r.text, "global"), t);
+}
