@@ -26,7 +26,7 @@ parda-tui = { path = "crates/parda-tui" }
 # general
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.9"
+toml = "1.1"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
