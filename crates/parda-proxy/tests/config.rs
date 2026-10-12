@@ -108,3 +108,54 @@ async fn distinct_scopes_are_capped() {
     // Scopes already in use keep working.
     assert_eq!(send("s0".into()).await.unwrap().status(), 200);
 }
+
+#[tokio::test]
+async fn passthrough_responses_are_streamed_not_buffered() {
+    use std::time::{Duration, Instant};
+    let s = setup(responder(|_| {
+        Reply::Sse(vec![
+            (0, "data: first\n\n".into()),
+            (600, "data: second\n\n".into()),
+        ])
+    }))
+    .await;
+    let started = Instant::now();
+    let mut resp = s
+        .client
+        .get(s.url("/v1/files/f1/content"))
+        .send()
+        .await
+        .unwrap();
+    let first = resp.chunk().await.unwrap().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "first bytes after {:?}",
+        started.elapsed()
+    );
+    assert!(String::from_utf8_lossy(&first).contains("first"));
+}
+
+#[tokio::test]
+async fn buffered_answers_are_capped() {
+    let big = "x".repeat(8192);
+    let s = setup_with(
+        responder(move |_| {
+            Reply::Json(
+                StatusCode::OK,
+                json!({"type": "message", "content": [{"type": "text", "text": big}]}),
+            )
+        }),
+        |c| c.proxy.max_body_bytes = 4096,
+        None,
+    )
+    .await;
+    let resp = s
+        .post(
+            "/v1/messages",
+            &json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+    assert_eq!(resp.status(), 502);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "parda_upstream_too_large");
+}

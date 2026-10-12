@@ -12,6 +12,7 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::response::Response;
 use bytes::Bytes;
+use futures::StreamExt;
 use http::header::{self, HeaderName};
 use http::{HeaderMap, StatusCode};
 use parda_core::{ProxyConfig, UnscannedMedia};
@@ -293,6 +294,28 @@ fn engine_error(provider: Provider, e: &EngineError) -> (Response, String) {
     }
 }
 
+enum ReadError {
+    TooLarge,
+    Io(reqwest::Error),
+}
+
+/// Buffer an upstream answer (to restore it), at most `cap` bytes.
+async fn read_capped(upstream: reqwest::Response, cap: usize) -> Result<Bytes, ReadError> {
+    if upstream.content_length().is_some_and(|n| n > cap as u64) {
+        return Err(ReadError::TooLarge);
+    }
+    let mut stream = upstream.bytes_stream();
+    let mut buf = bytes::BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(ReadError::Io)?;
+        if buf.len() + chunk.len() > cap {
+            return Err(ReadError::TooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
+}
+
 fn body_error(provider: Provider, e: &BodyError) -> (Response, String) {
     let (status, code, message) = match e {
         BodyError::UnsupportedEncoding(coding) => (
@@ -545,9 +568,32 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         return finish(&state, event, resp, None);
     }
 
-    let bytes = match upstream.bytes().await {
+    let restore = if status.is_success() {
+        provider.restores()
+    } else {
+        provider.rewrites()
+    };
+    if !restore {
+        // Nothing to restore: pass the body through as it arrives.
+        event.added_ms = redact_ms;
+        let mut resp = Response::new(Body::from_stream(upstream.bytes_stream()));
+        *resp.status_mut() = status;
+        *resp.headers_mut() = headers;
+        return finish(&state, event, resp, None);
+    }
+    let bytes = match read_capped(upstream, cfg.max_body_bytes).await {
         Ok(b) => b,
-        Err(e) => {
+        Err(ReadError::TooLarge) => {
+            let resp = error_response(
+                provider,
+                StatusCode::BAD_GATEWAY,
+                "parda_upstream_too_large",
+                "the upstream answer exceeds proxy.max_body_bytes, so parda could not \
+                 restore it",
+            );
+            return finish(&state, event, resp, Some("parda_upstream_too_large".into()));
+        }
+        Err(ReadError::Io(e)) => {
             tracing::warn!(error = %e, "reading upstream body failed");
             let resp = error_response(
                 provider,
@@ -559,11 +605,6 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         }
     };
     let mut restore_ms = 0;
-    let restore = if status.is_success() {
-        provider.restores()
-    } else {
-        provider.rewrites()
-    };
     let body = if restore && !bytes.is_empty() {
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(v) => {
