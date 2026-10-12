@@ -31,6 +31,8 @@ const MAX_ML_BUDGET: Duration = Duration::from_secs(30);
 const MAX_ATTEMPTS: u32 = 64;
 /// Vault `last_used_at` is refreshed at most this often per mapping.
 const TOUCH_INTERVAL: Duration = Duration::from_secs(3600);
+/// Entries in the touch rate-limit map before old ones are dropped.
+const TOUCHED_MAX: usize = 100_000;
 /// Rounds of the post-redaction self-check before a request is refused.
 const MAX_REPAIR_ROUNDS: usize = 4;
 
@@ -149,11 +151,19 @@ impl Detectors {
     }
 }
 
+/// In-memory views of the vault, valid for one deletion generation.
+#[derive(Default)]
+pub(crate) struct Indexes {
+    scopes: HashMap<String, ScopeIndex>,
+    /// [`Store::deletions`] when `scopes` was last known to match the vault.
+    deletions: u64,
+}
+
 pub(crate) struct Inner {
     store: Store,
     surrogates: SurrogateGen,
     detectors: RwLock<Arc<Detectors>>,
-    indexes: Mutex<HashMap<String, ScopeIndex>>,
+    indexes: Mutex<Indexes>,
     cache: DetCache,
     ml_cache: Arc<DetCache>,
     ml: Option<MlWorker>,
@@ -179,6 +189,7 @@ impl Engine {
         if pruned > 0 {
             tracing::info!(pruned, "expired vault mappings removed");
         }
+        let deletions = store.deletions();
         let ml_cache = Arc::new(DetCache::new(CACHE_CAPACITY));
         let ml = match ml {
             Some(det) => Some(
@@ -196,7 +207,10 @@ impl Engine {
                 store,
                 surrogates: SurrogateGen::new(),
                 detectors: RwLock::new(Arc::new(Detectors::new(opts.config, opts.rules, 1))),
-                indexes: Mutex::new(HashMap::new()),
+                indexes: Mutex::new(Indexes {
+                    scopes: HashMap::new(),
+                    deletions,
+                }),
                 cache: DetCache::new(CACHE_CAPACITY),
                 ml_cache,
                 ml,
@@ -297,7 +311,8 @@ impl Engine {
     /// Drop the in-memory view of a scope (or all) so it is re-read from the
     /// vault; call after wiping the vault.
     pub fn forget_scopes(&self) {
-        self.inner.indexes.lock().clear();
+        self.inner.indexes.lock().scopes.clear();
+        self.inner.touched.lock().clear();
     }
 }
 
@@ -618,6 +633,17 @@ fn widen_to_words(text: &str, span: Span) -> Span {
     Span::new(start, end)
 }
 
+/// Keep the touch rate-limit map bounded: drop entries old enough to be
+/// touched again anyway, and everything if that is not enough.
+fn bound_touched(t: &mut HashMap<[u8; 32], Instant>, now: Instant, max: usize) {
+    if t.len() > max {
+        t.retain(|_, at| now.duration_since(*at) < TOUCH_INTERVAL);
+        if t.len() > max {
+            t.clear();
+        }
+    }
+}
+
 fn push_unique(v: &mut Vec<EntityKind>, k: &EntityKind) {
     if !v.contains(k) {
         v.push(k.clone());
@@ -677,8 +703,9 @@ fn core(tok: &str) -> &str {
 
 impl Inner {
     pub(crate) fn table(&self, scope: &str) -> Option<Arc<RestoreTable>> {
+        let deletions = self.store.deletions();
         let mut indexes = self.indexes.lock();
-        let idx = match self.index_mut(&mut indexes, scope) {
+        let idx = match self.index_mut(&mut indexes, scope, deletions) {
             Ok(idx) => idx,
             Err(e) => {
                 tracing::error!(error = %e, "cannot read vault for restore");
@@ -689,11 +716,21 @@ impl Inner {
         (!t.is_empty()).then_some(t)
     }
 
+    /// The in-memory view of `scope`, rebuilt from the vault when rows were
+    /// deleted since it was built (`deletions` is the store's current
+    /// deletion generation).
     fn index_mut<'a>(
         &self,
-        indexes: &'a mut HashMap<String, ScopeIndex>,
+        indexes: &'a mut Indexes,
         scope: &str,
+        deletions: u64,
     ) -> Result<&'a mut ScopeIndex> {
+        if indexes.deletions != deletions {
+            indexes.scopes.clear();
+            indexes.deletions = deletions;
+            self.touched.lock().clear();
+        }
+        let indexes = &mut indexes.scopes;
         if !indexes.contains_key(scope) {
             let entries = self
                 .store
@@ -909,8 +946,12 @@ impl Inner {
             return Err(EngineError::Blocked(blocked_all));
         }
 
+        // Prune and wipe wait while stand-ins are chosen and sent, so a
+        // mapping in use cannot vanish from the vault meanwhile; rows they
+        // removed earlier make the index reload here.
+        let rows = self.store.hold_rows();
         let mut indexes = self.indexes.lock();
-        let idx = self.index_mut(&mut indexes, scope)?;
+        let idx = self.index_mut(&mut indexes, scope, rows.deletions())?;
 
         // Surrogate-echo guard: a surrogate string already present in the
         // input (a different, undetected value that happens to look like
@@ -978,6 +1019,7 @@ impl Inner {
             ));
         };
         drop(indexes);
+        drop(rows);
 
         let mut out = Vec::with_capacity(texts.len());
         let mut counts: BTreeMap<String, u64> = BTreeMap::new();
@@ -1132,6 +1174,7 @@ impl Inner {
             return;
         }
         t.insert(k, now);
+        bound_touched(&mut t, now, TOUCHED_MAX);
         drop(t);
         if let Err(e) = self.store.touch(scope, real) {
             tracing::warn!(error = %e, "vault touch failed");
@@ -1456,6 +1499,21 @@ mod tests {
         assert_eq!(map_to_input(&placed, 3, true), 4);
         assert_eq!(map_to_input(&placed, 11, true), 10);
         assert_eq!(map_to_input(&placed, 6, false), 5);
+    }
+
+    #[test]
+    fn touched_map_stays_bounded() {
+        let now = Instant::now();
+        let mut t = HashMap::new();
+        for i in 0..20u8 {
+            t.insert([i; 32], now);
+        }
+        bound_touched(&mut t, now, 10);
+        assert!(t.len() <= 10);
+        let mut t: HashMap<[u8; 32], Instant> = HashMap::new();
+        t.insert([1; 32], now);
+        bound_touched(&mut t, now, 10);
+        assert_eq!(t.len(), 1, "small maps are left alone");
     }
 
     #[test]

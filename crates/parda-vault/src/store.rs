@@ -10,7 +10,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parda_core::EntityKind;
@@ -56,6 +56,20 @@ pub struct Store {
     conn: Mutex<Connection>,
     key: VaultKey,
     generation: AtomicU64,
+    /// Bumped (under the write lock) by every prune or wipe that removed
+    /// rows. Redactions hold the read lock, so rows cannot vanish while one
+    /// is choosing stand-ins, and they see the change on their next run.
+    deletions: RwLock<u64>,
+}
+
+/// Held while a redaction uses mappings: `prune` and `wipe` wait for it.
+pub struct RowsGuard<'a>(RwLockReadGuard<'a, u64>);
+
+impl RowsGuard<'_> {
+    /// The deletion generation (see [`Store::deletions`]).
+    pub fn deletions(&self) -> u64 {
+        *self.0
+    }
 }
 
 impl Store {
@@ -80,6 +94,7 @@ impl Store {
             conn: Mutex::new(conn),
             key,
             generation: AtomicU64::new(0),
+            deletions: RwLock::new(0),
         };
         store.verify_or_init_key_check()?;
         Ok(store)
@@ -133,6 +148,27 @@ impl Store {
     /// restore automaton.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+
+    /// A counter that increases whenever a prune or wipe removed rows. An
+    /// in-memory view of the mappings built under an older value may hold
+    /// mappings that no longer exist and must be rebuilt.
+    pub fn deletions(&self) -> u64 {
+        *self
+            .deletions
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keep `prune` and `wipe` out until the guard is dropped. Do not call
+    /// [`Store::deletions`], `prune` or `wipe` on the same thread while
+    /// holding it (use [`RowsGuard::deletions`]).
+    pub fn hold_rows(&self) -> RowsGuard<'_> {
+        RowsGuard(
+            self.deletions
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
     }
 
     /// The seed for the deterministic surrogate generator (HKDF subkey
@@ -275,6 +311,10 @@ impl Store {
     /// Delete mappings not used for `ttl_days` days. `0` disables expiry.
     /// Returns the number of rows removed.
     pub fn prune(&self, ttl_days: u32) -> Result<usize> {
+        let mut deletions = self
+            .deletions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         let removed = if ttl_days == 0 {
             0
         } else {
@@ -284,12 +324,19 @@ impl Store {
             checkpoint(&conn);
             n
         };
+        if removed > 0 {
+            *deletions += 1;
+        }
         self.bump();
         Ok(removed)
     }
 
     /// Delete every mapping, or only those of `scope`. Returns rows removed.
     pub fn wipe(&self, scope: Option<&str>) -> Result<usize> {
+        let mut deletions = self
+            .deletions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         let removed = {
             let conn = self.conn();
             let n = match scope {
@@ -299,6 +346,9 @@ impl Store {
             checkpoint(&conn);
             n
         };
+        if removed > 0 {
+            *deletions += 1;
+        }
         self.bump();
         Ok(removed)
     }
@@ -612,6 +662,23 @@ mod tests {
         assert!(g2 > g1);
         s.wipe(None).unwrap();
         assert!(s.generation() > g2);
+    }
+
+    #[test]
+    fn deletions_count_only_removals() {
+        let (_d, s) = open_tmp();
+        assert_eq!(s.deletions(), 0);
+        s.insert("global", &EntityKind::Person, "R", "S").unwrap();
+        s.prune(30).unwrap();
+        assert_eq!(s.deletions(), 0, "nothing expired");
+        s.wipe(Some("other")).unwrap();
+        assert_eq!(s.deletions(), 0);
+        {
+            let g = s.hold_rows();
+            assert_eq!(g.deletions(), 0);
+        }
+        s.wipe(None).unwrap();
+        assert_eq!(s.deletions(), 1);
     }
 
     #[test]

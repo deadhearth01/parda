@@ -335,3 +335,27 @@ fn model_threshold_change_applies_without_reload() {
     assert_eq!(e.scan(t).unwrap(), vec![], "0.5 is below the new threshold");
     assert_eq!(e.redact(t, "global").unwrap().text, t);
 }
+
+/// Review A finding 12: rows deleted by a prune or wipe that the engine was
+/// not told about (the daemon prunes, then calls forget_scopes; a redaction
+/// can run in between) must not be reused from memory: a stand-in that is
+/// sent must be in the vault, or the answer can never be restored.
+#[test]
+fn mappings_deleted_behind_the_engine_are_recreated() {
+    for prune in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine_at(dir.path(), rules_only_config(), None);
+        e.redact("Ravi Kumar", "global").unwrap();
+        if prune {
+            age_vault(dir.path(), -40);
+            assert!(e.vault().prune(30).unwrap() > 0);
+        } else {
+            e.vault().wipe(None).unwrap();
+        }
+        // No forget_scopes() here: that is the race.
+        let t = "Ravi Kumar called";
+        let r = e.redact(t, "global").unwrap();
+        let fresh = engine_at(dir.path(), rules_only_config(), None);
+        assert_eq!(fresh.restore(&r.text, "global"), t, "prune={prune}");
+    }
+}
