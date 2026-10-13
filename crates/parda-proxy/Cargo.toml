@@ -22,11 +22,15 @@ reqwest.workspace = true
 bytes.workspace = true
 futures.workspace = true
 http.workspace = true
+# Decoding compressed request bodies before redaction.
+flate2 = "1"
+brotli-decompressor = "6"
+ruzstd = "0.9"
 
 [dev-dependencies]
 parda-detect.workspace = true
 tempfile.workspace = true
-flate2 = "1"
+brotli = "9"
 proptest.workspace = true
 
 [lints]

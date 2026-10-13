@@ -2,25 +2,30 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::Context;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::response::Response;
 use bytes::Bytes;
+use futures::StreamExt;
 use http::header::{self, HeaderName};
 use http::{HeaderMap, StatusCode};
-use parda_core::UnscannedMedia;
+use parda_core::{ProxyConfig, UnscannedMedia};
 use parda_engine::{Engine, EngineError};
 use serde_json::Value;
 
+use crate::body::{self, BodyError};
 use crate::error::error_response;
 use crate::route::{Provider, route};
+use crate::route::{SUPPORTED, normalize_path};
 use crate::sse::{Restorers, StreamRewriter};
-use crate::walk::{Visit, leaves};
-use crate::{ProxyEvent, ProxyState, anthropic, guard, openai_chat, openai_responses, sse};
+use crate::walk::{Unscanned, Visit, leaves, preserve_numbers};
+use crate::{ProxyEvent, ProxyState, anthropic, guard, legacy, openai_chat, openai_responses, sse};
 
 /// Header naming the vault scope of a request (default `global`).
 pub const SCOPE_HEADER: &str = "x-parda-scope";
@@ -29,12 +34,48 @@ pub fn router(state: Arc<ProxyState>) -> Router {
     Router::new().fallback(handle).with_state(state)
 }
 
+/// Bind `cfg.listen`, refusing any non-loopback address unless
+/// `proxy.allow_non_loopback` is set (the proxy holds no credentials of its
+/// own: anyone who can reach it can send through it and read restored
+/// answers).
+pub async fn bind(cfg: &ProxyConfig) -> anyhow::Result<tokio::net::TcpListener> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&cfg.listen)
+        .await
+        .with_context(|| format!("resolving proxy.listen = {}", cfg.listen))?
+        .collect();
+    if addrs.is_empty() {
+        anyhow::bail!("proxy.listen = {} resolves to no address", cfg.listen);
+    }
+    if !cfg.allow_non_loopback
+        && let Some(a) = addrs.iter().find(|a| !a.ip().is_loopback())
+    {
+        anyhow::bail!(
+            "proxy.listen = {} resolves to {a}, which is not a loopback address; parda only \
+             serves this machine unless proxy.allow_non_loopback = true",
+            cfg.listen
+        );
+    }
+    let mut last = None;
+    for a in addrs {
+        match tokio::net::TcpListener::bind(a).await {
+            Ok(l) => return Ok(l),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(anyhow::Error::from(last.expect("at least one address"))
+        .context(format!("binding the proxy on {}", cfg.listen)))
+}
+
 /// Serve until the listener fails.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     state: Arc<ProxyState>,
 ) -> anyhow::Result<()> {
-    axum::serve(listener, router(state)).await?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -44,21 +85,45 @@ pub async fn serve_with_shutdown(
     state: Arc<ProxyState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
     Ok(())
 }
 
-type Walker = fn(&mut Value, Visit<'_>) -> u32;
+type Walker = fn(&mut Value, Visit<'_>) -> Unscanned;
 
 fn request_walker(p: Provider) -> Option<Walker> {
     match p {
         Provider::Anthropic => Some(anthropic::walk_request),
+        Provider::AnthropicBatches => Some(legacy::walk_batch_request),
+        Provider::AnthropicComplete => Some(legacy::walk_complete_request),
         Provider::OpenAiChat => Some(openai_chat::walk_request),
         Provider::OpenAiResponses => Some(openai_responses::walk_request),
-        _ => None,
+        Provider::OpenAiCompletions => Some(legacy::walk_completions_request),
+        Provider::OpenAiEmbeddings => Some(legacy::walk_embeddings_request),
+        Provider::OpenAiConversations => Some(openai_responses::walk_conversation_request),
+        Provider::PassAnthropic | Provider::PassOpenAi => None,
     }
+}
+
+/// True if a body sent to an endpoint parda does not know holds no text at
+/// all: JSON with no strings (keys included), e.g. `{}` for a cancel call.
+fn carries_no_text(headers: &HeaderMap, body: &Bytes, max: usize) -> bool {
+    fn has_text(v: &Value) -> bool {
+        match v {
+            Value::String(_) => true,
+            Value::Array(a) => a.iter().any(has_text),
+            Value::Object(m) => !m.is_empty(),
+            _ => false,
+        }
+    }
+    body::decode(headers, body.clone(), max)
+        .and_then(|raw| body::parse_json(&raw))
+        .is_ok_and(|v| !has_text(&v))
 }
 
 fn scope_of(headers: &HeaderMap) -> String {
@@ -117,13 +182,14 @@ struct Redacted {
     body: Vec<u8>,
     counts: BTreeMap<String, u32>,
     ml_ms: u64,
-    unscanned: u32,
+    unscanned: Unscanned,
     paused: bool,
 }
 
 fn redact_body(
     engine: &Engine,
     walker: Walker,
+    raw: &[u8],
     mut v: Value,
     scope: &str,
 ) -> Result<Redacted, EngineError> {
@@ -147,6 +213,7 @@ fn redact_body(
         }
     });
     let body = serde_json::to_vec(&v).map_err(|e| EngineError::Other(e.to_string()))?;
+    let body = preserve_numbers(raw, body);
     Ok(Redacted {
         body,
         counts,
@@ -159,6 +226,7 @@ fn redact_body(
 fn restore_body(
     engine: &Engine,
     provider: Provider,
+    raw: &[u8],
     mut v: Value,
     scope: &str,
     success: bool,
@@ -171,15 +239,17 @@ fn restore_body(
     if success {
         match provider {
             Provider::Anthropic => anthropic::walk_response(&mut v, &mut f),
+            Provider::AnthropicComplete => legacy::walk_complete_response(&mut v, &mut f),
             Provider::OpenAiChat => openai_chat::walk_response(&mut v, &mut f),
             Provider::OpenAiResponses => openai_responses::walk_response(&mut v, &mut f),
+            Provider::OpenAiCompletions => legacy::walk_completions_response(&mut v, &mut f),
             _ => {}
         }
     } else {
         // Error bodies may quote the request; restore every string.
         leaves(&mut v, &mut f);
     }
-    serde_json::to_vec(&v).unwrap_or_default()
+    preserve_numbers(raw, serde_json::to_vec(&v).unwrap_or_default())
 }
 
 fn engine_error(provider: Provider, e: &EngineError) -> (Response, String) {
@@ -227,6 +297,58 @@ fn engine_error(provider: Provider, e: &EngineError) -> (Response, String) {
     }
 }
 
+enum ReadError {
+    TooLarge,
+    Io(reqwest::Error),
+}
+
+/// Buffer an upstream answer (to restore it), at most `cap` bytes.
+async fn read_capped(upstream: reqwest::Response, cap: usize) -> Result<Bytes, ReadError> {
+    if upstream.content_length().is_some_and(|n| n > cap as u64) {
+        return Err(ReadError::TooLarge);
+    }
+    let mut stream = upstream.bytes_stream();
+    let mut buf = bytes::BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(ReadError::Io)?;
+        if buf.len() + chunk.len() > cap {
+            return Err(ReadError::TooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
+}
+
+fn body_error(provider: Provider, e: &BodyError) -> (Response, String) {
+    let (status, code, message) = match e {
+        BodyError::UnsupportedEncoding(coding) => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "parda_unsupported_encoding",
+            format!(
+                "parda cannot decode Content-Encoding `{coding}` (supported: gzip, deflate, br, \
+                 zstd); the request was not sent"
+            ),
+        ),
+        BodyError::TooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "parda_body_too_large",
+            "the decoded request body exceeds proxy.max_body_bytes".to_string(),
+        ),
+        BodyError::Unparseable(why) => (
+            StatusCode::BAD_REQUEST,
+            "parda_unparseable_body",
+            format!(
+                "parda could not read the request body as JSON ({why}), so it could not \
+                 redact it; the request was not sent"
+            ),
+        ),
+    };
+    (
+        error_response(provider, status, code, &message),
+        code.into(),
+    )
+}
+
 fn finish(
     state: &ProxyState,
     mut event: ProxyEvent,
@@ -243,6 +365,7 @@ fn finish(
         ml_ms = event.ml_ms,
         entities = event.counts.values().sum::<u32>(),
         unscanned = event.unscanned_media,
+        unknown_parts = event.unknown_parts,
         streaming = event.streaming,
         "proxied request"
     );
@@ -252,26 +375,48 @@ fn finish(
 
 async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
-    let provider = route(&parts.method, parts.uri.path(), &parts.headers);
+    let cfg = state.config();
+    let peer = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(a)| *a);
+    // Route (and forward) the path the way the upstream will read it, so
+    // `/v1//messages` or `/v1/%6Dessages` cannot slip past the walkers.
+    let path = normalize_path(parts.uri.path());
+    let provider = route(&parts.method, &path, &parts.headers);
     let mut event = ProxyEvent {
         provider: provider.name(),
-        path: parts.uri.path().to_string(),
+        path: path.clone(),
         counts: BTreeMap::new(),
         ml_ms: 0,
         added_ms: 0,
         unscanned_media: 0,
+        unknown_parts: 0,
         status: 0,
         streaming: false,
         paused: false,
         error: None,
     };
 
-    if let Err(msg) = guard::check(&parts.headers, &state.cfg) {
+    if let Err(msg) = guard::check(&parts.headers, &parts.uri, peer, &cfg) {
         let resp = error_response(provider, StatusCode::FORBIDDEN, "parda_forbidden", msg);
         return finish(&state, event, resp, Some("parda_forbidden".into()));
     }
     let scope = scope_of(&parts.headers);
-    let body = match axum::body::to_bytes(body, state.cfg.max_body_bytes).await {
+    if provider.rewrites() && !state.admit_scope(&scope) {
+        let resp = error_response(
+            provider,
+            StatusCode::BAD_REQUEST,
+            "parda_too_many_scopes",
+            &format!(
+                "this proxy already serves {} vault scopes (x-parda-scope); restart the \
+                 daemon to reset them",
+                crate::MAX_SCOPES
+            ),
+        );
+        return finish(&state, event, resp, Some("parda_too_many_scopes".into()));
+    }
+    let body = match axum::body::to_bytes(body, cfg.max_body_bytes).await {
         Ok(b) => b,
         Err(_) => {
             let resp = error_response(
@@ -284,33 +429,65 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         }
     };
 
-    // Redact the request.
+    // An endpoint parda cannot redact may only carry bodies without text.
+    if !provider.rewrites()
+        && !body.is_empty()
+        && !carries_no_text(&parts.headers, &body, cfg.max_body_bytes)
+    {
+        let resp = error_response(
+            provider,
+            StatusCode::BAD_REQUEST,
+            "parda_unknown_endpoint",
+            &format!(
+                "parda does not know which fields of {} {path} carry text, so it cannot redact \
+                 them; the request was not sent. Endpoints parda redacts: {SUPPORTED}",
+                parts.method
+            ),
+        );
+        return finish(&state, event, resp, Some("parda_unknown_endpoint".into()));
+    }
+
+    // Redact the request. A body parda cannot read is refused, never
+    // forwarded as is.
     let mut out_body = body.clone();
     let mut redact_ms = 0;
+    let mut decoded = false;
     if let Some(walker) = request_walker(provider)
         && !body.is_empty()
-        && let Ok(v) = serde_json::from_slice::<Value>(&body)
     {
+        let (raw, v) = match body::decode(&parts.headers, body, cfg.max_body_bytes)
+            .and_then(|raw| body::parse_json(&raw).map(|v| (raw, v)))
+        {
+            Ok(x) => x,
+            Err(e) => {
+                let (resp, code) = body_error(provider, &e);
+                return finish(&state, event, resp, Some(code));
+            }
+        };
+        decoded = body::is_encoded(&parts.headers);
         let started = Instant::now();
         let engine = state.engine.clone();
         let scope2 = scope.clone();
         let res =
-            tokio::task::spawn_blocking(move || redact_body(&engine, walker, v, &scope2)).await;
+            tokio::task::spawn_blocking(move || redact_body(&engine, walker, &raw, v, &scope2))
+                .await;
         redact_ms = started.elapsed().as_millis() as u64;
         match res {
             Ok(Ok(r)) => {
                 event.counts = r.counts;
                 event.ml_ms = r.ml_ms;
-                event.unscanned_media = r.unscanned;
+                event.unscanned_media = r.unscanned.media;
+                event.unknown_parts = r.unscanned.unknown;
                 event.paused = r.paused;
                 event.added_ms = redact_ms;
-                if r.unscanned > 0 && state.cfg.unscanned_media == UnscannedMedia::Block {
+                if r.unscanned.total() > 0 && cfg.unscanned_media == UnscannedMedia::Block {
                     let resp = error_response(
                         provider,
                         StatusCode::BAD_REQUEST,
                         "parda_unscanned_media",
-                        "the request contains images or binary documents, which parda cannot \
-                         scan yet (proxy.unscanned_media = \"block\")",
+                        "the request contains images, binary documents, token ids or content \
+                         of a type parda does not know, which it cannot scan \
+                         (proxy.unscanned_media = \"block\")",
                     );
                     return finish(&state, event, resp, Some("parda_unscanned_media".into()));
                 }
@@ -334,15 +511,17 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
 
     // Forward.
     let base = if provider.is_anthropic() {
-        &state.cfg.anthropic_upstream
+        &cfg.anthropic_upstream
     } else {
-        &state.cfg.openai_upstream
+        &cfg.openai_upstream
     };
-    let pq = parts.uri.path_and_query().map_or("/", |p| p.as_str());
-    let url = format!("{}{pq}", base.trim_end_matches('/'));
+    let url = match parts.uri.query() {
+        Some(q) => format!("{}{path}?{q}", base.trim_end_matches('/')),
+        None => format!("{}{path}", base.trim_end_matches('/')),
+    };
     let mut rb = state.http.request(parts.method.clone(), &url);
     for (k, v) in &parts.headers {
-        if forward_request_header(k) {
+        if forward_request_header(k) && !(decoded && k == header::CONTENT_ENCODING) {
             rb = rb.header(k, v);
         }
     }
@@ -375,11 +554,13 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         .and_then(|v| v.to_str().ok())
         .is_some_and(|c| c.starts_with("text/event-stream"));
 
-    if is_sse && provider.rewrites() {
+    if is_sse && provider.restores() {
         let restorers = Restorers::new(state.engine.clone(), &scope);
         let rw: Box<dyn StreamRewriter> = match provider {
             Provider::Anthropic => Box::new(anthropic::AnthropicStream::new(restorers)),
+            Provider::AnthropicComplete => Box::new(legacy::CompleteStream::new(restorers)),
             Provider::OpenAiChat => Box::new(openai_chat::ChatStream::new(restorers)),
+            Provider::OpenAiCompletions => Box::new(legacy::CompletionsStream::new(restorers)),
             _ => Box::new(openai_responses::ResponsesStream::new(restorers)),
         };
         let (tx, rx) = futures::channel::mpsc::channel(32);
@@ -391,9 +572,32 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         return finish(&state, event, resp, None);
     }
 
-    let bytes = match upstream.bytes().await {
+    let restore = if status.is_success() {
+        provider.restores()
+    } else {
+        provider.rewrites()
+    };
+    if !restore {
+        // Nothing to restore: pass the body through as it arrives.
+        event.added_ms = redact_ms;
+        let mut resp = Response::new(Body::from_stream(upstream.bytes_stream()));
+        *resp.status_mut() = status;
+        *resp.headers_mut() = headers;
+        return finish(&state, event, resp, None);
+    }
+    let bytes = match read_capped(upstream, cfg.max_body_bytes).await {
         Ok(b) => b,
-        Err(e) => {
+        Err(ReadError::TooLarge) => {
+            let resp = error_response(
+                provider,
+                StatusCode::BAD_GATEWAY,
+                "parda_upstream_too_large",
+                "the upstream answer exceeds proxy.max_body_bytes, so parda could not \
+                 restore it",
+            );
+            return finish(&state, event, resp, Some("parda_upstream_too_large".into()));
+        }
+        Err(ReadError::Io(e)) => {
             tracing::warn!(error = %e, "reading upstream body failed");
             let resp = error_response(
                 provider,
@@ -405,15 +609,16 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         }
     };
     let mut restore_ms = 0;
-    let body = if provider.rewrites() && !bytes.is_empty() {
+    let body = if restore && !bytes.is_empty() {
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(v) => {
                 let started = Instant::now();
                 let engine = state.engine.clone();
                 let scope2 = scope.clone();
                 let ok = status.is_success();
+                let raw = bytes.clone();
                 let res = tokio::task::spawn_blocking(move || {
-                    restore_body(&engine, provider, v, &scope2, ok)
+                    restore_body(&engine, provider, &raw, v, &scope2, ok)
                 })
                 .await;
                 restore_ms = started.elapsed().as_millis() as u64;

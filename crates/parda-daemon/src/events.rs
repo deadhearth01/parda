@@ -112,6 +112,12 @@ pub fn from_proxy(ev: &ProxyEvent) -> Event {
             if ev.unscanned_media > 0 {
                 summary.push_str(&format!(" · {} unscanned media", ev.unscanned_media));
             }
+            if ev.unknown_parts > 0 {
+                summary.push_str(&format!(
+                    " · {} part(s) of unknown type sent unscanned",
+                    ev.unknown_parts
+                ));
+            }
             if ev.streaming {
                 summary.push_str(" · stream");
             }
@@ -120,7 +126,7 @@ pub fn from_proxy(ev: &ProxyEvent) -> Event {
     let mut e = Event::now("proxy", summary);
     e.counts = ev.counts.clone();
     e.latency_ms = Some(ev.added_ms);
-    if ev.error.is_some() || ev.status >= 400 || ev.paused {
+    if ev.error.is_some() || ev.status >= 400 || ev.paused || ev.unknown_parts > 0 {
         e.level = "warn".into();
     }
     e
@@ -171,6 +177,14 @@ pub fn from_clip(ev: &ClipEvent) -> Event {
             Default::default(),
             true,
         ),
+        ClipEvent::OriginalNotRestored { reason } => (
+            format!(
+                "pasted, but the original could not be put back — the redacted text is still \
+                 on the clipboard ({reason})"
+            ),
+            Default::default(),
+            true,
+        ),
     };
     let mut e = Event::now("clipboard", summary);
     e.counts = counts;
@@ -217,6 +231,7 @@ mod tests {
             ml_ms: 12,
             added_ms: 15,
             unscanned_media: 1,
+            unknown_parts: 0,
             status: 200,
             streaming: true,
             paused: false,
@@ -230,6 +245,16 @@ mod tests {
         );
         assert_eq!(e.latency_ms, Some(15));
         assert_eq!(e.level, "info");
+        let unknown = from_proxy(&ProxyEvent {
+            unknown_parts: 2,
+            ..ev.clone()
+        });
+        assert!(
+            unknown
+                .summary
+                .contains("2 part(s) of unknown type sent unscanned")
+        );
+        assert_eq!(unknown.level, "warn");
         let paused = from_proxy(&ProxyEvent {
             paused: true,
             counts: BTreeMap::new(),

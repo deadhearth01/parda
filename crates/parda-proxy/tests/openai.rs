@@ -219,3 +219,291 @@ async fn gzip_upstream_handled() {
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "for Ravi Kumar");
 }
+
+fn chat_chunk(delta: Value, finish: Value) -> String {
+    sse(
+        None,
+        &json!({"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}),
+    )
+}
+
+fn user_sur(seen: &Seen, prefix: &str) -> String {
+    let v = seen.json();
+    let text = v["messages"][0]["content"]
+        .as_str()
+        .or_else(|| v["input"].as_str())
+        .unwrap()
+        .to_string();
+    text.strip_prefix(prefix).unwrap().to_string()
+}
+
+fn chat_text(body: &str) -> (String, String) {
+    let events: Vec<Value> = parse_events(body)
+        .iter()
+        .filter_map(|e| serde_json::from_str(&e.data).ok())
+        .collect();
+    let content = events
+        .iter()
+        .filter_map(|v| {
+            v["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    let args = events
+        .iter()
+        .filter_map(|v| {
+            v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    (content, args)
+}
+
+#[tokio::test]
+async fn chat_tail_stays_in_the_chunk_that_finishes_the_choice() {
+    // vLLM / Ollama / Groq put the last text and finish_reason in one chunk.
+    let s = setup(responder(|seen| {
+        let sur = user_sur(seen, "Say hi to ");
+        Reply::Sse(vec![
+            (
+                0,
+                chat_chunk(json!({"role": "assistant", "content": "Hi! "}), Value::Null),
+            ),
+            (
+                5,
+                chat_chunk(json!({"content": format!("Thanks, {sur}")}), json!("stop")),
+            ),
+            (0, "data: [DONE]\n\n".into()),
+        ])
+    }))
+    .await;
+    let resp = s
+        .post(
+            "/v1/chat/completions",
+            &json!({"model": "gpt", "stream": true, "messages": [{"role": "user", "content": "Say hi to Ravi Kumar"}]}),
+        )
+        .await;
+    let body = resp.text().await.unwrap();
+    assert_eq!(chat_text(&body).0, "Hi! Thanks, Ravi Kumar");
+    // The finishing chunk is still the last one before [DONE].
+    let events = parse_events(&body);
+    let n = events.len();
+    assert_eq!(events[n - 1].data, "[DONE]");
+    let last: Value = serde_json::from_str(&events[n - 2].data).unwrap();
+    assert_eq!(last["choices"][0]["finish_reason"], "stop");
+}
+
+#[tokio::test]
+async fn chat_tool_arguments_escape_restored_values_and_keep_order() {
+    let s = setup(responder(|seen| {
+        let sur = user_sur(seen, "ship to ");
+        let args = serde_json::to_string(&json!({"addr": sur})).unwrap();
+        let mut at = args.find(&sur).unwrap() + sur.len() / 2;
+        while !args.is_char_boundary(at) {
+            at += 1;
+        }
+        let (a, b) = args.split_at(at);
+        let call = |args: &str, first: bool| {
+            if first {
+                json!({"tool_calls": [{"index": 0, "id": "t", "type": "function", "function": {"name": "ship", "arguments": args}}]})
+            } else {
+                json!({"tool_calls": [{"index": 0, "function": {"arguments": args}}]})
+            }
+        };
+        Reply::Sse(vec![
+            (0, chat_chunk(call(a, true), Value::Null)),
+            (5, chat_chunk(call(b, false), json!("tool_calls"))),
+            (0, "data: [DONE]\n\n".into()),
+        ])
+    }))
+    .await;
+    let resp = s
+        .post(
+            "/v1/chat/completions",
+            &json!({"model": "gpt", "stream": true, "messages": [{"role": "user", "content": format!("ship to {ADDRESS}")}]}),
+        )
+        .await;
+    assert!(!s.mock.last().text().contains("Lotus"));
+    let body = resp.text().await.unwrap();
+    let args = chat_text(&body).1;
+    let v: Value = serde_json::from_str(&args).unwrap_or_else(|e| panic!("{e}: {args}"));
+    assert_eq!(v["addr"], ADDRESS);
+}
+
+#[tokio::test]
+async fn responses_function_arguments_escape_restored_values() {
+    let s = setup(responder(|seen| {
+        let sur = user_sur(seen, "ship to ");
+        let args = serde_json::to_string(&json!({"addr": sur})).unwrap();
+        let mut at = args.find(&sur).unwrap() + sur.len() / 2;
+        while !args.is_char_boundary(at) {
+            at += 1;
+        }
+        let (a, b) = args.split_at(at);
+        let delta = |d: &str, n: u64| {
+            sse(
+                Some("response.function_call_arguments.delta"),
+                &json!({"type": "response.function_call_arguments.delta",
+                "item_id": "fc_1", "output_index": 0, "delta": d, "sequence_number": n}),
+            )
+        };
+        Reply::Sse(vec![
+            (0, delta(a, 1)),
+            (5, delta(b, 2)),
+            (
+                0,
+                sse(
+                    Some("response.function_call_arguments.done"),
+                    &json!({"type": "response.function_call_arguments.done",
+                "item_id": "fc_1", "output_index": 0, "arguments": args, "sequence_number": 3}),
+                ),
+            ),
+        ])
+    }))
+    .await;
+    let resp = s
+        .post(
+            "/v1/responses",
+            &json!({"model": "gpt", "stream": true, "input": format!("ship to {ADDRESS}")}),
+        )
+        .await;
+    let body = resp.text().await.unwrap();
+    let events: Vec<Value> = parse_events(&body)
+        .iter()
+        .filter_map(|e| serde_json::from_str(&e.data).ok())
+        .collect();
+    let streamed: String = events
+        .iter()
+        .filter(|v| v["type"] == "response.function_call_arguments.delta")
+        .map(|v| v["delta"].as_str().unwrap().to_string())
+        .collect();
+    let v: Value = serde_json::from_str(&streamed).unwrap_or_else(|e| panic!("{e}: {streamed}"));
+    assert_eq!(v["addr"], ADDRESS);
+    let done = events
+        .iter()
+        .find(|v| v["type"] == "response.function_call_arguments.done")
+        .unwrap();
+    let v: Value = serde_json::from_str(done["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(v["addr"], ADDRESS);
+}
+
+fn responses_events(body: &str) -> Vec<Value> {
+    parse_events(body)
+        .iter()
+        .filter_map(|e| serde_json::from_str(&e.data).ok())
+        .collect()
+}
+
+fn r_ev(v: Value) -> String {
+    let ty = v["type"].as_str().unwrap().to_string();
+    sse(Some(&ty), &v)
+}
+
+/// Split `s` inside `needle` at a char boundary.
+fn split_inside(s: &str, needle: &str) -> (String, String) {
+    let mut at = s.find(needle).unwrap() + needle.len() / 2;
+    while !s.is_char_boundary(at) {
+        at += 1;
+    }
+    (s[..at].to_string(), s[at..].to_string())
+}
+
+#[tokio::test]
+async fn responses_stream_numbers_and_metadata_stay_consistent() {
+    let s = setup(responder(|seen| {
+        let sur = user_sur(seen, "Say hi to ");
+        let text = format!("Hi {sur}");
+        let (a, b) = split_inside(&text, &sur);
+        Reply::Sse(vec![
+            (0, r_ev(json!({"type": "response.created", "sequence_number": 0, "response": {"id": "r"}}))),
+            (0, r_ev(json!({"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0, "content_index": 0, "delta": a, "sequence_number": 1}))),
+            (5, r_ev(json!({"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0, "content_index": 0, "delta": b, "sequence_number": 2}))),
+            // No output_text.done: the tail is flushed at response.completed.
+            (0, r_ev(json!({"type": "response.completed", "sequence_number": 3, "response": {"id": "r", "output": []}}))),
+        ])
+    }))
+    .await;
+    let resp = s
+        .post(
+            "/v1/responses",
+            &json!({"model": "gpt", "stream": true, "input": "Say hi to Ravi Kumar"}),
+        )
+        .await;
+    let events = responses_events(&resp.text().await.unwrap());
+    let seq: Vec<u64> = events
+        .iter()
+        .map(|v| v["sequence_number"].as_u64().unwrap())
+        .collect();
+    let want: Vec<u64> = (0..seq.len() as u64).collect();
+    assert_eq!(seq, want, "{events:?}");
+    let deltas: Vec<&Value> = events
+        .iter()
+        .filter(|v| v["type"] == "response.output_text.delta")
+        .collect();
+    let text: String = deltas
+        .iter()
+        .map(|v| v["delta"].as_str().unwrap())
+        .collect();
+    assert_eq!(text, "Hi Ravi Kumar");
+    for d in deltas {
+        assert_eq!(d["item_id"], "msg_1", "{d}");
+        assert_eq!(d["output_index"], 0, "{d}");
+        assert_eq!(d["content_index"], 0, "{d}");
+    }
+}
+
+#[tokio::test]
+async fn responses_custom_tool_input_and_refusal_are_restored() {
+    let s = setup(responder(|seen| {
+        let sur = user_sur(seen, "Say hi to ");
+        let (a, b) = split_inside(&sur, &sur);
+        let refusal = format!("I won't contact {sur}");
+        Reply::Sse(vec![
+            (0, r_ev(json!({"type": "response.custom_tool_call_input.delta", "item_id": "ct_1", "output_index": 0, "delta": format!("grep '{a}"), "sequence_number": 1}))),
+            (5, r_ev(json!({"type": "response.custom_tool_call_input.delta", "item_id": "ct_1", "output_index": 0, "delta": format!("{b}' notes"), "sequence_number": 2}))),
+            (0, r_ev(json!({"type": "response.custom_tool_call_input.done", "item_id": "ct_1", "output_index": 0, "input": format!("grep '{sur}' notes"), "sequence_number": 3}))),
+            (0, r_ev(json!({"type": "response.refusal.delta", "item_id": "msg_2", "output_index": 1, "content_index": 0, "delta": refusal, "sequence_number": 4}))),
+            (0, r_ev(json!({"type": "response.refusal.done", "item_id": "msg_2", "output_index": 1, "content_index": 0, "refusal": refusal, "sequence_number": 5}))),
+        ])
+    }))
+    .await;
+    let resp = s
+        .post(
+            "/v1/responses",
+            &json!({"model": "gpt", "stream": true, "input": "Say hi to Ravi Kumar"}),
+        )
+        .await;
+    let events = responses_events(&resp.text().await.unwrap());
+    let joined = |ty: &str| -> String {
+        events
+            .iter()
+            .filter(|v| v["type"] == ty)
+            .map(|v| v["delta"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        joined("response.custom_tool_call_input.delta"),
+        "grep 'Ravi Kumar' notes"
+    );
+    assert_eq!(
+        joined("response.refusal.delta"),
+        "I won't contact Ravi Kumar"
+    );
+    let done = |ty: &str, field: &str| -> String {
+        events.iter().find(|v| v["type"] == ty).unwrap()[field]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(
+        done("response.custom_tool_call_input.done", "input"),
+        "grep 'Ravi Kumar' notes"
+    );
+    assert_eq!(
+        done("response.refusal.done", "refusal"),
+        "I won't contact Ravi Kumar"
+    );
+}
