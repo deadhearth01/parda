@@ -21,6 +21,8 @@ pub fn rules() -> RulesFile {
 pub fn rules_only_config() -> Config {
     let mut c = Config::default();
     c.detect.model = "none".into();
+    // These tests exercise realistic stand-ins; tag style has its own tests.
+    c.replace.style = parda_core::Style::Surrogate;
     c
 }
 
@@ -80,6 +82,7 @@ impl MlDetector for StubMl {
 pub fn ml_config(mode: parda_core::Mode, timeout_ms: u64) -> Config {
     let mut c = Config::default();
     c.detect.model = "stub".into();
+    c.replace.style = parda_core::Style::Surrogate;
     c.detect.mode = mode;
     c.detect.ml_timeout_ms = timeout_ms;
     c

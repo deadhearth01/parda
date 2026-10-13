@@ -30,7 +30,7 @@ execution_provider = "auto"        # auto | cpu | coreml | directml | cuda
 # Organization = "ignore"
 
 [replace]
-style = "surrogate"                # surrogate (realistic stand-ins) | token (⟦PERSON_1⟧)
+style = "token"                    # token: [NAME_1], [EMAIL_2], [AADHAAR_1] … | surrogate: realistic stand-ins
 
 [vault]
 ttl_days = 30                      # mappings unused this long are deleted (0 = keep)

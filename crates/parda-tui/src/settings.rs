@@ -100,9 +100,9 @@ pub fn row(s: &Setting, c: &Config) -> Row {
             r.label = "replacement style".into();
             r.value = match c.replace.style {
                 Style::Surrogate => "realistic stand-ins".into(),
-                Style::Token => "⟦TOKENS⟧".into(),
+                Style::Token => "tags like [NAME_1]".into(),
             };
-            r.help = "Stand-ins read naturally (Ravi Kumar → Arjun Mehta); tokens make every replacement obvious.";
+            r.help = "Tags show exactly what was hidden (Ravi Kumar → [NAME_1]); realistic stand-ins (→ Arjun Mehta) read more naturally to the AI.";
         }
         Setting::Proxy => {
             r.group = "agents";

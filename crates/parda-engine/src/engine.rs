@@ -1468,16 +1468,16 @@ mod tests {
     #[test]
     fn input_words_find_word_bounded_occurrences() {
         let texts = [
-            "Ravi met Arjun Desai, mail ⟦EMAIL_2⟧ or +91 98765 43210",
+            "Ravi met Arjun Desai, mail [EMAIL_2] or +91 98765 43210",
             "arjunx",
         ];
         let w = InputWords::new(&texts, Arc::new(RestoreTable::build(&[])));
         assert!(w.occurs("Arjun"));
         assert!(w.occurs("ARJUN DESAI"));
-        assert!(w.occurs("⟦EMAIL_2⟧"));
+        assert!(w.occurs("[EMAIL_2]"));
         assert!(w.occurs("+91 98765 43210"));
         assert!(!w.occurs("Arju"), "inside a word");
-        assert!(!w.occurs("⟦EMAIL_1⟧"));
+        assert!(!w.occurs("[EMAIL_1]"));
         assert!(!w.occurs("Desai Arjun"));
         assert!(!w.occurs("..."));
         // An existing stand-in is echo-guarded, so it may be reused.

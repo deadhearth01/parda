@@ -94,6 +94,38 @@ impl EntityKind {
         NAMED.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
     }
 
+    /// Short label used in tags such as `[NAME_1]`, `[AADHAAR_2]`.
+    pub fn tag_label(&self) -> String {
+        let short = match self {
+            EntityKind::Person => "NAME",
+            EntityKind::IpAddress => "IP",
+            EntityKind::MacAddress => "MAC",
+            EntityKind::CreditCard => "CARD",
+            EntityKind::BankAccount => "ACCOUNT",
+            EntityKind::VoterId => "VOTER_ID",
+            EntityKind::DrivingLicence => "LICENCE",
+            EntityKind::IndianVehicleReg => "VEHICLE",
+            EntityKind::UsSsn => "SSN",
+            EntityKind::UkNino => "NINO",
+            EntityKind::DateOfBirth => "DOB",
+            EntityKind::Organization => "ORG",
+            EntityKind::Custom(name) => {
+                return name
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() {
+                            c.to_ascii_uppercase()
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+            }
+            _ => return self.label(),
+        };
+        short.to_string()
+    }
+
     /// Upper-snake label used in placeholder tokens, e.g. `IP_ADDRESS`.
     pub fn label(&self) -> String {
         let name = self.to_string();
@@ -178,6 +210,28 @@ mod tests {
             "Codename".parse::<EntityKind>().unwrap(),
             EntityKind::Custom("Codename".into())
         );
+    }
+
+    #[test]
+    fn tag_labels_are_short_and_friendly() {
+        assert_eq!(EntityKind::Person.tag_label(), "NAME");
+        assert_eq!(EntityKind::Email.tag_label(), "EMAIL");
+        assert_eq!(EntityKind::Aadhaar.tag_label(), "AADHAAR");
+        assert_eq!(EntityKind::CreditCard.tag_label(), "CARD");
+        assert_eq!(EntityKind::BankAccount.tag_label(), "ACCOUNT");
+        assert_eq!(EntityKind::IpAddress.tag_label(), "IP");
+        assert_eq!(EntityKind::DateOfBirth.tag_label(), "DOB");
+        assert_eq!(
+            EntityKind::Custom("employee id".into()).tag_label(),
+            "EMPLOYEE_ID"
+        );
+        for k in EntityKind::all() {
+            let t = k.tag_label();
+            assert!(
+                !t.is_empty() && t.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "{k:?} -> {t}"
+            );
+        }
     }
 
     #[test]

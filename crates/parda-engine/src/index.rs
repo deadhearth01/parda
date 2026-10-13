@@ -69,15 +69,15 @@ impl ScopeIndex {
         taken || self.by_real.contains_key(&cand)
     }
 
-    /// Next free number for a `⟦LABEL_n⟧` token of `kind`.
+    /// Next free number for a `[LABEL_n]` tag of `kind`.
     pub(crate) fn next_token_number(&self, kind: &EntityKind) -> u32 {
-        let prefix = format!("⟦{}_", kind.label());
+        let prefix = format!("[{}_", kind.tag_label());
         self.entries
             .iter()
             .filter_map(|e| {
                 e.surrogate
                     .strip_prefix(&prefix)?
-                    .strip_suffix('⟧')?
+                    .strip_suffix(']')?
                     .parse::<u32>()
                     .ok()
             })
@@ -129,7 +129,7 @@ mod tests {
         let mut idx = ScopeIndex::default();
         assert_eq!(idx.next_token_number(&EntityKind::Email), 1);
         idx.add(Entry {
-            surrogate: "⟦EMAIL_4⟧".into(),
+            surrogate: "[EMAIL_4]".into(),
             real: "a@b.c".into(),
             kind: EntityKind::Email,
         });
