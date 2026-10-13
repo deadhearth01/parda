@@ -10,7 +10,7 @@ use http::header::CONTENT_ENCODING;
 use serde_json::Value;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum BodyError {
+pub enum BodyError {
     /// A `Content-Encoding` parda cannot decode (415).
     UnsupportedEncoding(String),
     /// The decoded body is larger than `proxy.max_body_bytes` (413).
@@ -38,13 +38,13 @@ fn codings(headers: &HeaderMap) -> Vec<String> {
 }
 
 /// True if the request declares a `Content-Encoding` other than identity.
-pub(crate) fn is_encoded(headers: &HeaderMap) -> bool {
+pub fn is_encoded(headers: &HeaderMap) -> bool {
     !codings(headers).is_empty()
 }
 
 /// Undo every `Content-Encoding` (gzip, deflate, br, zstd), never producing
 /// more than `max` bytes.
-pub(crate) fn decode(headers: &HeaderMap, body: Bytes, max: usize) -> Result<Bytes, BodyError> {
+pub fn decode(headers: &HeaderMap, body: Bytes, max: usize) -> Result<Bytes, BodyError> {
     let mut data = body;
     for coding in codings(headers).iter().rev() {
         data = decode_one(coding, &data, max)?;
@@ -89,7 +89,7 @@ fn decode_one(coding: &str, data: &[u8], max: usize) -> Result<Bytes, BodyError>
 /// lone UTF-16 surrogate escapes (`"\ud83d"` from a JS client that cut an
 /// emoji in half) become U+FFFD; anything else that is not JSON — including
 /// nesting deeper than serde_json's limit — is an error.
-pub(crate) fn parse_json(body: &[u8]) -> Result<Value, BodyError> {
+pub fn parse_json(body: &[u8]) -> Result<Value, BodyError> {
     let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
     match serde_json::from_slice(body) {
         Ok(v) => Ok(v),
@@ -105,7 +105,7 @@ pub(crate) fn parse_json(body: &[u8]) -> Result<Value, BodyError> {
 /// [`parse_json`] for the bodies of routes parda rewrites: every one of them
 /// is a JSON object, so any other value (`["text"]`, a bare string, …) is
 /// refused rather than walked as if it held no text.
-pub(crate) fn parse_object(body: &[u8]) -> Result<Value, BodyError> {
+pub fn parse_object(body: &[u8]) -> Result<Value, BodyError> {
     let v = parse_json(body)?;
     if v.is_object() {
         return Ok(v);

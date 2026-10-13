@@ -26,7 +26,7 @@ enum State {
     Value,
 }
 
-pub(crate) struct JsonFragRestorer {
+pub struct JsonFragRestorer {
     engine: Engine,
     scope: String,
     stack: Vec<Container>,
@@ -45,7 +45,7 @@ fn escape(s: &str) -> String {
 }
 
 impl JsonFragRestorer {
-    pub(crate) fn new(engine: Engine, scope: &str) -> Self {
+    pub fn new(engine: Engine, scope: &str) -> Self {
         JsonFragRestorer {
             engine,
             scope: scope.to_string(),
@@ -58,7 +58,7 @@ impl JsonFragRestorer {
     }
 
     /// Feed a fragment; returns the JSON text that is safe to emit now.
-    pub(crate) fn push(&mut self, chunk: &str) -> String {
+    pub fn push(&mut self, chunk: &str) -> String {
         let mut out = String::with_capacity(chunk.len());
         let mut decoded = String::new();
         for c in chunk.chars() {
@@ -82,7 +82,7 @@ impl JsonFragRestorer {
     }
 
     /// Flush everything held back (the document may be truncated).
-    pub(crate) fn finish(&mut self) -> String {
+    pub fn finish(&mut self) -> String {
         let mut out = String::new();
         if matches!(self.state, State::Value) {
             let mut raw = String::new();

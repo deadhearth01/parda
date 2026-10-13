@@ -1,0 +1,27 @@
+[package]
+name = "parda-wire"
+description = "HTTP body plumbing shared by parda's proxies: request decoding, SSE parsing, JSON walking and streamed JSON restore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+parda-engine.workspace = true
+bytes.workspace = true
+http.workspace = true
+# Keep the key order of JSON bodies we rewrite.
+serde_json = { workspace = true, features = ["preserve_order"] }
+# Decoding compressed request bodies before redaction.
+flate2 = "1"
+brotli-decompressor = "6"
+ruzstd = "0.9"
+
+[dev-dependencies]
+parda-core.workspace = true
+parda-detect.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

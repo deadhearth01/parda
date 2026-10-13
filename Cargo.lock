@@ -2911,7 +2911,6 @@ dependencies = [
  "anyhow",
  "axum",
  "brotli",
- "brotli-decompressor",
  "bytes",
  "flate2",
  "futures",
@@ -2919,6 +2918,7 @@ dependencies = [
  "parda-core",
  "parda-detect",
  "parda-engine",
+ "parda-wire",
  "proptest",
  "reqwest",
  "ruzstd",
@@ -2963,6 +2963,22 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "parda-wire"
+version = "0.1.0"
+dependencies = [
+ "brotli-decompressor",
+ "bytes",
+ "flate2",
+ "http",
+ "parda-core",
+ "parda-detect",
+ "parda-engine",
+ "ruzstd",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
