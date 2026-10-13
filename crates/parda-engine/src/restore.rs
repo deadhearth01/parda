@@ -180,6 +180,11 @@ impl RestoreTable {
         if let Some(e) = entries.iter().find(|e| e.surrogate == matched) {
             return e.real.clone();
         }
+        // A tag (`[NAME_1]`) echoed in another case: its case says nothing
+        // about the value's, so the value comes back as written.
+        if matched.starts_with('[') && matched.ends_with(']') {
+            return entries[0].real.clone();
+        }
         match entries.iter().find(|e| case_insensitive(&e.kind)) {
             Some(e) => apply_case(matched, &e.real),
             None => entries[0].real.clone(),
@@ -291,6 +296,17 @@ mod tests {
         assert_eq!(t.hold_start("Hello there"), 11);
         assert_eq!(t.hold_start("x arjun mehta"), 2);
         assert_eq!(t.hold_start(""), 0);
+    }
+
+    #[test]
+    fn a_tag_in_any_case_restores_the_value_as_written() {
+        // A model may echo `[name_1]`; the tag's case says nothing about the
+        // value's case.
+        let t = table(&[("[NAME_1]", "Ravi Kumar"), ("[NAME_2]", "ravi@x.in")]);
+        assert_eq!(
+            t.apply("[name_1], [Name_1], [NAME_1] / [name_2]", None),
+            "Ravi Kumar, Ravi Kumar, Ravi Kumar / ravi@x.in"
+        );
     }
 
     #[test]
