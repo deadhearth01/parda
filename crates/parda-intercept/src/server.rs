@@ -199,6 +199,9 @@ async fn front(
     if req.method() == Method::CONNECT {
         return Ok(connect(req, state).await);
     }
+    if let Some(res) = redirect_listed_http(&req, &state.hosts) {
+        return Ok(res);
+    }
     if req.method() == Method::GET && req.uri().path() == "/parda.pac" && is_local(req.uri()) {
         // The OS fetches the PAC with Host 127.0.0.1/localhost and no Origin.
         // Refuse web pages: cross-origin fetches carry an Origin, and a
@@ -238,6 +241,37 @@ async fn front(
     Ok(res)
 }
 
+/// A plain-HTTP proxy request (absolute-form `http://host/...`) for a listed
+/// host: answered with 308 to the same URL over https, nothing forwarded and
+/// the body never read. `None` for anything else.
+fn redirect_listed_http(req: &Request<Incoming>, hosts: &HostList) -> Option<Response<Body>> {
+    let uri = req.uri();
+    if uri.scheme_str() != Some("http") {
+        return None;
+    }
+    let host = normalize_host(uri.host()?);
+    if !hosts.matches(&host) {
+        return None;
+    }
+    let authority = match uri.port_u16() {
+        Some(p) if p != 80 => format!("{host}:{p}"),
+        _ => host,
+    };
+    let location = format!(
+        "https://{authority}{}",
+        uri.path_and_query().map_or("/", |p| p.as_str())
+    );
+    let Ok(location) = HeaderValue::from_str(&location) else {
+        return Some(text(StatusCode::BAD_REQUEST, "parda intercept: bad URL\n"));
+    };
+    let mut res = empty(StatusCode::PERMANENT_REDIRECT);
+    res.headers_mut().insert(http::header::LOCATION, location);
+    // The request body is not read; do not reuse the connection.
+    res.headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
+    Some(res)
+}
+
 /// Origin-form, or absolute-form naming this machine.
 fn is_local(uri: &http::Uri) -> bool {
     uri.host().is_none_or(is_local_host)
@@ -257,6 +291,14 @@ async fn connect(req: Request<Incoming>, state: Arc<InterceptState>) -> Response
     let port = authority.port_u16().unwrap_or(443);
 
     if state.hosts.matches(&host) {
+        if port == 80 {
+            // ws:// (or plain http tunnelled): parda only filters TLS
+            // traffic, and must not let it pass unfiltered.
+            return text(
+                StatusCode::FORBIDDEN,
+                "parda intercept: unencrypted connections to AI hosts are refused; use https/wss\n",
+            );
+        }
         tokio::spawn(async move {
             match hyper::upgrade::on(req).await {
                 Ok(io) => intercept_tls(TokioIo::new(io), host, port, state).await,

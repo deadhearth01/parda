@@ -4,9 +4,10 @@ use std::net::SocketAddr;
 
 use crate::HostList;
 
-/// A JavaScript PAC returning `PROXY <proxy>` for `https:`/`wss:` URLs of
-/// listed hosts (and their subdomains) and `DIRECT` for everything else.
-/// Plain `http:` stays DIRECT so a site can still redirect it to https.
+/// A JavaScript PAC returning `PROXY <proxy>` for every URL of a listed host
+/// (and its subdomains), whatever the scheme, and `DIRECT` for everything
+/// else. parda itself redirects plain http to https and refuses `ws://`, so
+/// nothing for a listed host bypasses the filter.
 ///
 /// A listed host gets no `DIRECT` fallback: if parda stops while a browser
 /// still holds this PAC, AI requests fail instead of leaving unfiltered.
@@ -22,8 +23,6 @@ pub fn pac(hosts: &HostList, proxy: SocketAddr) -> String {
         r#"// parda: send AI hosts through the local PII filter, everything else DIRECT.
 var PARDA_HOSTS = [{list}];
 function FindProxyForURL(url, host) {{
-  var scheme = url.substring(0, url.indexOf(":")).toLowerCase();
-  if (scheme !== "https" && scheme !== "wss") return "DIRECT";
   var h = host.toLowerCase();
   if (h.charAt(h.length - 1) === ".") h = h.substring(0, h.length - 1);
   for (var i = 0; i < PARDA_HOSTS.length; i++) {{
@@ -68,7 +67,7 @@ mod tests {
              'example.com','evilchat.test','chat.test.evil.com']) \
              console.log(h + '=' + FindProxyForURL('https://' + h + '/', h));\n\
              for (const u of ['http://chat.test/', 'wss://chat.test/', 'ws://chat.test/', \
-             'HTTPS://x.chat.test/', 'ftp://chat.test/']) \
+             'HTTPS://x.chat.test/', 'http://example.com/']) \
              console.log(u + '=' + FindProxyForURL(u, u.split('/')[2]));\n",
         );
         let out = match std::process::Command::new("node")
@@ -96,13 +95,13 @@ mod tests {
             ("example.com", "DIRECT"),
             ("evilchat.test", "DIRECT"),
             ("chat.test.evil.com", "DIRECT"),
-            // Only TLS URLs go to parda; plain http stays DIRECT so the site
-            // can redirect to https.
-            ("http://chat.test/", "DIRECT"),
+            // Every scheme of a listed host goes to parda (fail closed):
+            // parda redirects plain http to https and refuses ws:// itself.
+            ("http://chat.test/", proxy),
             ("wss://chat.test/", proxy),
-            ("ws://chat.test/", "DIRECT"),
+            ("ws://chat.test/", proxy),
             ("HTTPS://x.chat.test/", proxy),
-            ("ftp://chat.test/", "DIRECT"),
+            ("http://example.com/", "DIRECT"),
         ] {
             assert!(out.contains(&format!("{h}={want}\n")), "{h}: {out}");
         }

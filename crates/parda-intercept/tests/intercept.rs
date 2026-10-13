@@ -570,8 +570,10 @@ async fn pac_is_served_and_other_plain_requests_are_refused() {
         .timeout(T)
         .build()
         .unwrap();
+    // Plain http for an unlisted host is not proxied (listed hosts are
+    // redirected to https: see plain_http_to_a_listed_host_is_redirected).
     let res = via_proxy
-        .get(format!("http://chat.test:{}/echo", up.port))
+        .get("http://example.test/echo")
         .send()
         .await
         .unwrap();
@@ -899,4 +901,47 @@ async fn slow_and_idle_clients_are_disconnected() {
         .await
         .unwrap();
     assert_eq!(body, "data: hello secret one\n\ndata: two secret\n\n");
+}
+
+#[tokio::test]
+async fn plain_http_to_a_listed_host_is_redirected_to_https() {
+    let up = start_upstream(test_pki(&["chat.test"])).await;
+    let h = start_parda(&up.ca_pem).await;
+    let via_proxy = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://{}", h.proxy)).unwrap())
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(T)
+        .build()
+        .unwrap();
+    let res = via_proxy
+        .post("http://chat.test/x?q=1")
+        .body("my secret plan")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 308);
+    assert_eq!(res.headers()["location"], "https://chat.test/x?q=1");
+    let res = via_proxy
+        .get(format!("http://CHAT.test:{}/y", up.port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 308);
+    assert_eq!(
+        res.headers()["location"].to_str().unwrap(),
+        format!("https://chat.test:{}/y", up.port)
+    );
+    assert!(up.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn ws_connect_to_a_listed_host_on_port_80_is_refused() {
+    let up = start_upstream(test_pki(&["chat.test"])).await;
+    let h = start_parda(&up.ca_pem).await;
+    let mut tcp = TcpStream::connect(h.proxy).await.unwrap();
+    tcp.write_all(b"CONNECT chat.test:80 HTTP/1.1\r\nHost: chat.test:80\r\n\r\n")
+        .await
+        .unwrap();
+    let head = read_head(&mut tcp).await;
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
 }
