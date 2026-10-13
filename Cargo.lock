@@ -2792,6 +2792,7 @@ name = "parda-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "directories",
  "parda-clip",
  "parda-core",
@@ -2804,11 +2805,13 @@ dependencies = [
  "parda-vault",
  "serde",
  "serde_json",
+ "sha1",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 
