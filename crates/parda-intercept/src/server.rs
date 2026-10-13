@@ -122,7 +122,9 @@ pub fn upstream_client_builder() -> reqwest::ClientBuilder {
         .read_timeout(UPSTREAM_READ_TIMEOUT)
 }
 
-/// Serve the proxy on `listener`. Binding it to loopback is the caller's job.
+/// Serve the proxy on `listener`, which must be bound to a loopback address
+/// (anything else is refused); connections from non-loopback peers are
+/// dropped.
 ///
 /// - `CONNECT host:port` to a listed host: TLS is terminated with a leaf from
 ///   the parda CA (SNI must equal the CONNECT host; ALPN `http/1.1` only) and
@@ -131,9 +133,17 @@ pub fn upstream_client_builder() -> reqwest::ClientBuilder {
 /// - Plain `GET /parda.pac`: the PAC file. Any other plain request: 405.
 pub async fn serve(listener: TcpListener, state: Arc<InterceptState>) -> anyhow::Result<()> {
     let local = listener.local_addr()?;
+    anyhow::ensure!(
+        is_loopback(local.ip()),
+        "parda intercept must listen on a loopback address, not {local}"
+    );
     loop {
         let tcp = match listener.accept().await {
-            Ok((tcp, _)) => tcp,
+            Ok((tcp, peer)) if is_loopback(peer.ip()) => tcp,
+            Ok((_, peer)) => {
+                tracing::warn!(%peer, "intercept: dropped a non-loopback client");
+                continue;
+            }
             Err(e) => {
                 // E.g. out of file descriptors: back off instead of spinning.
                 tracing::warn!(error = %e, "intercept: accept failed");
@@ -723,8 +733,8 @@ fn text(status: StatusCode, msg: &str) -> Response<Body> {
 }
 
 /// Loopback, including IPv4-mapped IPv6 loopback.
-fn is_loopback(_ip: std::net::IpAddr) -> bool {
-    true
+fn is_loopback(ip: std::net::IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
 }
 
 #[cfg(test)]
