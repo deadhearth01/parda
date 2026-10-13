@@ -318,6 +318,17 @@ impl Engine {
         }
     }
 
+    /// [`Engine::restore`], except that a surrogate is left as it is when
+    /// the run of non-ASCII-whitespace text before it holds any of
+    /// `/ ? = & % \ : @`, follows `www.`, or is longer than 2 KiB: a real
+    /// value is never put back into something shaped like a URL or query.
+    pub fn restore_url_safe(&self, text: &str, scope: &str) -> String {
+        match self.inner.table(scope) {
+            Some(t) => t.apply_url_safe(text, None, &mut crate::restore::UrlRun::default()),
+            None => text.to_string(),
+        }
+    }
+
     pub fn stream_restorer(&self, scope: &str) -> StreamRestorer {
         StreamRestorer::new(self.inner.clone(), scope)
     }
