@@ -99,6 +99,11 @@ impl RestoreTable {
         self.ac.is_none()
     }
 
+    /// Is `s` (ignoring ASCII case) one of the surrogates?
+    pub(crate) fn contains(&self, s: &str) -> bool {
+        self.sorted.binary_search(&s.to_ascii_lowercase()).is_ok()
+    }
+
     fn bounded(
         &self,
         text: &str,

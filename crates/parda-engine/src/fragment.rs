@@ -1,16 +1,26 @@
-//! Splitting text into fragments: the unit of caching and of ML inference.
+//! Splitting text into fragments: the unit of ML inference and of the ML
+//! cache. The dictionary and rule tiers always run over the whole text, so a
+//! fragment edge can never cut a value they would find.
 //!
 //! Fragments are contiguous, cover the whole text, end on UTF-8 character
 //! boundaries and are at most `max_bytes` long. Splits prefer paragraph
-//! breaks, then line breaks, then sentence ends, then whitespace; only a run
-//! with none of those is cut mid-word. Small neighbouring pieces are packed
-//! together so a chat message is usually one fragment.
+//! breaks, then line breaks, then sentence ends, then whitespace; a run with
+//! none of those is cut after a non-alphanumeric character when there is one
+//! nearby, and mid-word only as a last resort. Small neighbouring pieces are
+//! packed together so a chat message is usually one fragment.
+//!
+//! [`ml_windows`] turns fragments into the model's input windows: each window
+//! after the first also covers the end of the previous fragment, so a name
+//! cut by a fragment edge is whole in one of the two windows.
 
 use parda_core::Span;
 
 /// Fragment size used by the engine: comfortably inside a 512-token model
 /// window for English and Indic text.
 pub const DEFAULT_MAX_FRAGMENT_BYTES: usize = 2000;
+
+/// Bytes each model window repeats from the end of the previous fragment.
+pub const ML_WINDOW_OVERLAP: usize = 256;
 
 const SEPARATORS: &[&[&str]] = &[
     &["\n\n"],
@@ -24,6 +34,49 @@ pub fn split_fragments(text: &str, max_bytes: usize) -> Vec<Span> {
     let max = max_bytes.max(16);
     let mut out = Vec::new();
     split_level(text, 0, text.len(), max, 0, &mut out);
+    out
+}
+
+/// Model input windows over `text`, each at most `max_bytes` (minimum 16)
+/// long. A text that fits is one window; a longer one is split into
+/// fragments of `max_bytes - overlap`, and every window after the first
+/// starts up to `overlap` bytes (a quarter of `max_bytes` at most) before its
+/// fragment, at a word start when there is one in reach. Windows cover the
+/// whole text and every substring shorter than about `overlap / 2` bytes lies
+/// entirely inside one window.
+pub fn ml_windows(text: &str, max_bytes: usize) -> Vec<Span> {
+    let max = max_bytes.max(16);
+    if text.len() <= max {
+        return if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![Span::new(0, text.len())]
+        };
+    }
+    let overlap = ML_WINDOW_OVERLAP.min(max / 4);
+    let mut out = split_fragments(text, max - overlap);
+    let mut prev_start = 0;
+    for w in out.iter_mut().skip(1) {
+        // A short first fragment (a heading before one long line of tool
+        // output) leaves less than `overlap` before this one; never step
+        // back past the previous window either.
+        let mut start = w.start.saturating_sub(overlap).max(prev_start);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        // Prefer to begin right after a separator in the first half of the
+        // overlap, so the model does not see a word cut in half.
+        let mid = start + overlap / 2;
+        if let Some((i, c)) = text[start..w.start]
+            .char_indices()
+            .take_while(|(i, _)| start + i < mid)
+            .find(|(_, c)| !c.is_alphanumeric())
+        {
+            start += i + c.len_utf8();
+        }
+        w.start = start;
+        prev_start = start;
+    }
     out
 }
 
@@ -95,6 +148,19 @@ fn hard_split(text: &str, start: usize, end: usize, max: usize, out: &mut Vec<Sp
         while !text.is_char_boundary(e) {
             e -= 1;
         }
+        if e < end {
+            // Back off to just after a non-alphanumeric character (`"`, `,`,
+            // `:`, `/`, …) within the last quarter, so a value is not cut.
+            let floor = e.saturating_sub(max / 4).max(s + 1);
+            if let Some((i, c)) = text[..e]
+                .char_indices()
+                .rev()
+                .take_while(|(i, _)| *i >= floor)
+                .find(|(_, c)| !c.is_alphanumeric())
+            {
+                e = i + c.len_utf8();
+            }
+        }
         if e == s {
             e = s + text[s..].chars().next().map_or(1, char::len_utf8);
         }
@@ -153,6 +219,95 @@ mod tests {
         check(&words, 50);
         let blob = "x".repeat(100) + &"é".repeat(50);
         check(&blob, 33);
+    }
+
+    #[test]
+    fn hard_split_backs_off_to_a_separator() {
+        // Minified JSON: no whitespace at all.
+        let text = r#"{"phone":"9876543210","name":"Ravi"},"#.repeat(200);
+        for s in check(&text, 100) {
+            let piece = &text[s.start..s.end];
+            if s.end < text.len() {
+                assert!(
+                    !piece.ends_with(|c: char| c.is_alphanumeric()),
+                    "cut inside a token: {piece:?}"
+                );
+            }
+        }
+        // With no separator at all the cut still happens, at `max`.
+        let blob = "x".repeat(250);
+        assert_eq!(check(&blob, 100).len(), 3);
+    }
+
+    #[test]
+    fn ml_windows_overlap_and_cover() {
+        let text = "Ravi Kumar met Anna Schmidt in Pune. ".repeat(300);
+        let max = 500;
+        let wins = ml_windows(&text, max);
+        assert!(wins.len() > 1);
+        assert_eq!(wins[0].start, 0);
+        assert_eq!(wins.last().unwrap().end, text.len());
+        for w in &wins {
+            assert!(w.len() <= max, "{w:?}");
+            assert!(text.is_char_boundary(w.start) && text.is_char_boundary(w.end));
+        }
+        for pair in wins.windows(2) {
+            assert!(pair[1].start < pair[0].end, "no overlap: {pair:?}");
+            assert!(pair[0].end - pair[1].start + 4 >= ML_WINDOW_OVERLAP.min(max / 4) / 2);
+        }
+        // Every short substring is whole in some window.
+        let probe = 40;
+        for at in (0..text.len() - probe).filter(|&i| text.is_char_boundary(i)) {
+            assert!(
+                wins.iter().any(|w| w.start <= at && at + probe <= w.end),
+                "{at}"
+            );
+        }
+        assert_eq!(ml_windows("short", max), vec![Span::new(0, 5)]);
+        assert!(ml_windows("", max).is_empty());
+        let indic = "नमस्ते Ravi Kumar 🙏 ".repeat(200);
+        for w in ml_windows(&indic, 300) {
+            assert!(indic.is_char_boundary(w.start) && indic.is_char_boundary(w.end));
+        }
+    }
+
+    /// Windows cover `text`, stay within `max`, sit on char boundaries,
+    /// move forward and leave no gap.
+    fn check_windows(text: &str, max: usize) -> Vec<Span> {
+        let wins = ml_windows(text, max);
+        assert_eq!(wins.first().map(|w| w.start), Some(0));
+        assert_eq!(wins.last().map(|w| w.end), Some(text.len()));
+        for w in &wins {
+            assert!(w.start < w.end && w.len() <= max, "{w:?}");
+            assert!(text.is_char_boundary(w.start) && text.is_char_boundary(w.end));
+        }
+        for pair in wins.windows(2) {
+            assert!(
+                pair[0].start <= pair[1].start && pair[1].start <= pair[0].end,
+                "{pair:?}"
+            );
+        }
+        wins
+    }
+
+    #[test]
+    fn ml_windows_after_a_short_first_paragraph() {
+        // Agent tool output: a short heading, then one long unbroken line.
+        let json = format!(
+            "{{\"rows\":[{}]}}",
+            r#"{"name":"Ravi Kumar","phone":"9876543210"},"#.repeat(80)
+        );
+        assert!(!json.contains('\n') && json.len() > 3000);
+        check_windows(
+            &format!("Here's the output:\n{json}"),
+            DEFAULT_MAX_FRAGMENT_BYTES,
+        );
+        for n in 0..300 {
+            let text = format!("{}\n{json}", "a".repeat(n));
+            check_windows(&text, DEFAULT_MAX_FRAGMENT_BYTES);
+            let text = format!("{}\n\n{json}", "é".repeat(n / 2));
+            check_windows(&text, DEFAULT_MAX_FRAGMENT_BYTES);
+        }
     }
 
     #[test]

@@ -14,6 +14,8 @@ const INDIAN_LAST: &str = include_str!("../../data/indian_last.txt");
 const WESTERN_FIRST: &str = include_str!("../../data/western_first.txt");
 const WESTERN_LAST: &str = include_str!("../../data/western_last.txt");
 const WORDS: &str = include_str!("../../data/words.txt");
+/// Names never picked as stand-ins (see the file).
+const DENYLIST: &str = include_str!("../../data/name_denylist.txt");
 
 /// Titles kept verbatim when a name is replaced.
 const HONORIFICS: &[&str] = &[
@@ -47,6 +49,7 @@ pub(crate) fn lists() -> &'static Lists {
         let indian_last = parse(INDIAN_LAST);
         let western_first = parse(WESTERN_FIRST);
         let western_last = parse(WESTERN_LAST);
+        // Classification knows every name; stand-ins skip the deny-list.
         let indian = lower(&indian_first)
             .into_iter()
             .chain(lower(&indian_last))
@@ -55,11 +58,17 @@ pub(crate) fn lists() -> &'static Lists {
             .into_iter()
             .chain(lower(&western_last))
             .collect();
+        let denied: HashSet<String> = lower(&parse(DENYLIST)).into_iter().collect();
+        let pickable = |v: Vec<&'static str>| {
+            v.into_iter()
+                .filter(|w| !denied.contains(&w.to_lowercase()))
+                .collect::<Vec<_>>()
+        };
         Lists {
-            indian_first,
-            indian_last,
-            western_first,
-            western_last,
+            indian_first: pickable(indian_first),
+            indian_last: pickable(indian_last),
+            western_first: pickable(western_first),
+            western_last: pickable(western_last),
             words: parse(WORDS),
             indian,
             western,
@@ -266,6 +275,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn surrogate_names_are_not_words_people_write_for_other_reasons() {
+        // Each name word becomes its own mapping and restore matches words
+        // in any case, so "foster collaboration", "Maxwell's equations",
+        // "Graham scan" or "Murphy's law" would be rewritten in answers.
+        const NOT_NAMES: &[&str] = &[
+            "foster", "warren", "victor", "henry", "maxwell", "graham", "lambert", "dalton",
+            "gilbert", "johnson", "murphy", "kelly", "carter", "palmer", "tucker", "morgan",
+            "scott", "jenkins", "pearson", "reynolds", "hamilton", "marshall", "martin", "peter",
+            "roger", "oscar", "norman", "julian", "jasper", "hector", "danish", "shah", "khan",
+        ];
+        let l = lists();
+        for list in [
+            &l.indian_first,
+            &l.indian_last,
+            &l.western_first,
+            &l.western_last,
+        ] {
+            for w in list.iter() {
+                assert!(!NOT_NAMES.contains(&w.to_lowercase().as_str()), "{w}");
+            }
+        }
+        // They are still names when a real person has them.
+        assert!(is_western_name("Foster") && is_indian_name("Khan"));
     }
 
     #[test]

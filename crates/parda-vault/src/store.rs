@@ -7,10 +7,15 @@
 //! value can be found without being readable. Surrogates are stored in the
 //! clear (they are fake by construction and are what the LLM sees anyway).
 //! WAL mode and `secure_delete` are on; timestamps are unix seconds.
+//!
+//! Each ciphertext is sealed with associated data naming its row (scope,
+//! kind, `real_hmac`), and a decrypted value must hash to the row's
+//! `real_hmac`: a ciphertext copied into another row does not open there.
+//! Rows written by schema v1 (no associated data) are re-sealed on open.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parda_core::EntityKind;
@@ -18,7 +23,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::{Error, Result, VaultKey};
 
-const SCHEMA_VERSION: i64 = 1;
+/// v2: ciphertexts carry associated data (see [`row_aad`]).
+const SCHEMA_VERSION: i64 = 2;
 const KEY_CHECK_NAME: &str = "key_check";
 const KEY_CHECK_PLAINTEXT: &[u8] = b"parda-vault-key-check-v1";
 const SECS_PER_DAY: i64 = 86_400;
@@ -56,6 +62,20 @@ pub struct Store {
     conn: Mutex<Connection>,
     key: VaultKey,
     generation: AtomicU64,
+    /// Bumped (under the write lock) by every prune or wipe that removed
+    /// rows. Redactions hold the read lock, so rows cannot vanish while one
+    /// is choosing stand-ins, and they see the change on their next run.
+    deletions: RwLock<u64>,
+}
+
+/// Held while a redaction uses mappings: `prune` and `wipe` wait for it.
+pub struct RowsGuard<'a>(RwLockReadGuard<'a, u64>);
+
+impl RowsGuard<'_> {
+    /// The deletion generation (see [`Store::deletions`]).
+    pub fn deletions(&self) -> u64 {
+        *self.0
+    }
 }
 
 impl Store {
@@ -74,15 +94,68 @@ impl Store {
         conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0))?;
         conn.pragma_update(None, "secure_delete", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         conn.execute_batch(SCHEMA)?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         let store = Store {
             conn: Mutex::new(conn),
             key,
             generation: AtomicU64::new(0),
+            deletions: RwLock::new(0),
         };
         store.verify_or_init_key_check()?;
+        if version < SCHEMA_VERSION {
+            store.migrate_to_v2()?;
+        }
+        store
+            .conn()
+            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(store)
+    }
+
+    /// Re-seal v1 rows (no associated data) with their row's associated
+    /// data. A row whose value does not hash to its own index (a ciphertext
+    /// moved between rows) is left as is and never opens.
+    fn migrate_to_v2(&self) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows: Vec<RowidRow> = {
+            let mut stmt =
+                tx.prepare("SELECT rowid, scope, kind, real_hmac, nonce, real_ct FROM mappings")?;
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let (mut resealed, mut rejected) = (0usize, 0usize);
+        for (rowid, scope, kind, h, nonce, ct) in rows {
+            let aad = row_aad(&scope, &kind, &h);
+            if self.key.decrypt_aad(&nonce, &ct, &aad).is_ok() {
+                continue;
+            }
+            match self.key.decrypt(&nonce, &ct) {
+                Ok(pt) if self.key.hmac(&pt)[..] == h[..] => {
+                    let (nonce, ct) = self.key.encrypt_aad(&pt, &aad);
+                    tx.execute(
+                        "UPDATE mappings SET nonce = ?1, real_ct = ?2 WHERE rowid = ?3",
+                        params![nonce, ct, rowid],
+                    )?;
+                    resealed += 1;
+                }
+                _ => rejected += 1,
+            }
+        }
+        tx.commit()?;
+        if resealed + rejected > 0 {
+            tracing::info!(resealed, rejected, "vault rows migrated to schema v2");
+        }
+        Ok(())
     }
 
     fn verify_or_init_key_check(&self) -> Result<()> {
@@ -135,6 +208,27 @@ impl Store {
         self.generation.load(Ordering::SeqCst)
     }
 
+    /// A counter that increases whenever a prune or wipe removed rows. An
+    /// in-memory view of the mappings built under an older value may hold
+    /// mappings that no longer exist and must be rebuilt.
+    pub fn deletions(&self) -> u64 {
+        *self
+            .deletions
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keep `prune` and `wipe` out until the guard is dropped. Do not call
+    /// [`Store::deletions`], `prune` or `wipe` on the same thread while
+    /// holding it (use [`RowsGuard::deletions`]).
+    pub fn hold_rows(&self) -> RowsGuard<'_> {
+        RowsGuard(
+            self.deletions
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
     /// The seed for the deterministic surrogate generator (HKDF subkey
     /// `"parda-seed"` of the vault key). Convenience so callers that only hold
     /// a `Store` need not keep a second copy of the key.
@@ -157,16 +251,22 @@ impl Store {
 
     /// The real value (and its kind) behind `surrogate` in `scope`.
     pub fn get_real(&self, scope: &str, surrogate: &str) -> Result<Option<(String, EntityKind)>> {
-        let row: Option<(String, Vec<u8>, Vec<u8>)> = self
+        let row: Option<SealedRow> = self
             .conn()
             .query_row(
-                "SELECT kind, nonce, real_ct FROM mappings WHERE scope = ?1 AND surrogate = ?2",
+                "SELECT kind, real_hmac, nonce, real_ct FROM mappings
+                 WHERE scope = ?1 AND surrogate = ?2",
                 params![scope, surrogate],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        row.map(|(kind, nonce, ct)| Ok((self.decrypt_text(&nonce, &ct)?, parse_kind(&kind))))
-            .transpose()
+        row.map(|(kind, h, nonce, ct)| {
+            Ok((
+                self.open_row(scope, &kind, &h, &nonce, &ct)?,
+                parse_kind(&kind),
+            ))
+        })
+        .transpose()
     }
 
     /// Record `real -> surrogate` in `scope`.
@@ -187,7 +287,10 @@ impl Store {
             return Err(Error::SurrogateTaken);
         }
         let h = self.key.hmac(real.as_bytes());
-        let (nonce, ct) = self.key.encrypt(real.as_bytes());
+        let kind = kind.to_string();
+        let (nonce, ct) = self
+            .key
+            .encrypt_aad(real.as_bytes(), &row_aad(scope, &kind, &h));
         let ts = now();
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -217,7 +320,7 @@ impl Store {
             "INSERT INTO mappings
                  (scope, kind, real_hmac, real_ct, nonce, surrogate, created_at, last_used_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-            params![scope, kind.to_string(), &h[..], ct, nonce, surrogate, ts],
+            params![scope, kind, &h[..], ct, nonce, surrogate, ts],
         )?;
         tx.commit()?;
         drop(conn);
@@ -238,20 +341,20 @@ impl Store {
     /// automaton. A row that fails authentication (corrupt or tampered) is
     /// skipped rather than failing the whole restore.
     pub fn reverse_map(&self, scope: &str) -> Result<Vec<(String, String, EntityKind)>> {
-        let rows: Vec<(String, String, Vec<u8>, Vec<u8>)> = {
+        let rows: Vec<SurrogateRow> = {
             let conn = self.conn();
             let mut stmt = conn.prepare_cached(
-                "SELECT surrogate, kind, nonce, real_ct FROM mappings
+                "SELECT surrogate, kind, real_hmac, nonce, real_ct FROM mappings
                  WHERE scope = ?1 ORDER BY rowid",
             )?;
             stmt.query_map([scope], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?
             .collect::<rusqlite::Result<_>>()?
         };
         let mut out = Vec::with_capacity(rows.len());
-        for (surrogate, kind, nonce, ct) in rows {
-            match self.decrypt_text(&nonce, &ct) {
+        for (surrogate, kind, h, nonce, ct) in rows {
+            match self.open_row(scope, &kind, &h, &nonce, &ct) {
                 Ok(real) => out.push((surrogate, real, parse_kind(&kind))),
                 Err(_) => tracing::warn!(
                     scope,
@@ -275,6 +378,10 @@ impl Store {
     /// Delete mappings not used for `ttl_days` days. `0` disables expiry.
     /// Returns the number of rows removed.
     pub fn prune(&self, ttl_days: u32) -> Result<usize> {
+        let mut deletions = self
+            .deletions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         let removed = if ttl_days == 0 {
             0
         } else {
@@ -284,12 +391,19 @@ impl Store {
             checkpoint(&conn);
             n
         };
+        if removed > 0 {
+            *deletions += 1;
+        }
         self.bump();
         Ok(removed)
     }
 
     /// Delete every mapping, or only those of `scope`. Returns rows removed.
     pub fn wipe(&self, scope: Option<&str>) -> Result<usize> {
+        let mut deletions = self
+            .deletions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         let removed = {
             let conn = self.conn();
             let n = match scope {
@@ -299,6 +413,9 @@ impl Store {
             checkpoint(&conn);
             n
         };
+        if removed > 0 {
+            *deletions += 1;
+        }
         self.bump();
         Ok(removed)
     }
@@ -317,10 +434,41 @@ impl Store {
             .collect())
     }
 
-    fn decrypt_text(&self, nonce: &[u8], ct: &[u8]) -> Result<String> {
-        String::from_utf8(self.key.decrypt(nonce, ct)?)
-            .map_err(|_| Error::Crypto("stored value is not valid UTF-8".into()))
+    /// Decrypt a row's real value: sealed for this row, and hashing to the
+    /// row's own index.
+    fn open_row(
+        &self,
+        scope: &str,
+        kind: &str,
+        h: &[u8],
+        nonce: &[u8],
+        ct: &[u8],
+    ) -> Result<String> {
+        let pt = self.key.decrypt_aad(nonce, ct, &row_aad(scope, kind, h))?;
+        if self.key.hmac(&pt)[..] != h[..] {
+            return Err(Error::Crypto("stored value does not match its row".into()));
+        }
+        String::from_utf8(pt).map_err(|_| Error::Crypto("stored value is not valid UTF-8".into()))
     }
+}
+
+/// `kind, real_hmac, nonce, real_ct`.
+type SealedRow = (String, Vec<u8>, Vec<u8>, Vec<u8>);
+/// `surrogate` followed by a [`SealedRow`].
+type SurrogateRow = (String, String, Vec<u8>, Vec<u8>, Vec<u8>);
+/// `rowid, scope` followed by a [`SealedRow`].
+type RowidRow = (i64, String, String, Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// Associated data binding a ciphertext to its row: scope, kind and the
+/// value's blind index, each length-prefixed.
+fn row_aad(scope: &str, kind: &str, real_hmac: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(16 + scope.len() + kind.len() + real_hmac.len());
+    aad.extend_from_slice(b"parda-row-v2");
+    for part in [scope.as_bytes(), kind.as_bytes(), real_hmac] {
+        aad.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        aad.extend_from_slice(part);
+    }
+    aad
 }
 
 fn parse_kind(s: &str) -> EntityKind {
@@ -612,6 +760,107 @@ mod tests {
         assert!(g2 > g1);
         s.wipe(None).unwrap();
         assert!(s.generation() > g2);
+    }
+
+    fn swap_ciphertexts(s: &Store, a: &str, b: &str) {
+        let c = s.conn.lock().unwrap();
+        let get = |sur: &str| -> (Vec<u8>, Vec<u8>) {
+            c.query_row(
+                "SELECT nonce, real_ct FROM mappings WHERE surrogate = ?1",
+                [sur],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let (na, ca) = get(a);
+        let (nb, cb) = get(b);
+        let set = |sur: &str, n: &[u8], ct: &[u8]| {
+            c.execute(
+                "UPDATE mappings SET nonce = ?1, real_ct = ?2 WHERE surrogate = ?3",
+                params![n, ct, sur],
+            )
+            .unwrap();
+        };
+        set(a, &nb, &cb);
+        set(b, &na, &ca);
+    }
+
+    #[test]
+    fn ciphertext_swapped_between_rows_is_rejected() {
+        let (_d, s) = open_tmp();
+        s.insert("global", &EntityKind::Person, "Ravi", "Arjun")
+            .unwrap();
+        s.insert("global", &EntityKind::Person, "Amit", "Vikram")
+            .unwrap();
+        swap_ciphertexts(&s, "Arjun", "Vikram");
+        assert!(s.get_real("global", "Arjun").is_err());
+        assert!(s.reverse_map("global").unwrap().is_empty());
+    }
+
+    #[test]
+    fn rows_written_without_aad_are_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("v.db");
+        let key = VaultKey::from_bytes([3; 32]);
+        {
+            let s = Store::open(&p, key.clone()).unwrap();
+            let c = s.conn.lock().unwrap();
+            // Rows as v0.1 wrote them (no associated data); the last two
+            // with their ciphertexts swapped.
+            for (indexed, encrypted, sur) in [
+                ("Ravi", "Ravi", "Arjun"),
+                ("Amit", "Neha", "Vikram"),
+                ("Neha", "Amit", "Kavya"),
+            ] {
+                let (nonce, ct) = key.encrypt(encrypted.as_bytes());
+                c.execute(
+                    "INSERT INTO mappings (scope, kind, real_hmac, real_ct, nonce, surrogate,
+                       created_at, last_used_at) VALUES ('global', 'Person', ?1, ?2, ?3, ?4, 1, 1)",
+                    params![&key.hmac(indexed.as_bytes())[..], ct, nonce, sur],
+                )
+                .unwrap();
+            }
+            c.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let s = Store::open(&p, key.clone()).unwrap();
+        assert_eq!(
+            s.get_real("global", "Arjun").unwrap(),
+            Some(("Ravi".into(), EntityKind::Person))
+        );
+        let rows = s.reverse_map("global").unwrap();
+        assert_eq!(
+            rows,
+            vec![("Arjun".into(), "Ravi".into(), EntityKind::Person)]
+        );
+        // Re-encrypted with associated data: the legacy form no longer opens.
+        let (nonce, ct): (Vec<u8>, Vec<u8>) = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT nonce, real_ct FROM mappings WHERE surrogate = 'Arjun'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(key.decrypt(&nonce, &ct).is_err());
+    }
+
+    #[test]
+    fn deletions_count_only_removals() {
+        let (_d, s) = open_tmp();
+        assert_eq!(s.deletions(), 0);
+        s.insert("global", &EntityKind::Person, "R", "S").unwrap();
+        s.prune(30).unwrap();
+        assert_eq!(s.deletions(), 0, "nothing expired");
+        s.wipe(Some("other")).unwrap();
+        assert_eq!(s.deletions(), 0);
+        {
+            let g = s.hold_rows();
+            assert_eq!(g.deletions(), 0);
+        }
+        s.wipe(None).unwrap();
+        assert_eq!(s.deletions(), 1);
     }
 
     #[test]

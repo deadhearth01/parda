@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
+use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -90,12 +90,29 @@ impl VaultKey {
     /// Decrypt and authenticate. Fails on a wrong key, wrong nonce length or
     /// any modification of the ciphertext.
     pub fn decrypt(&self, nonce: &[u8], ct: &[u8]) -> Result<Vec<u8>> {
+        self.decrypt_aad(nonce, ct, b"")
+    }
+
+    /// [`encrypt`](Self::encrypt) with associated data: the ciphertext only
+    /// opens with the same `aad` (binds it to where it is stored).
+    pub fn encrypt_aad(&self, pt: &[u8], aad: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let cipher = XChaCha20Poly1305::new((&self.0).into());
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let ct = cipher
+            .encrypt(&nonce, Payload { msg: pt, aad })
+            .expect("XChaCha20-Poly1305 encryption of an in-memory buffer cannot fail");
+        (nonce.to_vec(), ct)
+    }
+
+    /// [`decrypt`](Self::decrypt) with associated data; fails if `aad`
+    /// differs from what the ciphertext was sealed with.
+    pub fn decrypt_aad(&self, nonce: &[u8], ct: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         if nonce.len() != NONCE_LEN {
             return Err(Error::Crypto("invalid nonce length".into()));
         }
         let cipher = XChaCha20Poly1305::new((&self.0).into());
         cipher
-            .decrypt(XNonce::from_slice(nonce), ct)
+            .decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad })
             .map_err(|_| Error::Crypto("authentication failed".into()))
     }
 }
@@ -109,6 +126,15 @@ mod tests {
         let k = VaultKey::generate();
         let (n, c) = k.encrypt(b"Ravi");
         assert_eq!(k.decrypt(&n, &c).unwrap(), b"Ravi");
+    }
+
+    #[test]
+    fn associated_data_must_match() {
+        let k = VaultKey::generate();
+        let (n, c) = k.encrypt_aad(b"Ravi", b"row-1");
+        assert_eq!(k.decrypt_aad(&n, &c, b"row-1").unwrap(), b"Ravi");
+        assert!(k.decrypt_aad(&n, &c, b"row-2").is_err());
+        assert!(k.decrypt(&n, &c).is_err());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
-use crate::{Error, Result, VaultKey};
+use crate::{Error, Result, Store, VaultKey};
 
 /// Keyring service name.
 pub const KEYRING_SERVICE: &str = "parda";
@@ -16,6 +16,10 @@ pub const KEYRING_SERVICE: &str = "parda";
 pub const KEYRING_USER: &str = "vault-key";
 /// File name of the fallback key file inside the data directory.
 pub const KEY_FILE_NAME: &str = "vault.key";
+/// Lock file serialising key creation between processes.
+pub const LOCK_FILE_NAME: &str = "vault.key.lock";
+/// The vault database the key belongs to.
+const VAULT_DB_NAME: &str = "vault.db";
 
 /// Where the key was found or created (`parda doctor` reports this).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,21 +37,21 @@ pub enum KeySource {
 /// key lives in `<data_dir>/vault.key` (mode `0600` on Unix). A key file or
 /// keyring entry that exists but is malformed is an error - it is never
 /// silently replaced, because that would orphan the vault.
+///
+/// Key creation is serialised by a lock file, so two processes starting at
+/// once agree on one key. No key is ever created for a `vault.db` that
+/// already holds data (its key is missing: an error, not a fresh key that
+/// could never open it). When a keyring write cannot be read back, the same
+/// key is also written to `vault.key`, so the two can never disagree.
 pub fn load_or_create_key(data_dir: &Path, use_keyring: bool) -> Result<(VaultKey, KeySource)> {
     fs::create_dir_all(data_dir)?;
+    let _lock = lock_dir(data_dir)?;
     let file = data_dir.join(KEY_FILE_NAME);
+    let mut keyring_works = false;
     if use_keyring {
         match os_keyring::get() {
             Lookup::Found(key) => return Ok((key, KeySource::Keyring)),
-            Lookup::Missing => {
-                if file.exists() {
-                    return load_or_create_file(&file);
-                }
-                let key = VaultKey::generate();
-                if os_keyring::set(&key) {
-                    return Ok((key, KeySource::Keyring));
-                }
-            }
+            Lookup::Missing => keyring_works = true,
             Lookup::Corrupt => {
                 return Err(Error::Key(
                     "corrupt keyring entry (expected 64 hex characters)".into(),
@@ -56,7 +60,91 @@ pub fn load_or_create_key(data_dir: &Path, use_keyring: bool) -> Result<(VaultKe
             Lookup::Unavailable => {}
         }
     }
-    load_or_create_file(&file)
+    if let Some(key) = read_key_file(&file)? {
+        return Ok((key, KeySource::File(file)));
+    }
+    if vault_has_data(data_dir) {
+        return Err(Error::Key(format!(
+            "{} exists but its key is in neither the keyring nor {}; restore the key, \
+             or run `parda vault reset` to start over (all mappings are lost)",
+            data_dir.join(VAULT_DB_NAME).display(),
+            file.display()
+        )));
+    }
+    let key = VaultKey::generate();
+    if keyring_works {
+        if os_keyring::set(&key) {
+            return Ok((key, KeySource::Keyring));
+        }
+        // The write may have persisted although it did not read back.
+        if let Lookup::Found(k) = os_keyring::get() {
+            return Ok((k, KeySource::Keyring));
+        }
+    }
+    // Same key into the file: if the keyring did keep it, both agree.
+    load_or_create_file(&file, key)
+}
+
+/// Open `<data_dir>/vault.db` with its key (see [`load_or_create_key`]). If
+/// that key does not open the vault but the other key store holds one that
+/// does (the two disagree after an earlier failure), that one is used.
+pub fn open_vault(data_dir: &Path, use_keyring: bool) -> Result<(Store, KeySource)> {
+    let (key, src) = load_or_create_key(data_dir, use_keyring)?;
+    let file = data_dir.join(KEY_FILE_NAME);
+    let mut candidates = vec![(key, src.clone())];
+    if use_keyring
+        && src != KeySource::Keyring
+        && let Lookup::Found(k) = os_keyring::get()
+    {
+        candidates.push((k, KeySource::Keyring));
+    }
+    if src == KeySource::Keyring
+        && let Ok(Some(k)) = read_key_file(&file)
+    {
+        candidates.push((k, KeySource::File(file)));
+    }
+    open_with_keys(&data_dir.join(VAULT_DB_NAME), candidates)
+}
+
+/// Open the vault at `db` with the first candidate key that fits.
+pub(crate) fn open_with_keys(
+    db: &Path,
+    candidates: Vec<(VaultKey, KeySource)>,
+) -> Result<(Store, KeySource)> {
+    let mut first = true;
+    for (key, src) in candidates {
+        match Store::open(db, key) {
+            Ok(store) => {
+                if !first {
+                    tracing::warn!(source = ?src, "vault opened with the key from the other key store");
+                }
+                return Ok((store, src));
+            }
+            Err(Error::WrongKey) => first = false,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::WrongKey)
+}
+
+/// Does `<data_dir>/vault.db` hold anything (SQLite writes its header on
+/// first use; the file is pre-created empty)?
+fn vault_has_data(data_dir: &Path) -> bool {
+    fs::metadata(data_dir.join(VAULT_DB_NAME)).is_ok_and(|m| m.len() > 0)
+}
+
+/// Exclusive lock on `<data_dir>/vault.key.lock`, released on drop.
+fn lock_dir(data_dir: &Path) -> Result<fs::File> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts.open(data_dir.join(LOCK_FILE_NAME))?;
+    f.lock()?;
+    Ok(f)
 }
 
 /// Where an existing key would be loaded from, without creating one (for
@@ -90,11 +178,11 @@ pub fn delete_key(data_dir: &Path, use_keyring: bool) -> Result<()> {
     }
 }
 
-fn load_or_create_file(path: &Path) -> Result<(VaultKey, KeySource)> {
+/// The key in `path`, or `key` written there if there is none yet.
+fn load_or_create_file(path: &Path, key: VaultKey) -> Result<(VaultKey, KeySource)> {
     if let Some(key) = read_key_file(path)? {
         return Ok((key, KeySource::File(path.to_path_buf())));
     }
-    let key = VaultKey::generate();
     match write_new_key_file(path, &key) {
         Ok(()) => Ok((key, KeySource::File(path.to_path_buf()))),
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
@@ -297,6 +385,60 @@ mod tests {
             b"too short",
             "must not overwrite a bad key file"
         );
+    }
+
+    #[test]
+    fn existing_vault_without_its_key_is_an_error_not_a_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (key, _) = load_or_create_key(dir.path(), false).unwrap();
+            let s = crate::Store::open(&dir.path().join("vault.db"), key).unwrap();
+            s.insert("global", &parda_core::EntityKind::Person, "Ravi", "Arjun")
+                .unwrap();
+        }
+        std::fs::remove_file(dir.path().join("vault.key")).unwrap();
+        let err = load_or_create_key(dir.path(), false).unwrap_err();
+        assert!(err.to_string().contains("vault reset"), "{err}");
+        assert!(
+            !dir.path().join("vault.key").exists(),
+            "must not mint a key that cannot open the vault"
+        );
+    }
+
+    #[test]
+    fn a_key_that_does_not_open_the_vault_falls_back_to_the_other_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("vault.db");
+        let right = VaultKey::from_bytes([1; 32]);
+        crate::Store::open(&db, right.clone()).unwrap();
+        let wrong = VaultKey::from_bytes([2; 32]);
+        let file = KeySource::File(dir.path().join("vault.key"));
+        let (_, src) = open_with_keys(
+            &db,
+            vec![(wrong.clone(), file.clone()), (right, KeySource::Keyring)],
+        )
+        .unwrap();
+        assert_eq!(src, KeySource::Keyring);
+        assert!(matches!(
+            open_with_keys(&db, vec![(wrong, file)]),
+            Err(Error::WrongKey)
+        ));
+    }
+
+    #[test]
+    fn concurrent_first_starts_agree_on_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let keys: Vec<[u8; 32]> = (0..8)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || load_or_create_key(&p, false).unwrap().0.hmac(b"probe"))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        assert!(keys.windows(2).all(|w| w[0] == w[1]));
     }
 
     #[test]

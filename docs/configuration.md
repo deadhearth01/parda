@@ -48,6 +48,10 @@ log_values = false
 ```
 
 Kinds: `Person Email Phone Address Url IpAddress MacAddress CreditCard Iban BankAccount Ifsc Aadhaar Pan Gstin Upi VoterId DrivingLicence IndianVehicleReg Passport UsSsn UkNino DateOfBirth Secret Organization`, plus any custom kind you use in `rules.toml`.
+Built-in names ignore case and `_` / `-` / spaces (`secret`, `IP_ADDRESS` work); any other key is
+taken as a custom kind exactly as written, so it must match the `kind` in `rules.toml`. A key one or
+two letters away from a built-in name (`Aadhar`, `Pasport`) is almost certainly a typo: it names a
+custom kind nothing detects, and the built-in kind keeps its default action.
 
 ## Changing settings
 
