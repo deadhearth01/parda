@@ -25,6 +25,7 @@ rustls-pki-types.workspace = true
 rcgen.workspace = true
 time = "0.3"
 rand.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 # The fake upstream speaks HTTP/2 like real AI sites.

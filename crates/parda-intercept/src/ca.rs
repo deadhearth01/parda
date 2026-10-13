@@ -17,6 +17,7 @@ use rustls::sign::CertifiedKey;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use time::{Duration, OffsetDateTime};
+use zeroize::Zeroizing;
 
 const CA_NAME: &str = "parda local interception CA";
 const CA_VALIDITY_DAYS: i64 = 3653;
@@ -97,8 +98,9 @@ impl Ca {
         self.cert_pem.clone()
     }
 
-    pub fn key_pem(&self) -> String {
-        self.issuer.key().serialize_pem()
+    /// The CA private key (PKCS#8 PEM), wiped from memory when dropped.
+    pub fn key_pem(&self) -> Zeroizing<String> {
+        Zeroizing::new(self.issuer.key().serialize_pem())
     }
 
     /// The CA certificate in DER form.
@@ -251,7 +253,9 @@ mod tests {
     fn pem_round_trip_signs_leaves_the_original_cert_vouches_for() {
         let ca = Ca::generate().unwrap();
         assert!(ca.cert_pem().contains("BEGIN CERTIFICATE"));
-        assert!(ca.key_pem().contains("PRIVATE KEY"));
+        // The key text is wiped from memory when dropped.
+        let key: zeroize::Zeroizing<String> = ca.key_pem();
+        assert!(key.contains("PRIVATE KEY"));
         let again = Ca::from_pem(&ca.cert_pem(), &ca.key_pem()).unwrap();
         assert_eq!(again.cert_pem(), ca.cert_pem());
         let leaf = again.leaf_for("claude.ai").unwrap();
