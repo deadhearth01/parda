@@ -391,3 +391,36 @@ async fn unknown_parts_are_unscanned_and_blocked_by_policy() {
     assert_eq!(body["error"]["type"], "parda_unscanned_media");
     assert_eq!(s.mock.count(), 0);
 }
+
+#[tokio::test]
+async fn tags_reach_upstream_and_real_values_come_back() {
+    let s = setup_with(
+        responder(|seen| {
+            // Echo what the upstream received.
+            let text = seen.json()["messages"][0]["content"].as_str().unwrap_or("").to_string();
+            Reply::Json(
+                StatusCode::OK,
+                json!({"type": "message", "role": "assistant", "content": [{"type": "text", "text": format!("You said: {text}")}]}),
+            )
+        }),
+        |c| c.replace.style = parda_core::Style::Token,
+        None,
+    )
+    .await;
+    let resp: Value = s
+        .client
+        .post(s.url("/v1/messages"))
+        .json(&json!({"model": "m", "max_tokens": 50, "messages": [{"role": "user", "content": "Mail ravi.k@gmail.com or call +91 98765 43210"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let upstream = s.mock.seen.lock().unwrap()[0].json()["messages"][0]["content"].clone();
+    assert_eq!(upstream, json!("Mail [EMAIL_1] or call [PHONE_1]"));
+    assert_eq!(
+        resp["content"][0]["text"],
+        json!("You said: Mail ravi.k@gmail.com or call +91 98765 43210")
+    );
+}

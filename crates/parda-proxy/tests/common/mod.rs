@@ -185,6 +185,9 @@ pub async fn setup_with(
     config.detect.model = "none".into();
     config.proxy.anthropic_upstream = format!("http://{}", mock.addr);
     config.proxy.openai_upstream = format!("http://{}", mock.addr);
+    // Most tests locate the stand-in by shape (e.g. an e-mail address); tag
+    // style has its own tests and is selected through `tweak`.
+    config.replace.style = parda_core::Style::Surrogate;
     tweak(&mut config);
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::open(
