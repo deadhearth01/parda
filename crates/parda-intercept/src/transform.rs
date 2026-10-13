@@ -21,6 +21,9 @@ pub struct RequestOutcome {
     pub counts: BTreeMap<String, u32>,
     /// Parts forwarded without being scanned (images, binary files, …).
     pub unscanned: u32,
+    /// The request target (path and query) to send upstream, when the
+    /// transform rewrote it; `None` keeps the one the client sent.
+    pub target: Option<String>,
 }
 
 /// Rewrites bodies of decrypted traffic: requests on the way out, responses
@@ -61,6 +64,40 @@ pub trait BodyTransform: Send + Sync + 'static {
                 ..RequestOutcome::default()
             })
     }
+
+    /// The request target (path and query string) to send upstream. The
+    /// default keeps it unchanged.
+    fn request_target(&self, host: &str, path_and_query: &str) -> Result<String, Refusal> {
+        let _ = host;
+        Ok(path_and_query.to_string())
+    }
+
+    /// One whole request, target and body together, so an engine-backed
+    /// transform can redact all of its text in one batch. The server calls
+    /// this (on the blocking pool); `body` may be empty. The default calls
+    /// [`BodyTransform::request_target`] and, for a non-empty body,
+    /// [`BodyTransform::request_outcome`].
+    fn rewrite_request(
+        &self,
+        host: &str,
+        path_and_query: &str,
+        headers: &http::HeaderMap,
+        body: Bytes,
+    ) -> Result<RequestOutcome, Refusal> {
+        let target = self.request_target(host, path_and_query)?;
+        let path = path_and_query
+            .split_once('?')
+            .map_or(path_and_query, |(p, _)| p);
+        let mut out = if body.is_empty() {
+            RequestOutcome::default()
+        } else {
+            self.request_outcome(host, path, headers, body)?
+        };
+        if target != path_and_query {
+            out.target = Some(target);
+        }
+        Ok(out)
+    }
 }
 
 /// Rewrites one response body chunk by chunk, without buffering it whole.
@@ -70,6 +107,11 @@ pub trait StreamTransform: Send {
     fn push(&mut self, chunk: &[u8]) -> Bytes;
     /// The end of the body: return anything still held back.
     fn finish(&mut self) -> Bytes;
+    /// True if this rewriter never changes a byte: the server then streams
+    /// the body without calling it.
+    fn is_passthrough(&self) -> bool {
+        false
+    }
 }
 
 /// An identity transform for unit tests only: it would forward a compressed
