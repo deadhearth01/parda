@@ -123,10 +123,14 @@ pub fn from_proxy(ev: &ProxyEvent) -> Event {
             }
         }
     }
+    if ev.passthrough {
+        summary.push_str(" · passed through unfiltered (proxy.passthrough_paths)");
+    }
     let mut e = Event::now("proxy", summary);
     e.counts = ev.counts.clone();
     e.latency_ms = Some(ev.added_ms);
-    if ev.error.is_some() || ev.status >= 400 || ev.paused || ev.unknown_parts > 0 {
+    if ev.error.is_some() || ev.status >= 400 || ev.paused || ev.passthrough || ev.unknown_parts > 0
+    {
         e.level = "warn".into();
     }
     e
@@ -235,6 +239,7 @@ mod tests {
             status: 200,
             streaming: true,
             paused: false,
+            passthrough: false,
             error: None,
         };
         let e = from_proxy(&ev);
@@ -255,6 +260,19 @@ mod tests {
                 .contains("2 part(s) of unknown type sent unscanned")
         );
         assert_eq!(unknown.level, "warn");
+        let passed = from_proxy(&ProxyEvent {
+            passthrough: true,
+            counts: BTreeMap::new(),
+            ..ev.clone()
+        });
+        assert!(
+            passed
+                .summary
+                .contains("passed through unfiltered (proxy.passthrough_paths)"),
+            "{}",
+            passed.summary
+        );
+        assert_eq!(passed.level, "warn");
         let paused = from_proxy(&ProxyEvent {
             paused: true,
             counts: BTreeMap::new(),

@@ -292,3 +292,91 @@ async fn unknown_endpoints_without_text_pass_through() {
     assert_eq!(resp.status(), 200);
     assert_eq!(s.mock.count(), 3);
 }
+
+#[tokio::test]
+async fn passthrough_paths_opt_in_forwards_unknown_endpoints_with_a_warning() {
+    let mut s = setup_with(
+        echo(),
+        |c| {
+            c.proxy.passthrough_paths = vec![
+                "/api/*".into(),
+                "/v1/files".into(),
+                // Endpoints parda redacts are never passed through.
+                "/v1/chat/completions".into(),
+                "/v1/messages/*".into(),
+            ];
+        },
+        None,
+    )
+    .await;
+    let text = json!({"model": "llama3", "prompt": "Ravi Kumar"});
+
+    // Prefix entry, exact entry, and a path that only normalises to a match.
+    for (path, canonical) in [
+        ("/api/generate", "/api/generate"),
+        ("/api/chat/sub", "/api/chat/sub"),
+        ("//api/%67enerate", "/api/generate"),
+        ("/v1/files", "/v1/files"),
+    ] {
+        let resp = post_openai(&s, path, &text).await;
+        assert_eq!(resp.status(), 200, "{path}");
+        let seen = s.mock.last();
+        assert_eq!(seen.path, canonical, "{path}");
+        assert!(seen.text().contains("Ravi Kumar"), "{path} forwarded as is");
+        let ev = s.events.recv().await.unwrap();
+        assert!(ev.passthrough, "{path}: {ev:?}");
+        assert_eq!(ev.status, 200);
+        assert_eq!(ev.error, None);
+    }
+    let forwarded = s.mock.count();
+
+    // Everything else is still refused.
+    for path in ["/api", "/v1/files/f1", "/v1/threads/t1/messages", "/apiary"] {
+        let resp = post_openai(&s, path, &text).await;
+        assert_eq!(resp.status(), 400, "{path}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "parda_unknown_endpoint", "{path}");
+        let ev = s.events.recv().await.unwrap();
+        assert!(!ev.passthrough, "{path}");
+    }
+    assert_eq!(s.mock.count(), forwarded);
+
+    // A listed path that parda knows how to redact is redacted, not passed through.
+    let resp = post_openai(
+        &s,
+        "/v1/chat/completions",
+        &json!({"model": "m", "messages": [{"role": "user", "content": "Ravi Kumar"}]}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_clean(&s);
+    assert!(!s.events.recv().await.unwrap().passthrough);
+    let resp = s
+        .post(
+            "/v1/messages/batches",
+            &json!({"requests": [{"custom_id": "a", "params": {"model": "m", "max_tokens": 5,
+                "messages": [{"role": "user", "content": "Ravi Kumar"}]}}]}),
+        )
+        .await;
+    assert_eq!(resp.status(), 200);
+    assert_clean(&s);
+    assert!(!s.events.recv().await.unwrap().passthrough);
+    // Listing a redacted path does not open it to other methods either.
+    let resp = s
+        .client
+        .put(s.url("/v1/chat/completions"))
+        .json(&text)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(!s.events.recv().await.unwrap().passthrough);
+}
+
+#[tokio::test]
+async fn nothing_is_passed_through_by_default() {
+    let s = setup(echo()).await;
+    let resp = post_openai(&s, "/api/generate", &json!({"prompt": "Ravi Kumar"})).await;
+    assert_eq!(resp.status(), 400);
+    assert_eq!(s.mock.count(), 0);
+}

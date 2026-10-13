@@ -56,6 +56,9 @@ pub struct ProxyEvent {
     pub streaming: bool,
     /// Protection was switched off: the request went upstream unfiltered.
     pub paused: bool,
+    /// The path is listed in `proxy.passthrough_paths`: the request was
+    /// forwarded unfiltered (a warning).
+    pub passthrough: bool,
     pub error: Option<String>,
 }
 

@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::body::{self, BodyError};
 use crate::error::error_response;
 use crate::route::{Provider, route};
-use crate::route::{SUPPORTED, normalize_path};
+use crate::route::{SUPPORTED, normalize_path, passthrough_listed};
 use crate::sse::{Restorers, StreamRewriter};
 use crate::walk::{Unscanned, Visit, leaves, preserve_numbers};
 use crate::{
@@ -399,6 +399,13 @@ fn finish(
         streaming = event.streaming,
         "proxied request"
     );
+    if event.passthrough {
+        tracing::warn!(
+            provider = event.provider,
+            path = %event.path,
+            "passed through unfiltered (proxy.passthrough_paths)"
+        );
+    }
     let _ = state.events.send(event);
     resp
 }
@@ -425,6 +432,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         status: 0,
         streaming: false,
         paused: false,
+        passthrough: false,
         error: None,
     };
 
@@ -446,24 +454,32 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         }
     };
 
-    // An endpoint parda cannot redact may only carry bodies without text.
-    if !provider.rewrites() && !body.is_empty() {
-        let (headers, body2, max) = (parts.headers.clone(), body.clone(), cfg.max_body_bytes);
-        let no_text = tokio::task::spawn_blocking(move || carries_no_text(&headers, &body2, max))
-            .await
-            .unwrap_or(false);
-        if !no_text {
-            let resp = error_response(
-                provider,
-                StatusCode::BAD_REQUEST,
-                "parda_unknown_endpoint",
-                &format!(
-                    "parda does not know which fields of {} {path} carry text, so it cannot \
-                     redact them; the request was not sent. Endpoints parda redacts: {SUPPORTED}",
-                    parts.method
-                ),
-            );
-            return finish(&state, event, resp, Some("parda_unknown_endpoint".into()));
+    // An endpoint parda cannot redact may only carry bodies without text,
+    // unless the user listed its path in `proxy.passthrough_paths`.
+    if !provider.rewrites() {
+        if passthrough_listed(&cfg.passthrough_paths, &path) {
+            event.passthrough = true;
+        } else if !body.is_empty() {
+            let (headers, body2, max) = (parts.headers.clone(), body.clone(), cfg.max_body_bytes);
+            let no_text =
+                tokio::task::spawn_blocking(move || carries_no_text(&headers, &body2, max))
+                    .await
+                    .unwrap_or(false);
+            if !no_text {
+                let resp = error_response(
+                    provider,
+                    StatusCode::BAD_REQUEST,
+                    "parda_unknown_endpoint",
+                    &format!(
+                        "parda does not know which fields of {} {path} carry text, so it cannot \
+                         redact them; the request was not sent. Endpoints parda redacts: \
+                         {SUPPORTED}. To forward this path unfiltered, list it in \
+                         proxy.passthrough_paths.",
+                        parts.method
+                    ),
+                );
+                return finish(&state, event, resp, Some("parda_unknown_endpoint".into()));
+            }
         }
     }
 
