@@ -11,6 +11,31 @@
 
 use parda_engine::{Engine, StreamRestorer};
 
+/// Restores the text of one JSON string value as it arrives in pieces.
+pub trait ValueRestorer: Send {
+    /// Restore the next piece; may hold back a possible surrogate prefix.
+    fn push(&mut self, text: &str) -> String;
+    /// Everything still held back.
+    fn finish(&mut self) -> String;
+    /// Bytes held back.
+    fn pending_len(&self) -> usize;
+}
+
+impl ValueRestorer for StreamRestorer {
+    fn push(&mut self, text: &str) -> String {
+        StreamRestorer::push(self, text)
+    }
+    fn finish(&mut self) -> String {
+        StreamRestorer::finish(self)
+    }
+    fn pending_len(&self) -> usize {
+        StreamRestorer::pending_len(self)
+    }
+}
+
+/// Makes a fresh [`ValueRestorer`] for each string value.
+pub type NewValueRestorer = Box<dyn Fn() -> Box<dyn ValueRestorer> + Send + Sync>;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Container {
     Object { expect_key: bool },
@@ -27,11 +52,10 @@ enum State {
 }
 
 pub struct JsonFragRestorer {
-    engine: Engine,
-    scope: String,
+    new_value: NewValueRestorer,
     stack: Vec<Container>,
     state: State,
-    restorer: Option<StreamRestorer>,
+    restorer: Option<Box<dyn ValueRestorer>>,
     /// An escape sequence still being read (starts with `\`).
     escape: String,
     /// A high surrogate waiting for its low half (and its raw text).
@@ -46,9 +70,14 @@ fn escape(s: &str) -> String {
 
 impl JsonFragRestorer {
     pub fn new(engine: Engine, scope: &str) -> Self {
+        let scope = scope.to_string();
+        Self::with_values(Box::new(move || Box::new(engine.stream_restorer(&scope))))
+    }
+
+    /// Restore each string value with a restorer from `new_value`.
+    pub fn with_values(new_value: NewValueRestorer) -> Self {
         JsonFragRestorer {
-            engine,
-            scope: scope.to_string(),
+            new_value,
             stack: Vec::new(),
             state: State::Outside,
             restorer: None,
@@ -83,9 +112,7 @@ impl JsonFragRestorer {
 
     /// Text held back: a possible surrogate prefix or an unfinished escape.
     pub fn pending_len(&self) -> usize {
-        self.restorer
-            .as_ref()
-            .map_or(0, StreamRestorer::pending_len)
+        self.restorer.as_ref().map_or(0, |r| r.pending_len())
             + self.escape.len()
             + self.high.as_ref().map_or(0, |(_, raw)| raw.len())
     }
@@ -104,7 +131,7 @@ impl JsonFragRestorer {
             }
             // Incomplete escapes are re-emitted as they came.
             out.push_str(&raw);
-            self.restorer = Some(self.engine.stream_restorer(&self.scope));
+            self.restorer = Some((self.new_value)());
         }
         out
     }
@@ -135,7 +162,7 @@ impl JsonFragRestorer {
                     self.state = State::Key { escaped: false };
                 } else {
                     self.state = State::Value;
-                    self.restorer = Some(self.engine.stream_restorer(&self.scope));
+                    self.restorer = Some((self.new_value)());
                 }
             }
             _ => {}
@@ -327,6 +354,45 @@ mod tests {
             // Keys are left exactly as they came.
             assert_eq!(v[format!("k\"{name}")], 1);
         }
+    }
+
+    /// Upper-cases each value, holding back a trailing `x`.
+    struct Upper(String);
+
+    impl ValueRestorer for Upper {
+        fn push(&mut self, text: &str) -> String {
+            self.0.push_str(text);
+            let keep = if self.0.ends_with('x') { 1 } else { 0 };
+            let tail = self.0.split_off(self.0.len() - keep);
+            std::mem::replace(&mut self.0, tail).to_uppercase()
+        }
+        fn finish(&mut self) -> String {
+            std::mem::take(&mut self.0).to_uppercase()
+        }
+        fn pending_len(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    #[test]
+    fn values_go_through_the_given_restorer_and_are_escaped() {
+        let new_value: NewValueRestorer = Box::new(|| Box::new(Upper(String::new())));
+        let mut r = JsonFragRestorer::with_values(new_value);
+        let mut out = String::new();
+        for piece in [
+            "{\"ke",
+            "y\": [\"a\\\"b",
+            "x\", \"\\u00e9x",
+            "\"], \"n\": 1}",
+        ] {
+            out.push_str(&r.push(piece));
+            if piece.ends_with('x') {
+                assert_eq!(r.pending_len(), 1);
+            }
+        }
+        out.push_str(&r.finish());
+        let v: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+        assert_eq!(v, json!({"key": ["A\"BX", "\u{c9}X"], "n": 1}));
     }
 
     #[test]

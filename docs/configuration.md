@@ -49,7 +49,7 @@ enabled = false
 listen = "127.0.0.1:8788"
 hosts = ["chatgpt.com", "chat.openai.com", "claude.ai", "gemini.google.com", "copilot.microsoft.com",
          "perplexity.ai", "chat.deepseek.com", "chat.mistral.ai", "grok.com", "meta.ai", "poe.com"]
-scope = "global"                   # same tags as the clipboard and the agent proxy
+scope = "per-host"                 # each site its own scope; or a fixed name, e.g. "global"
 unscanned = "allow"                # allow | block — file uploads and binary bodies
 skip_keys = []                     # extra JSON / form keys never changed, e.g. ["trace_tag"]
 
@@ -89,17 +89,30 @@ passthrough_paths = ["/api/*"]
 Only the listed hosts and their subdomains are decrypted; everything else is tunnelled untouched.
 Tags follow `replace.style` (there is no separate style for intercept).
 
-- **Requests**: JSON bodies have every string value redacted except identifier fields — keys such
-  as `id`, `*_id`, `*Id`, `uuid`, `model`, `token`, `nonce`, `timestamp`, `parent*`, `client_*`,
-  `type`, `role`, `status` (plus `skip_keys` and a built-in list per site) — and values that look
-  like identifiers (UUIDs, long hex or base64 strings, links to the site itself). JSON carried inside
-  a string (Gemini's `f.req`) is opened and filtered too. Form bodies, query strings and `text/plain`
-  bodies are filtered; multipart text fields are filtered and file parts count as unscanned.
-  Compressed bodies are decoded first. A body that claims to be JSON but is not is refused
-  (`400 parda_unparseable_body`) rather than sent unfiltered. In `detect.mode = "strict"` a failed name
-  detector refuses the send (`503`); a `block` action refuses it with `403`.
+- **Scope**: with `scope = "per-host"` (the default) each listed site gets its own vault scope,
+  `intercept:<host>` (for example `intercept:chatgpt.com`). A site's answers can only restore tags
+  that were issued for text sent to that same site — never names you sent to another site, the
+  clipboard or the agent proxy. Any other value is a fixed scope shared by every site (`global` also
+  shares tags with the clipboard and the agent proxy).
+- **Requests**: every string is checked. JSON string values are redacted; identifier fields — keys
+  such as `id`, `*_id`, `*Id`, `uuid`, `model`, `token`, `nonce`, `timestamp`, `parent*`, `client_*`,
+  `type`, `role`, `status` (plus `skip_keys` and a built-in list per site), and values that look like
+  identifiers (UUIDs, long hex or base64 strings, links to the site itself) — skip only the name
+  model, and only when the value is identifier-shaped (up to 64 characters of `A-Z a-z 0-9 _ . : / +
+  = -`). The dictionary and rule tiers still see them, so an e-mail, phone number, Aadhaar or key is
+  redacted wherever it sits; a value with a space or an `@` is redacted under any key. JSON carried
+  inside a string (Gemini's `f.req`) is opened and filtered, four levels deep; deeper, it is filtered
+  as plain text. Form bodies, query strings and `text/plain` bodies are filtered; multipart text fields
+  are filtered and file parts count as unscanned. Compressed bodies are decoded first. A body that
+  claims to be JSON but is not is refused (`400 parda_unparseable_body`) rather than sent unfiltered.
+  In `detect.mode = "strict"` a failed name detector refuses the send (`503`); a `block` action
+  refuses it with `403`.
 - **Answers**: JSON, NDJSON, server-sent-event streams and plain text get the real values back,
-  including tags split across stream events.
+  including tags split across stream events. Real values only land inside JSON strings (escaped as
+  JSON) or plain text. **A tag inside a URL is never restored** — in `http(s)://…` links, markdown
+  link and image targets, `href=` / `src=` values and CSS `url(…)` — so a prompt-injected image or
+  link cannot carry your real data to another server. HTML pages and other types pass through
+  unchanged.
 
 ## Changing settings
 
