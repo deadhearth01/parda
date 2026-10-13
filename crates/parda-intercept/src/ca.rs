@@ -19,7 +19,8 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Server
 use time::{Duration, OffsetDateTime};
 use zeroize::Zeroizing;
 
-const CA_NAME: &str = "parda local interception CA";
+/// Common name of the root certificate, as the OS trust stores show it.
+pub const CA_NAME: &str = "parda local interception CA";
 const CA_VALIDITY_DAYS: i64 = 3653;
 const LEAF_VALIDITY_DAYS: i64 = 365;
 /// Leaves are re-issued this long before they expire.

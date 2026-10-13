@@ -2797,9 +2797,11 @@ dependencies = [
  "parda-core",
  "parda-detect",
  "parda-engine",
+ "parda-intercept",
  "parda-ipc",
  "parda-ml",
  "parda-proxy",
+ "parda-vault",
  "serde",
  "serde_json",
  "tempfile",
@@ -2807,6 +2809,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
