@@ -97,6 +97,9 @@ enum Command {
     /// Start parda at login.
     #[command(subcommand)]
     Service(ServiceCmd),
+    /// The local root certificate used to protect AI websites and apps.
+    #[command(subcommand)]
+    Ca(CaCmd),
     /// Print environment settings that route an agent through parda.
     Env {
         #[arg(value_parser = ["claude", "codex", "openai", "anthropic"])]
@@ -165,6 +168,24 @@ enum ServiceCmd {
     Status,
 }
 
+#[derive(Subcommand)]
+enum CaCmd {
+    /// Create the certificate (kept in parda's data folder, key encrypted).
+    Create {
+        /// Replace an existing certificate (re-run `parda ca install` afterwards).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the certificate's path.
+    Path,
+    /// Trust the certificate for your user (the OS asks you to confirm).
+    Install,
+    /// Remove it from your trust store.
+    Uninstall,
+    /// Show whether it exists and is trusted.
+    Status,
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -215,6 +236,13 @@ fn main() {
             ServiceCmd::Install => commands::service::install(),
             ServiceCmd::Uninstall => commands::service::uninstall(),
             ServiceCmd::Status => commands::service::status(),
+        },
+        Command::Ca(c) => match c {
+            CaCmd::Create { force } => commands::ca::create(force),
+            CaCmd::Path => commands::ca::path(),
+            CaCmd::Install => commands::ca::install(),
+            CaCmd::Uninstall => commands::ca::uninstall(),
+            CaCmd::Status => commands::ca::status(),
         },
         Command::Env { agent } => commands::env::run(&agent),
     };
