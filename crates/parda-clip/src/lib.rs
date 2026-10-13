@@ -18,6 +18,6 @@ mod watcher;
 pub use hotkey::{parse_hotkey, run_hotkey_loop};
 pub use paste::{EnigoPaster, Paster};
 pub use watcher::{
-    ArboardBackend, ClipEvent, ClipHandle, ClipService, ClipboardBackend, PASTE_MAX_AGE,
+    ArboardBackend, ClipEvent, ClipHandle, ClipRead, ClipService, ClipboardBackend, PASTE_MAX_AGE,
     PasteOutcome, RESTORE_DELAY, spawn,
 };

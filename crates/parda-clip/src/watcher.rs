@@ -13,10 +13,30 @@ use serde::Serialize;
 
 use crate::paste::{EnigoPaster, Paster};
 
+/// What reading the clipboard gave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipRead {
+    Text(String),
+    /// The clipboard is empty or holds something that is not text (an image).
+    NoText,
+    /// The read itself failed (clipboard locked by another app, …).
+    Failed(String),
+}
+
 pub trait ClipboardBackend: Send {
-    /// Current text, or `None` for empty / non-text content.
+    /// Current text, or `None` for empty / non-text content (or a failed read).
     fn get_text(&mut self) -> Option<String>;
     fn set_text(&mut self, s: &str) -> anyhow::Result<()>;
+
+    /// Like [`get_text`](Self::get_text), but tells "no text there" from
+    /// "could not read". Backends that cannot tell report every `None` as a
+    /// failed read, which is the cautious reading.
+    fn read_text(&mut self) -> ClipRead {
+        match self.get_text() {
+            Some(t) => ClipRead::Text(t),
+            None => ClipRead::Failed("the clipboard could not be read".into()),
+        }
+    }
 }
 
 pub struct ArboardBackend(arboard::Clipboard);
@@ -32,6 +52,14 @@ impl ArboardBackend {
 impl ClipboardBackend for ArboardBackend {
     fn get_text(&mut self) -> Option<String> {
         self.0.get_text().ok()
+    }
+
+    fn read_text(&mut self) -> ClipRead {
+        match self.0.get_text() {
+            Ok(t) => ClipRead::Text(t),
+            Err(arboard::Error::ContentNotAvailable) => ClipRead::NoText,
+            Err(e) => ClipRead::Failed(e.to_string()),
+        }
     }
 
     fn set_text(&mut self, s: &str) -> anyhow::Result<()> {
@@ -276,10 +304,32 @@ impl<B: ClipboardBackend, P: Paster> ClipService<B, P> {
         })
     }
 
+    /// Read the clipboard, once more after a short pause if the read failed.
+    fn read_with_retry(&mut self) -> ClipRead {
+        match self.backend.read_text() {
+            ClipRead::Failed(_) => {
+                std::thread::sleep(Duration::from_millis(50));
+                self.backend.read_text()
+            }
+            other => other,
+        }
+    }
+
     /// Put the original back unless the user copied something else since.
+    /// A clipboard that cannot be read is not "something else": the redacted
+    /// text may still be there, so that is reported.
     fn put_back(&mut self, original: &str, redacted: &str) {
-        if self.backend.get_text().as_deref() != Some(redacted) {
-            return;
+        match self.read_with_retry() {
+            ClipRead::Text(now) if now == redacted => {}
+            // The user copied other text, or something that is not text.
+            ClipRead::Text(_) | ClipRead::NoText => return,
+            ClipRead::Failed(reason) => {
+                tracing::warn!(error = %reason, "could not read the clipboard to put the original back");
+                (self.on_event)(ClipEvent::OriginalNotRestored {
+                    reason: format!("the clipboard could not be read: {reason}"),
+                });
+                return;
+            }
         }
         let mut last = None;
         for _ in 0..2 {
@@ -441,12 +491,32 @@ mod tests {
         writes: Arc<Mutex<usize>>,
         /// The user copies this while the paste is happening.
         copy_during_paste: Arc<Mutex<Option<String>>>,
+        /// After the paste, this many reads of the clipboard fail.
+        fail_reads_after_paste: Arc<Mutex<usize>>,
+        fail_reads: Arc<Mutex<usize>>,
+        /// After the paste the clipboard holds something that is not text.
+        non_text_after_paste: Arc<Mutex<bool>>,
+        non_text: Arc<Mutex<bool>>,
     }
 
     struct FakeClip(Shared);
     impl ClipboardBackend for FakeClip {
         fn get_text(&mut self) -> Option<String> {
+            let mut fails = self.0.fail_reads.lock().unwrap();
+            if *fails > 0 {
+                *fails -= 1;
+                return None;
+            }
             self.0.clip.lock().unwrap().clone()
+        }
+        fn read_text(&mut self) -> ClipRead {
+            if *self.0.non_text.lock().unwrap() {
+                return ClipRead::NoText;
+            }
+            match self.get_text() {
+                Some(t) => ClipRead::Text(t),
+                None => ClipRead::Failed("clipboard read failed".into()),
+            }
         }
         fn set_text(&mut self, s: &str) -> anyhow::Result<()> {
             let mut n = self.0.writes.lock().unwrap();
@@ -470,6 +540,8 @@ mod tests {
             if let Some(copy) = self.0.copy_during_paste.lock().unwrap().clone() {
                 *self.0.clip.lock().unwrap() = Some(copy);
             }
+            *self.0.fail_reads.lock().unwrap() = *self.0.fail_reads_after_paste.lock().unwrap();
+            *self.0.non_text.lock().unwrap() = *self.0.non_text_after_paste.lock().unwrap();
             Ok(())
         }
     }
@@ -706,6 +778,61 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ClipEvent::OriginalNotRestored { .. }))
         );
+    }
+
+    fn originals_not_restored(shared: &Shared) -> usize {
+        shared
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, ClipEvent::OriginalNotRestored { .. }))
+            .count()
+    }
+
+    #[test]
+    fn a_failed_clipboard_read_is_retried_once_and_the_original_restored() {
+        let (_d, _e, shared, mut svc) = service(false);
+        set(&shared, "Call Ravi Kumar");
+        *shared.fail_reads_after_paste.lock().unwrap() = 1;
+        let out = svc.paste_safe().unwrap();
+        assert_eq!(out, PasteOutcome::PastedRedacted { replaced: 1 });
+        assert_eq!(
+            shared.clip.lock().unwrap().as_deref(),
+            Some("Call Ravi Kumar")
+        );
+        assert_eq!(originals_not_restored(&shared), 0);
+    }
+
+    #[test]
+    fn a_clipboard_that_stays_unreadable_is_reported_not_silently_skipped() {
+        let (_d, _e, shared, mut svc) = service(false);
+        set(&shared, "Call Ravi Kumar");
+        *shared.fail_reads_after_paste.lock().unwrap() = 2;
+        let out = svc.paste_safe().unwrap();
+        assert_eq!(out, PasteOutcome::PastedRedacted { replaced: 1 });
+        assert_eq!(originals_not_restored(&shared), 1);
+        // The redacted text is still there, never the original.
+        let now = shared.clip.lock().unwrap().clone().unwrap();
+        assert!(!now.contains("Ravi Kumar"), "{now}");
+    }
+
+    #[test]
+    fn something_else_copied_during_the_paste_is_left_alone_without_an_error() {
+        let (_d, _e, shared, mut svc) = service(false);
+        set(&shared, "Call Ravi Kumar");
+        *shared.copy_during_paste.lock().unwrap() = Some("another text".into());
+        svc.paste_safe().unwrap();
+        assert_eq!(shared.clip.lock().unwrap().as_deref(), Some("another text"));
+        assert_eq!(originals_not_restored(&shared), 0);
+        // Non-text content (an image) is not overwritten either.
+        let (_d2, _e2, shared, mut svc) = service(false);
+        set(&shared, "Call Ravi Kumar");
+        *shared.non_text_after_paste.lock().unwrap() = true;
+        svc.paste_safe().unwrap();
+        let now = shared.clip.lock().unwrap().clone().unwrap();
+        assert!(!now.contains("Ravi Kumar"), "{now}");
+        assert_eq!(originals_not_restored(&shared), 0);
     }
 
     #[test]
