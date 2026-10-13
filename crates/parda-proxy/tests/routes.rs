@@ -80,7 +80,8 @@ async fn post_openai(s: &Setup, path: &str, body: &Value) -> reqwest::Response {
 fn assert_clean(s: &Setup) {
     let up = s.mock.last().text();
     assert!(
-        !up.contains("Ravi") && !up.contains("ravi.k@gmail.com"),
+        // A surrogate may itself start with "Ravi" (Ravindra, ...).
+        !up.contains("Ravi Kumar") && !up.contains("ravi.k@gmail.com"),
         "{up}"
     );
 }

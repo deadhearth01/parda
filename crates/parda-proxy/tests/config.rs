@@ -85,28 +85,97 @@ async fn request_without_any_host_is_refused() {
     assert_eq!(s.mock.count(), 0);
 }
 
+fn messages(text: &str) -> Value {
+    json!({"model": "m", "messages": [{"role": "user", "content": text}]})
+}
+
 #[tokio::test]
-async fn distinct_scopes_are_capped() {
+async fn distinct_scopes_are_capped_but_the_default_scope_is_never_locked_out() {
     let s = setup(responder(|_| {
         Reply::Json(StatusCode::OK, json!({"ok": true}))
     }))
     .await;
-    let send = |scope: String| {
-        s.client
-            .post(s.url("/v1/messages"))
-            .header("x-parda-scope", scope)
-            .json(&json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}))
-            .send()
+    let send = |scope: Option<String>| {
+        let mut rb = s.client.post(s.url("/v1/messages"));
+        if let Some(scope) = scope {
+            rb = rb.header("x-parda-scope", scope);
+        }
+        rb.json(&messages("hi")).send()
     };
-    for i in 0..parda_proxy::MAX_SCOPES {
-        assert_eq!(send(format!("s{i}")).await.unwrap().status(), 200);
+    // The default scope ("global") holds one of the slots from the start.
+    for i in 0..parda_proxy::MAX_SCOPES - 1 {
+        assert_eq!(send(Some(format!("s{i}"))).await.unwrap().status(), 200);
     }
-    let resp = send("one-too-many".into()).await.unwrap();
-    assert_eq!(resp.status(), 400);
+    let resp = send(Some("one-too-many".into())).await.unwrap();
+    assert_eq!(resp.status(), 429);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["type"], "parda_too_many_scopes");
-    // Scopes already in use keep working.
-    assert_eq!(send("s0".into()).await.unwrap().status(), 200);
+    assert_eq!(s.mock.count(), parda_proxy::MAX_SCOPES - 1);
+    // Scopes already in use keep working, and so does the default one,
+    // with or without the header.
+    assert_eq!(send(Some("s0".into())).await.unwrap().status(), 200);
+    assert_eq!(send(None).await.unwrap().status(), 200);
+    assert_eq!(send(Some("global".into())).await.unwrap().status(), 200);
+}
+
+#[tokio::test]
+async fn refused_requests_do_not_use_up_scopes() {
+    let s = setup(responder(|_| {
+        Reply::Json(StatusCode::OK, json!({"ok": true}))
+    }))
+    .await;
+    let n = parda_proxy::MAX_SCOPES + 20;
+    for i in 0..n {
+        let scope = format!("junk{i}");
+        // Not JSON, not an object, a browser origin: all refused up front.
+        let resp = s
+            .client
+            .post(s.url("/v1/messages"))
+            .header("x-parda-scope", &scope)
+            .body("not json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{scope}");
+        let resp = s
+            .client
+            .post(s.url("/v1/chat/completions"))
+            .header("x-parda-scope", &scope)
+            .body("[1]")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{scope}");
+        let resp = s
+            .client
+            .post(s.url("/v1/messages"))
+            .header("x-parda-scope", &scope)
+            .header("origin", "https://evil.example")
+            .json(&messages("hi"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{scope}");
+        let resp = s
+            .client
+            .post(s.url("/v1/messages"))
+            .header("x-parda-scope", &scope)
+            .send()
+            .await
+            .unwrap();
+        // No body at all: nothing to redact, nothing to remember.
+        assert_ne!(resp.status(), 429, "{scope}");
+    }
+    let resp = s
+        .client
+        .post(s.url("/v1/messages"))
+        .header("x-parda-scope", "real-project")
+        .json(&messages("hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(s.mock.count(), n + 1);
 }
 
 #[tokio::test]

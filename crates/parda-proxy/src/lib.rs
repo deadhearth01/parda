@@ -59,9 +59,14 @@ pub struct ProxyEvent {
     pub error: Option<String>,
 }
 
-/// Distinct vault scopes (`x-parda-scope`) one proxy accepts: each one
-/// keeps an in-memory restore index for the life of the daemon.
+/// Distinct vault scopes (`x-parda-scope`) one proxy accepts, the default
+/// scope included: each one keeps an in-memory restore index for the life
+/// of the daemon.
 pub const MAX_SCOPES: usize = 256;
+
+/// The scope of a request without a (valid) `x-parda-scope` header. It is
+/// always admitted, so the cap can never lock out the default.
+pub const DEFAULT_SCOPE: &str = "global";
 
 pub struct ProxyState {
     pub engine: Engine,
@@ -86,7 +91,7 @@ impl ProxyState {
         Ok(Arc::new(ProxyState {
             engine,
             cfg: RwLock::new(Arc::new(cfg)),
-            scopes: Mutex::new(HashSet::new()),
+            scopes: Mutex::new(HashSet::from([DEFAULT_SCOPE.to_string()])),
             events,
             http,
         }))
@@ -108,6 +113,14 @@ impl ProxyState {
         }
         seen.insert(scope.to_string());
         true
+    }
+
+    /// True if `scope` has been admitted (it can hold surrogates to restore).
+    pub(crate) fn scope_known(&self, scope: &str) -> bool {
+        self.scopes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(scope)
     }
 
     /// Apply new settings to the running proxy. `listen` and `enabled` only

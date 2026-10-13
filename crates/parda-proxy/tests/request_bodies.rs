@@ -79,7 +79,7 @@ async fn assert_redacted_and_decoded(encoding: &str, body: Vec<u8>) {
         "{encoding}: the decoded body must not carry the old content-encoding"
     );
     let up = seen.text();
-    assert!(!up.contains("Ravi"), "{encoding}: {up}");
+    assert!(!up.contains("Ravi Kumar"), "{encoding}: {up}");
     assert!(
         seen.json()["messages"][0]["content"]
             .as_str()
@@ -157,7 +157,7 @@ async fn lone_surrogate_escape_is_replaced_not_forwarded() {
     assert_eq!(resp.status(), 200);
     let seen = s.mock.last();
     let up = seen.text();
-    assert!(!up.contains("Ravi"), "{up}");
+    assert!(!up.contains("Ravi Kumar"), "{up}");
     let content = seen.json()["messages"][0]["content"]
         .as_str()
         .unwrap()
@@ -177,7 +177,7 @@ async fn lone_surrogate_escape_is_replaced_not_forwarded() {
         content.starts_with("\u{fffd} ") && content.ends_with("\u{fffd}A"),
         "{content}"
     );
-    assert!(!content.contains("Ravi"));
+    assert!(!content.contains("Ravi Kumar"));
 
     // A well-formed pair is kept, and an escaped backslash is not an escape.
     let body = br#"{"model":"m","messages":[{"role":"user","content":"\ud83d\ude00 \\ud800 Ravi Kumar"}]}"#;
@@ -197,7 +197,7 @@ async fn utf8_bom_is_accepted_and_redacted() {
     body.extend(messages_body("Hello Ravi Kumar"));
     let resp = post_raw(&s, "/v1/messages", body, None).await;
     assert_eq!(resp.status(), 200);
-    assert!(!s.mock.last().text().contains("Ravi"));
+    assert!(!s.mock.last().text().contains("Ravi Kumar"));
 }
 
 #[tokio::test]
@@ -210,6 +210,77 @@ async fn unparseable_body_is_refused_not_forwarded() {
         let kind = body["error"]["type"].as_str().unwrap().to_string();
         assert_eq!(kind, "parda_unparseable_body", "{path}");
     }
+    assert_eq!(s.mock.count(), 0);
+}
+
+#[tokio::test]
+async fn non_object_json_bodies_are_refused_on_rewrite_routes() {
+    let s = setup(ok_reply()).await;
+    let paths = [
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+        "/v1/messages/batches",
+        "/v1/complete",
+        "/v1/chat/completions",
+        "/v1/responses",
+        "/v1/responses/input_tokens",
+        "/v1/responses/compact",
+        "/v1/completions",
+        "/v1/embeddings",
+        "/v1/conversations",
+        "/v1/conversations/c1/items",
+    ];
+    for path in paths {
+        for body in [r#"["Ravi Kumar"]"#, r#""Ravi Kumar""#, "42", "null", "true"] {
+            let resp = post_raw(&s, path, body.as_bytes().to_vec(), None).await;
+            assert_eq!(resp.status(), 400, "{path} {body}");
+            let v: Value = resp.json().await.unwrap();
+            assert_eq!(
+                v["error"]["type"], "parda_unparseable_body",
+                "{path} {body}"
+            );
+        }
+    }
+    // Compressed ones too.
+    let resp = post_raw(&s, "/v1/messages", gzip(br#"["Ravi Kumar"]"#), Some("gzip")).await;
+    assert_eq!(resp.status(), 400);
+    assert_eq!(s.mock.count(), 0);
+}
+
+#[tokio::test]
+async fn decompression_runs_off_the_async_workers() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    // The default test runtime has one thread: server, client and the
+    // heartbeat below share it, so any long synchronous step shows up as a
+    // gap between heartbeats.
+    let s = setup(ok_reply()).await;
+    let zeros = vec![b' '; 60 * 1024 * 1024];
+    let body = gzip(&zeros);
+    drop(zeros);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let beat = tokio::spawn(async move {
+        let mut worst = Duration::ZERO;
+        let mut last = Instant::now();
+        while !stop2.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            worst = worst.max(last.elapsed());
+            last = Instant::now();
+        }
+        worst
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // 60 MiB of blanks is not JSON: refused, but only after decoding.
+    let resp = post_raw(&s, "/v1/messages", body, Some("gzip")).await;
+    assert_eq!(resp.status(), 400);
+    stop.store(true, Ordering::Relaxed);
+    let worst = beat.await.unwrap();
+    assert!(
+        worst < Duration::from_millis(100),
+        "the async runtime stalled for {worst:?} while decoding the body"
+    );
     assert_eq!(s.mock.count(), 0);
 }
 
@@ -238,7 +309,7 @@ async fn number_literals_survive_the_rewrite() {
     let resp = post_raw(&s, "/v1/messages", body.to_vec(), None).await;
     assert_eq!(resp.status(), 200);
     let up = s.mock.last().text();
-    assert!(!up.contains("Ravi"), "{up}");
+    assert!(!up.contains("Ravi Kumar"), "{up}");
     for lit in [
         "123456789012345678901234567890",
         "-98765432109876543210",
@@ -272,5 +343,5 @@ async fn number_literals_survive_the_rewrite() {
         .unwrap()
         .to_string();
     assert!(sent.contains("123456789012345678901234567890"), "{sent}");
-    assert!(!sent.contains("Ravi"), "{sent}");
+    assert!(!sent.contains("Ravi Kumar"), "{sent}");
 }
