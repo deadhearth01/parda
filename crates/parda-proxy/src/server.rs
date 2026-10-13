@@ -47,7 +47,7 @@ pub async fn bind(cfg: &ProxyConfig) -> anyhow::Result<tokio::net::TcpListener> 
         anyhow::bail!("proxy.listen = {} resolves to no address", cfg.listen);
     }
     if !cfg.allow_non_loopback
-        && let Some(a) = addrs.iter().find(|a| !a.ip().is_loopback())
+        && let Some(a) = addrs.iter().find(|a| !a.ip().to_canonical().is_loopback())
     {
         anyhow::bail!(
             "proxy.listen = {} resolves to {a}, which is not a loopback address; parda only \

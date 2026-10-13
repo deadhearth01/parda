@@ -16,7 +16,7 @@ pub(crate) fn check(
 ) -> Result<(), &'static str> {
     if !cfg.allow_non_loopback {
         // The peer address cannot be forged the way a Host header can.
-        if peer.is_some_and(|p| !p.ip().is_loopback()) {
+        if peer.is_some_and(|p| !p.ip().to_canonical().is_loopback()) {
             return Err("only this machine may use the proxy (proxy.allow_non_loopback = false)");
         }
         // HTTP/2 carries the host as :authority (in the URI), HTTP/1.0 may
@@ -43,7 +43,7 @@ pub(crate) fn check(
 
 fn is_loopback_host(h: &str) -> bool {
     if let Ok(ip) = h.parse::<IpAddr>() {
-        return ip.is_loopback();
+        return ip.to_canonical().is_loopback();
     }
     let host = if let Some(rest) = h.strip_prefix('[') {
         rest.split(']').next().unwrap_or("")
@@ -54,7 +54,9 @@ fn is_loopback_host(h: &str) -> bool {
         }
     };
     host.eq_ignore_ascii_case("localhost")
-        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 #[cfg(test)]
@@ -112,6 +114,21 @@ mod tests {
         assert!(check(&h, &uri(), Some(local), &cfg).is_ok());
         cfg.allow_non_loopback = true;
         assert!(check(&h, &uri(), Some(lan), &cfg).is_ok());
+    }
+
+    #[test]
+    fn ipv4_mapped_loopback_peers_and_hosts_count_as_loopback() {
+        let cfg = ProxyConfig::default();
+        let mut h = HeaderMap::new();
+        h.insert(HOST, "127.0.0.1:8787".parse().unwrap());
+        // A dual-stack listener reports IPv4 peers as ::ffff:a.b.c.d.
+        let mapped_local: SocketAddr = "[::ffff:127.0.0.1]:5555".parse().unwrap();
+        let mapped_lan: SocketAddr = "[::ffff:192.168.1.20]:5555".parse().unwrap();
+        assert!(check(&h, &uri(), Some(mapped_local), &cfg).is_ok());
+        assert!(check(&h, &uri(), Some(mapped_lan), &cfg).is_err());
+        assert!(is_loopback_host("[::ffff:127.0.0.1]:8787"));
+        assert!(is_loopback_host("::ffff:127.0.0.1"));
+        assert!(!is_loopback_host("[::ffff:10.0.0.1]:8787"));
     }
 
     #[test]
