@@ -50,17 +50,24 @@ enum Scan {
         total: usize,
         skip_lf: bool,
     },
-    /// No complete event yet; resume scanning at this line start.
-    Incomplete(usize),
+    /// No complete event yet. Resume at `line_start`; `searched` bytes from
+    /// there are known to hold no line ending, so they need not be read again.
+    Incomplete { line_start: usize, searched: usize },
 }
 
-fn scan(buf: &[u8], from: usize) -> Scan {
+/// `from` is a line start; `searched` (>= `from`, or 0) is how far into
+/// that line an earlier call already looked for a line ending.
+fn scan(buf: &[u8], from: usize, searched: usize) -> Scan {
     let mut pos = from;
+    let mut look = searched.max(from).min(buf.len());
     loop {
-        let Some(off) = buf[pos..].iter().position(|&b| b == b'\r' || b == b'\n') else {
-            return Scan::Incomplete(pos);
+        let Some(off) = buf[look..].iter().position(|&b| b == b'\r' || b == b'\n') else {
+            return Scan::Incomplete {
+                line_start: pos,
+                searched: buf.len(),
+            };
         };
-        let i = pos + off;
+        let i = look + off;
         let blank = i == pos;
         let (len, skip_lf) = if buf[i] == b'\n' {
             (1, false)
@@ -70,8 +77,12 @@ fn scan(buf: &[u8], from: usize) -> Scan {
             // A blank line ended by a CR: the event is complete now.
             (1, true)
         } else {
-            // A CR at the end of a line: maybe half of a CRLF; wait.
-            return Scan::Incomplete(pos);
+            // A CR at the end of a line: maybe half of a CRLF; wait (and
+            // look at that CR again with the next chunk).
+            return Scan::Incomplete {
+                line_start: pos,
+                searched: i,
+            };
         };
         if blank {
             return Scan::Event {
@@ -81,6 +92,7 @@ fn scan(buf: &[u8], from: usize) -> Scan {
             };
         }
         pos = i + len;
+        look = pos;
     }
 }
 
@@ -91,6 +103,8 @@ pub struct SseParser {
     buf: BytesMut,
     /// Start of the first line not yet known to be complete and non-blank.
     scanned: usize,
+    /// Bytes from `scanned` on that hold no line ending (never re-read).
+    searched: usize,
     /// Drop a leading LF (the second half of a CRLF already used).
     skip_lf: bool,
 }
@@ -108,7 +122,7 @@ impl SseParser {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
         loop {
-            match scan(&self.buf, self.scanned) {
+            match scan(&self.buf, self.scanned, self.searched) {
                 Scan::Event {
                     body_end,
                     total,
@@ -116,6 +130,7 @@ impl SseParser {
                 } => {
                     let raw = self.buf.split_to(total).freeze();
                     self.scanned = 0;
+                    self.searched = 0;
                     self.skip_lf = skip_lf;
                     if let Some(ev) = parse_block(&raw[..body_end], raw.clone()) {
                         out.push(ev);
@@ -125,8 +140,12 @@ impl SseParser {
                         self.skip_lf = false;
                     }
                 }
-                Scan::Incomplete(at) => {
-                    self.scanned = at;
+                Scan::Incomplete {
+                    line_start,
+                    searched,
+                } => {
+                    self.scanned = line_start;
+                    self.searched = searched;
                     return out;
                 }
             }
@@ -136,6 +155,7 @@ impl SseParser {
     /// Whatever is left when the stream ends without a final blank line.
     pub fn finish(&mut self) -> Option<SseEvent> {
         self.scanned = 0;
+        self.searched = 0;
         parse_rest(&mut self.buf)
     }
 }
@@ -144,8 +164,7 @@ impl SseParser {
 pub fn parse_sse(buf: &mut BytesMut) -> Vec<SseEvent> {
     let mut p = SseParser {
         buf: std::mem::take(buf),
-        scanned: 0,
-        skip_lf: false,
+        ..SseParser::default()
     };
     let out = p.feed(&[]);
     *buf = p.buf;
@@ -476,6 +495,54 @@ mod tests {
         assert_eq!(p.scanned, p.buf.len());
         assert_eq!(p.feed(b"\n").len(), 1);
         assert!(p.buf.is_empty());
+    }
+
+    #[test]
+    fn one_huge_line_in_small_chunks_is_scanned_once() {
+        use std::time::{Duration, Instant};
+        // A 4 MB `data:` line (a big tool result) arriving in 16 KB chunks:
+        // rescanning the unfinished line on every chunk is quadratic.
+        let line = format!("data: {}", "x".repeat(4 * 1024 * 1024));
+        let mut input = line.clone().into_bytes();
+        input.extend_from_slice(b"\n\ndata: next\n\n");
+        let started = Instant::now();
+        let mut p = SseParser::default();
+        let mut events = Vec::new();
+        for chunk in input.chunks(16 * 1024) {
+            events.extend(p.feed(chunk));
+        }
+        let took = started.elapsed();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].data.len(), 4 * 1024 * 1024);
+        assert_eq!(events[1].data, "next");
+        assert!(took < Duration::from_secs(1), "took {took:?}");
+        // A CR/LF split at a chunk edge still resolves correctly.
+        let mut p = SseParser::default();
+        let mut evs = Vec::new();
+        for chunk in b"data: ab\r\n\r\n".chunks(1) {
+            evs.extend(p.feed(chunk));
+        }
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data, "ab");
+    }
+
+    #[test]
+    fn any_chunking_gives_the_same_events() {
+        let input =
+            b"event: a\r\ndata: 1\r\n\r\ndata: 2\ndata: 3\r\rdata: 4\n\n: c\n\ndata: 5\r\n\r\n";
+        let all = |chunk: usize| {
+            let mut p = SseParser::default();
+            let mut evs = Vec::new();
+            for c in input.chunks(chunk) {
+                evs.extend(p.feed(c));
+            }
+            evs.into_iter().map(|e| e.data).collect::<Vec<_>>()
+        };
+        let whole = all(input.len());
+        assert_eq!(whole, ["1", "2\n3", "4", "", "5"]);
+        for n in 1..12 {
+            assert_eq!(all(n), whole, "{n}");
+        }
     }
 
     #[test]
