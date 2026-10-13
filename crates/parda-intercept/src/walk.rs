@@ -3,14 +3,43 @@
 //!
 //! Redaction walks a request twice in the same order: once to collect the
 //! texts (one engine batch), once to write the results back.
+//!
+//! Nothing is skipped: every string is visited. Identifiers a site needs
+//! verbatim (values under identifier keys, or identifier-looking values) are
+//! visited as [`Tier::Identifier`] — the engine's dictionary and rule tiers
+//! still see them, only the ML model does not — and only when they are
+//! identifier-shaped ([`id_shaped`]); anything else is text.
 
 use serde_json::Value;
 
 use crate::hosts::HostList;
 use crate::sites::Site;
 
-/// Visits one text to redact; may replace it.
-pub(crate) type Visit<'a> = &'a mut dyn FnMut(&mut String);
+/// How a string is redacted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tier {
+    /// Every engine tier, the ML model included.
+    Text,
+    /// An identifier the site needs verbatim: the dictionary and rule tiers
+    /// only (an e-mail, phone or key in it is still redacted), never the ML
+    /// model, which could mistake an id or an enum word for a name.
+    Identifier,
+}
+
+/// Visits one string to redact; may replace it.
+pub(crate) type Visit<'a> = &'a mut dyn FnMut(&mut String, Tier);
+
+/// Longest value that may be treated as an identifier.
+const MAX_ID_LEN: usize = 64;
+
+/// Identifier-shaped: 1–64 characters of `[A-Za-z0-9_.:/+=-]` (UUIDs, hex,
+/// base64 tokens, enum words). Only such values may skip the ML model;
+/// anything with a space, an `@` and so on is text wherever it sits.
+pub(crate) fn id_shaped(s: &str) -> bool {
+    (1..=MAX_ID_LEN).contains(&s.len())
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_.:/+=-".contains(&c))
+}
 
 /// What decides which strings are text.
 pub(crate) struct Rules<'a> {
@@ -48,7 +77,8 @@ const CONTENT_KEYS: &[&str] = &[
     "sensitive_string_value",
 ];
 
-/// Identifier keys (lower-case patterns). Their values are never changed.
+/// Identifier keys (lower-case patterns). Identifier-shaped values under
+/// them skip the ML model.
 const SKIP_KEYS: &[&str] = &[
     "id",
     "*_id",
@@ -148,7 +178,7 @@ fn is_jwt(s: &str) -> bool {
 }
 
 impl Rules<'_> {
-    /// Values under this key are never changed.
+    /// Identifier-shaped values under this key skip the ML model.
     pub(crate) fn skip_key(&self, key: &str) -> bool {
         SKIP_SUFFIXES
             .iter()
@@ -160,7 +190,9 @@ impl Rules<'_> {
             || self.extra.iter().any(|p| glob(p, key))
     }
 
-    /// Does `value` look like an identifier the site needs verbatim?
+    /// Does `value` look like an identifier the site needs verbatim (whatever
+    /// its key)? Only identifier-shaped values ([`id_shaped`]) are then
+    /// treated as identifiers.
     pub(crate) fn is_identifier(&self, value: &str) -> bool {
         is_uuid(value)
             || is_hex_id(value)
@@ -186,8 +218,8 @@ pub(crate) fn walk_json(v: &mut Value, rules: &Rules<'_>, f: Visit<'_>) {
     walk_value(v, None, false, 0, rules, f);
 }
 
-/// `skipped`: the value sits under an identifier key; its strings (and
-/// arrays of strings) are left alone, objects inside it are still walked.
+/// `skipped`: the value sits under an identifier key (its strings and arrays
+/// of strings; objects inside it have their own keys).
 fn walk_value(
     v: &mut Value,
     key: Option<&str>,
@@ -197,7 +229,7 @@ fn walk_value(
     f: Visit<'_>,
 ) {
     match v {
-        Value::String(s) if !skipped => visit_at(s, key, depth, rules, f),
+        Value::String(s) => visit_at(s, key, skipped, depth, rules, f),
         Value::Array(items) => {
             for x in items {
                 walk_value(x, key, skipped, depth, rules, f);
@@ -213,24 +245,35 @@ fn walk_value(
     }
 }
 
-/// Visit one string value found under `key` (keys are checked by the
-/// caller).
+/// Visit one string value found under `key`.
 pub(crate) fn visit_text(s: &mut String, key: Option<&str>, rules: &Rules<'_>, f: Visit<'_>) {
-    visit_at(s, key, 0, rules, f);
+    let skipped = key.is_some_and(|k| rules.skip_key(k));
+    visit_at(s, key, skipped, 0, rules, f);
 }
 
-fn visit_at(s: &mut String, key: Option<&str>, depth: usize, rules: &Rules<'_>, f: Visit<'_>) {
+fn visit_at(
+    s: &mut String,
+    key: Option<&str>,
+    skipped: bool,
+    depth: usize,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) {
     if s.trim().is_empty() {
         return;
     }
     let content = key.is_some_and(is_content_key);
+    // JSON inside a string is opened; past the depth limit (or when it does
+    // not parse) the string is text like any other.
     if !content && depth < MAX_NESTED_JSON && nested_json(s, depth, rules, f) {
         return;
     }
-    if !content && rules.is_identifier(s) {
-        return;
-    }
-    f(s);
+    let tier = if !content && id_shaped(s) && (skipped || rules.is_identifier(s)) {
+        Tier::Identifier
+    } else {
+        Tier::Text
+    };
+    f(s, tier);
 }
 
 /// If `s` holds a JSON object or array, walk it and re-serialise it when a
@@ -252,9 +295,9 @@ fn nested_json(s: &mut String, depth: usize, rules: &Rules<'_>, f: Visit<'_>) ->
         false,
         depth + 1,
         rules,
-        &mut |t: &mut String| {
+        &mut |t: &mut String, tier| {
             let before = t.clone();
-            f(t);
+            f(t, tier);
             changed |= *t != before;
         },
     );
@@ -289,10 +332,6 @@ pub(crate) fn walk_form(raw: &str, rules: &Rules<'_>, f: Visit<'_>) -> Option<St
             continue;
         };
         let key = decode_component(k_raw);
-        if rules.skip_key(&key) {
-            out.push_str(piece);
-            continue;
-        }
         let mut value = decode_component(v_raw);
         let before = value.clone();
         visit_text(&mut value, Some(&key), rules, f);
@@ -317,7 +356,7 @@ pub(crate) struct Malformed;
 pub(crate) struct MultipartWalk {
     /// The rewritten body, when a text part changed.
     pub(crate) body: Option<Vec<u8>>,
-    /// File parts (and non-UTF-8 fields) forwarded unscanned.
+    /// File parts (and non-text or non-UTF-8 fields) forwarded unscanned.
     pub(crate) unscanned: u32,
 }
 
@@ -401,7 +440,7 @@ pub(crate) fn walk_multipart(
         let mut new = None;
         if file || !texty {
             walk.unscanned += 1;
-        } else if !name.as_deref().is_some_and(|n| rules.skip_key(n)) {
+        } else {
             match std::str::from_utf8(content) {
                 Ok(text) => {
                     let mut value = text.to_string();
@@ -450,14 +489,47 @@ mod tests {
         }
     }
 
+    /// The texts visited, identifiers marked with a leading `#`.
     fn collect_json(v: &mut Value, r: &Rules<'_>) -> Vec<String> {
         let mut out = Vec::new();
-        walk_json(v, r, &mut |s: &mut String| out.push(s.clone()));
+        walk_json(v, r, &mut |s: &mut String, tier| out.push(mark(s, tier)));
         out
     }
 
-    fn upper(s: &mut String) {
+    fn mark(s: &str, tier: Tier) -> String {
+        match tier {
+            Tier::Text => s.to_string(),
+            Tier::Identifier => format!("#{s}"),
+        }
+    }
+
+    fn upper(s: &mut String, _: Tier) {
         *s = s.to_uppercase();
+    }
+
+    #[test]
+    fn identifier_shape() {
+        for v in [
+            "abc",
+            "aaa2b8c1-55f4-4bd2-9a1c-0123456789ab",
+            "client-created-root",
+            "AJvLN6M:1697000000000",
+            "a/b+c=d_e.f",
+            &"x".repeat(64),
+        ] {
+            assert!(id_shaped(v), "{v}");
+        }
+        for v in [
+            "",
+            "Ravi Kumar",
+            "ravi@example.com",
+            "a,b",
+            "x?y",
+            "naïve",
+            &"x".repeat(65),
+        ] {
+            assert!(!id_shaped(v), "{v}");
+        }
     }
 
     #[test]
@@ -578,17 +650,35 @@ mod tests {
                 "metadata": {"note": "deadbeef00112233deadbeef"}
             }],
             "parent_message_id": "client-created-root",
-            "model": "auto",
+            "model": "ravi.k@gmail.com",
+            "type": "Ravi Kumar",
             "timezone_offset_min": -330,
             "client_contextual_info": {"page_title": "x"},
             "tags": ["a", "  "],
+            "ids": ["aaa2b8c1-55f4-4bd2-9a1c-0123456789ab"],
         });
         assert_eq!(
             collect_json(&mut v, &r),
-            // Identifier keys (`author`, `client_*`) skip strings, but objects
-            // under them are still walked; an identifier-looking value in
-            // `parts` (a content key) is still text.
-            ["Ravi Kumar", "Email Ravi Kumar", key, "x", "a"]
+            // Every string is visited. Identifier-shaped values under
+            // identifier keys (or looking like ids) skip only the model; a
+            // value with a space or an `@` is text under any key; content
+            // keys (`parts`) are always text.
+            [
+                "#next",
+                "#aaa2b8c1-55f4-4bd2-9a1c-0123456789ab",
+                "#user",
+                "Ravi Kumar",
+                "#text",
+                "Email Ravi Kumar",
+                key,
+                "#deadbeef00112233deadbeef",
+                "#client-created-root",
+                "ravi.k@gmail.com",
+                "Ravi Kumar",
+                "x",
+                "a",
+                "#aaa2b8c1-55f4-4bd2-9a1c-0123456789ab",
+            ]
         );
     }
 
@@ -602,9 +692,9 @@ mod tests {
             collect_json(&mut v, &r),
             ["Ravi Kumar here", "en", "c_1a2b3c", "r_9f8e7d"]
         );
-        walk_json(&mut v, &r, &mut |s: &mut String| {
+        walk_json(&mut v, &r, &mut |s: &mut String, t| {
             if s.starts_with("Ravi") {
-                upper(s)
+                upper(s, t)
             }
         });
         assert_eq!(
@@ -614,12 +704,12 @@ mod tests {
         // Unchanged JSON-in-string keeps its exact text.
         let spaced = r#"{ "a" : "x" }"#;
         let mut v = json!({"blob": spaced});
-        walk_json(&mut v, &r, &mut |_| {});
+        walk_json(&mut v, &r, &mut |_, _| {});
         assert_eq!(v["blob"], spaced);
         // JSON typed into a content field is text: its keys get no say.
         let mut v = json!({"prompt": r#"{"id": "Ravi Kumar"}"#});
         assert_eq!(collect_json(&mut v, &r), [r#"{"id": "Ravi Kumar"}"#]);
-        // Nesting beyond the limit is visited as text.
+        // Nesting beyond the limit is visited as text, never skipped.
         let mut s = String::from("\"deep Ravi\"");
         for _ in 0..6 {
             s = serde_json::to_string(&json!([s])).unwrap();
@@ -639,13 +729,16 @@ mod tests {
         let raw = format!("f.req={enc}&at=AJvLN6M%3A1697000000000&q=Ravi+Kumar&flag&e=%E2%9C%93");
         let mut seen = Vec::new();
         assert_eq!(
-            walk_form(&raw, &r, &mut |s: &mut String| seen.push(s.clone())),
+            walk_form(&raw, &r, &mut |s: &mut String, t| seen.push(mark(s, t))),
             None
         );
-        assert_eq!(seen, ["Ravi Kumar", "Ravi Kumar", "✓"]);
-        let out = walk_form(&raw, &r, &mut |s: &mut String| {
+        assert_eq!(
+            seen,
+            ["Ravi Kumar", "#AJvLN6M:1697000000000", "Ravi Kumar", "✓"]
+        );
+        let out = walk_form(&raw, &r, &mut |s: &mut String, t| {
             if s.starts_with("Ravi") {
-                upper(s)
+                upper(s, t)
             }
         })
         .unwrap();
@@ -683,9 +776,13 @@ mod tests {
         let r = rules(&h, &[], "chatgpt.com");
         let body = multipart("XyZ");
         let mut seen = Vec::new();
-        let w =
-            walk_multipart(&body, "XyZ", &r, &mut |s: &mut String| seen.push(s.clone())).unwrap();
-        assert_eq!(seen, ["Ravi Kumar asks"]);
+        let w = walk_multipart(&body, "XyZ", &r, &mut |s: &mut String, t| {
+            seen.push(mark(s, t))
+        })
+        .unwrap();
+        // `conversation_id` is an identifier key, but "Ravi id" is not
+        // identifier-shaped: text.
+        assert_eq!(seen, ["Ravi Kumar asks", "Ravi id"]);
         assert_eq!(
             w,
             MultipartWalk {
@@ -695,7 +792,9 @@ mod tests {
         );
         let w = walk_multipart(&body, "XyZ", &r, &mut upper).unwrap();
         let out = w.body.unwrap();
-        let want = String::from_utf8_lossy(&body).replace("Ravi Kumar asks", "RAVI KUMAR ASKS");
+        let want = String::from_utf8_lossy(&body)
+            .replace("Ravi Kumar asks", "RAVI KUMAR ASKS")
+            .replace("Ravi id", "RAVI ID");
         assert_eq!(String::from_utf8_lossy(&out), want);
         // The file bytes are untouched.
         assert!(out.windows(10).any(|w| w == b"Ravi\xff\r\n--X"));

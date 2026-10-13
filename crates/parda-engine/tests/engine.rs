@@ -363,3 +363,38 @@ fn default_style_is_tags_and_they_round_trip() {
         "Sent to ravi.k@gmail.com."
     );
 }
+
+#[test]
+fn rules_only_texts_skip_the_model_but_not_the_rules() {
+    // The model "finds" a name wherever it sees "abc".
+    let ml = NameMl::new(&["abc"]);
+    let (_d, e) = engine_with(
+        ml_config(Mode::Strict, 250),
+        Some(ml.clone() as Arc<dyn MlDetector>),
+    );
+    let rs = e
+        .redact_many_tiered(
+            &["abc text", "abc-123", "ravi@example.com", "Ravi Kumar"],
+            &[false, true, true, true],
+            "global",
+        )
+        .unwrap();
+    assert!(!rs[0].text.contains("abc"), "{}", rs[0].text);
+    // An identifier is not shown to the model…
+    assert_eq!(rs[1].text, "abc-123");
+    // …but the rule and dictionary tiers still see it.
+    assert!(!rs[2].text.contains("ravi@"), "{}", rs[2].text);
+    assert!(!rs[3].text.contains("Ravi"), "{}", rs[3].text);
+    // The same string as text afterwards does go to the model (separate
+    // cache entries).
+    let r = e
+        .redact_many_tiered(&["abc-123"], &[false], "global")
+        .unwrap();
+    assert!(!r[0].text.contains("abc"), "{}", r[0].text);
+    // Only identifiers: no model is needed, even in strict mode.
+    let (_d2, e2) = engine_with(ml_config(Mode::Strict, 250), None);
+    let r = e2
+        .redact_many_tiered(&["abc-123"], &[true], "global")
+        .unwrap();
+    assert_eq!(r[0].text, "abc-123");
+}

@@ -18,7 +18,7 @@ use crate::hosts::HostList;
 use crate::server::MAX_REQUEST_BODY;
 use crate::sites;
 use crate::transform::RequestOutcome;
-use crate::walk::{Rules, Visit, walk_form, walk_json, walk_multipart};
+use crate::walk::{Rules, Tier, Visit, walk_form, walk_json, walk_multipart};
 use crate::{BodyTransform, Refusal, StreamTransform};
 
 /// The settings one request uses (a snapshot of `[intercept]`).
@@ -90,9 +90,13 @@ impl EngineTransform {
         };
         let mut body = ReqBody::prepare(headers, body)?;
 
-        // Pass 1: collect the texts.
+        // Pass 1: collect the texts (identifiers skip only the ML model).
         let mut texts = Vec::new();
-        let mut collect = |s: &mut String| texts.push(s.clone());
+        let mut rules_only = Vec::new();
+        let mut collect = |s: &mut String, tier: Tier| {
+            texts.push(s.clone());
+            rules_only.push(tier == Tier::Identifier);
+        };
         if let Some(q) = query {
             walk_form(q, &rules, &mut collect);
         }
@@ -118,7 +122,7 @@ impl EngineTransform {
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let reds = self
             .engine
-            .redact_many(&refs, &st.scope)
+            .redact_many_tiered(&refs, &rules_only, &st.scope)
             .map_err(engine_refusal)?;
         let mut counts = BTreeMap::new();
         for r in &reds {
@@ -129,7 +133,7 @@ impl EngineTransform {
 
         // Pass 2: write the results back, in the same order.
         let mut results = reds.into_iter().map(|r| r.text);
-        let mut assign = |s: &mut String| {
+        let mut assign = |s: &mut String, _: Tier| {
             if let Some(t) = results.next() {
                 *s = t;
             }
@@ -221,9 +225,9 @@ impl ReqBody {
             ReqBody::Empty => (None, 0),
             ReqBody::Json { raw, value } => {
                 let mut changed = false;
-                walk_json(value, rules, &mut |t: &mut String| {
+                walk_json(value, rules, &mut |t: &mut String, tier| {
                     let before = t.clone();
-                    f(t);
+                    f(t, tier);
                     changed |= *t != before;
                 });
                 let out = changed.then(|| {
@@ -238,7 +242,7 @@ impl ReqBody {
                     return Ok((None, 0));
                 }
                 let mut t = text.clone();
-                f(&mut t);
+                f(&mut t, Tier::Text);
                 ((t != *text).then(|| Bytes::from(t)), 0)
             }
             ReqBody::Multipart { raw, boundary } => {
@@ -581,9 +585,9 @@ pub(crate) mod tests {
             &t,
             "example.com",
             "application/x-www-form-urlencoded",
-            Bytes::from("q=Ravi+Kumar&conversation_id=Ravi+Kumar&n=1"),
+            Bytes::from("q=Ravi+Kumar&conversation_id=abc-123&n=1"),
         );
-        assert_eq!(out.body, "q=%5BNAME_1%5D&conversation_id=Ravi+Kumar&n=1");
+        assert_eq!(out.body, "q=%5BNAME_1%5D&conversation_id=abc-123&n=1");
         let out = t
             .rewrite_request(
                 "example.com",
@@ -612,13 +616,104 @@ pub(crate) mod tests {
         );
         assert_eq!(out.body, "hi [NAME_1]");
         // Sites post JSON as text/plain to skip CORS preflights.
-        let body = json!({"id": "Ravi Kumar", "msg": "Ravi Kumar"});
+        let body = json!({"id": "Ravi Kumar", "msg": "Ravi Kumar", "chat_id": "abc-123"});
         let out = rewrite(&t, "example.com", "text/plain", json_body(&body));
         let v: Value = serde_json::from_slice(&out.body).unwrap();
-        assert_eq!(v, json!({"id": "Ravi Kumar", "msg": "[NAME_1]"}));
+        // (`id` is an identifier key, but a name is never an identifier.)
+        assert_eq!(
+            v,
+            json!({"id": "[NAME_1]", "msg": "[NAME_1]", "chat_id": "abc-123"})
+        );
         // No content type at all: sniffed.
         let out = rewrite(&t, "example.com", "", Bytes::from("Ravi Kumar"));
         assert_eq!(out.body, "[NAME_1]");
+    }
+
+    #[test]
+    fn skipping_never_hides_personal_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path());
+        let t = transform(&e, |_| {});
+        let send = |v: Value| -> Value {
+            let out = rewrite(&t, "chatgpt.com", "application/json", json_body(&v));
+            serde_json::from_slice(&out.body).unwrap()
+        };
+        // Identifier keys hold identifiers; anything else under them is
+        // redacted like any text.
+        assert_eq!(
+            send(json!({"author": "Ravi Kumar"})),
+            json!({"author": "[NAME_1]"})
+        );
+        assert_eq!(
+            send(json!({"model": "ravi.k@gmail.com"})),
+            json!({"model": "[EMAIL_1]"})
+        );
+        // Identifier-shaped values still meet the rule tier: the rules
+        // decide about a phone-shaped id.
+        let rules_say = e.redact("9876543210", "global").unwrap().text;
+        assert_eq!(send(json!({"id": "9876543210"})), json!({"id": rules_say}));
+        assert_eq!(
+            send(json!({"type": "ravi.kumar@example.com"})),
+            json!({"type": "[EMAIL_2]"})
+        );
+        // Genuine identifiers stay byte-identical.
+        let ids = json_body(&json!({
+            "id": UUID, "conversation_id": UUID, "parent_message_id": "client-created-root",
+            "model": "gpt-4o", "type": "text", "role": "user", "nonce": "deadbeef00112233",
+            "token": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo0NTY3ODk",
+            "link": "https://chatgpt.com/c/0123abcd", "prompt": "hi there"
+        }));
+        assert_eq!(
+            rewrite(&t, "chatgpt.com", "application/json", ids.clone()).body,
+            ids
+        );
+        // Beyond the JSON-in-string depth limit the rest is redacted as text.
+        let mut s = json!({"note": "Ravi Kumar, ravi@example.com"}).to_string();
+        for _ in 0..6 {
+            s = json!([s]).to_string();
+        }
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            json_body(&json!({"blob": s})),
+        );
+        let text = String::from_utf8(out.body.to_vec()).unwrap();
+        assert!(!text.contains("Ravi") && !text.contains("ravi@"), "{text}");
+        // A string that only looks like JSON is text.
+        let v = send(json!({"blob": "[Ravi Kumar, ravi@example.com"}));
+        assert_eq!(v["blob"], "[[NAME_1], [EMAIL_3]");
+        // Forms, queries and multipart follow the same rule.
+        let out = rewrite(
+            &t,
+            "gemini.google.com",
+            "application/x-www-form-urlencoded",
+            Bytes::from(
+                "conversation_id=Ravi+Kumar&at=AJvLN6M%3A1697000000000&type=ravi%40example.com",
+            ),
+        );
+        assert_eq!(
+            out.body,
+            "conversation_id=%5BNAME_1%5D&at=AJvLN6M%3A1697000000000&type=%5BEMAIL_3%5D"
+        );
+        let out = t
+            .rewrite_request(
+                "example.com",
+                "/s?chat_id=Ravi%20Kumar",
+                &HeaderMap::new(),
+                Bytes::new(),
+            )
+            .unwrap();
+        assert_eq!(out.target.as_deref(), Some("/s?chat_id=%5BNAME_1%5D"));
+        let mp = "--b\r\nContent-Disposition: form-data; name=\"conversation_id\"\r\n\r\n\
+                  Ravi Kumar\r\n--b--\r\n";
+        let out = rewrite(
+            &t,
+            "example.com",
+            "multipart/form-data; boundary=b",
+            Bytes::from(mp),
+        );
+        assert_eq!(out.body, mp.replace("Ravi Kumar", "[NAME_1]"));
     }
 
     fn multipart_body() -> Bytes {
