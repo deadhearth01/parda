@@ -1,0 +1,33 @@
+[package]
+name = "parda-intercept"
+description = "Local HTTPS interception proxy: decrypts only listed AI hosts, rewrites their bodies, tunnels everything else"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+bytes.workspace = true
+futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+rcgen.workspace = true
+time = "0.3"
+rand.workspace = true
+
+[dev-dependencies]
+x509-parser = "0.18"
+
+[lints]
+workspace = true
