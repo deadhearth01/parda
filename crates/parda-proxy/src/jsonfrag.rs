@@ -135,9 +135,17 @@ impl JsonFragRestorer {
 
     fn value(&mut self, c: char, decoded: &mut String, out: &mut String) {
         if !self.escape.is_empty() {
-            self.escape.push(c);
-            self.escape_progress(decoded);
-            return;
+            // `\u` must be followed by four hex digits. Anything else is
+            // not JSON: keep what was read as literal text and read `c`
+            // normally (never slice into a partial escape).
+            if self.escape.starts_with("\\u") && !c.is_ascii_hexdigit() {
+                self.lone_high(decoded);
+                decoded.push_str(&std::mem::take(&mut self.escape));
+            } else {
+                self.escape.push(c);
+                self.escape_progress(decoded);
+                return;
+            }
         }
         match c {
             '\\' => self.escape.push(c),
@@ -169,10 +177,11 @@ impl JsonFragRestorer {
         let e = &self.escape;
         let second = e.chars().nth(1).unwrap_or(' ');
         if second == 'u' {
+            // Every char after `\u` is an ASCII hex digit (see `value`).
             if e.len() < 6 {
                 return;
             }
-            let unit = u16::from_str_radix(&e[2..6], 16).ok();
+            let unit = e.get(2..6).and_then(|h| u16::from_str_radix(h, 16).ok());
             let raw = std::mem::take(&mut self.escape);
             match unit {
                 Some(u @ 0xD800..=0xDBFF) => {
@@ -317,5 +326,35 @@ mod tests {
         let e = engine(dir.path());
         assert_eq!(run(&e, "{\"q\": \"abc\\u00", 3), "{\"q\": \"abc\\u00");
         assert_eq!(run(&e, "{\"q\": \"x\\ud83d", 2), "{\"q\": \"x\\ud83d");
+    }
+
+    #[test]
+    fn malformed_unicode_escapes_never_panic_and_stay_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path());
+        let name = e.redact("Ravi Kumar", "global").unwrap().text;
+        // Non-ASCII (or non-hex) where hex digits belong: `&e[2..6]` used to
+        // cut a char in half. The bad escape becomes literal text and the
+        // document after it is still restored.
+        for bad in [
+            "\\uabc\u{e9}",
+            "\\uaa\u{20ac}",
+            "\\u\u{1f600}\u{1f600}",
+            "\\u12\u{e9}\u{e9}",
+            "\\uzzzz",
+            "\\u+123",
+            "\\u12",
+            "\\u\u{e9}",
+            "\\\u{e9}",
+        ] {
+            let text = format!("{{\"a\": \"x{bad}y\", \"b\": \"{name}\"}}");
+            for n in 1..8 {
+                let out = run(&e, &text, n);
+                let v: Value = serde_json::from_str(&out)
+                    .unwrap_or_else(|err| panic!("{bad} {n}: {err}: {out}"));
+                assert_eq!(v["a"], format!("x{bad}y"), "{bad} {n}");
+                assert_eq!(v["b"], "Ravi Kumar", "{bad} {n}");
+            }
+        }
     }
 }
