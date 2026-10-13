@@ -352,7 +352,8 @@ pub(crate) fn aadhaar(real: &str, rng: &mut ChaCha20Rng) -> String {
     if digits_of(real).len() == 12 {
         fill_digits(real, &base)
     } else {
-        format!("{} {} {}", &base[..4], &base[4..8], &base[8..])
+        // Partial or mistyped number ("my aadhaar is 123456789"): keep its shape.
+        shape(real, rng)
     }
 }
 
@@ -399,6 +400,9 @@ fn holder_of(real_pan: &str) -> char {
 }
 
 pub(crate) fn pan(real: &str, rng: &mut ChaCha20Rng) -> String {
+    if real.len() != 10 {
+        return shape(real, rng); // partial or mistyped PAN: keep its shape
+    }
     let s = pan_with_holder(holder_of(real), rng);
     if real.chars().any(|c| c.is_ascii_lowercase()) {
         s.to_lowercase()
@@ -591,7 +595,7 @@ pub(crate) fn us_ssn(real: &str, rng: &mut ChaCha20Rng) -> String {
     if digits_of(real).len() == 9 {
         fill_digits(real, &digits)
     } else {
-        format!("{}-{}-{}", &digits[..3], &digits[3..5], &digits[5..])
+        shape(real, rng) // partial SSN: keep its shape
     }
 }
 
@@ -886,5 +890,27 @@ mod tests {
         assert_eq!(second % 2, 0);
         let v6 = ip("2001:db8::8a2e:370:7334", &mut rng(18));
         assert!(v6.starts_with("2001:") && v6.contains("::"));
+    }
+
+    #[test]
+    fn partial_ids_keep_their_shape() {
+        use rand::SeedableRng;
+        for (real, f) in [
+            ("123456789", aadhaar as fn(&str, &mut ChaCha20Rng) -> String),
+            ("ABCDE1234", pan),
+            ("123-45-678", us_ssn),
+        ] {
+            let mut rng = ChaCha20Rng::from_seed([7; 32]);
+            let s = f(real, &mut rng);
+            assert_eq!(s.len(), real.len(), "{real} -> {s}");
+            assert_ne!(s, real);
+            let class = |c: char| (c.is_ascii_digit(), c.is_ascii_alphabetic());
+            assert!(
+                s.chars()
+                    .zip(real.chars())
+                    .all(|(a, b)| class(a) == class(b)),
+                "{real} -> {s}"
+            );
+        }
     }
 }
