@@ -136,7 +136,7 @@ Rust 1.89+ (edition 2024). See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Roadmap
 
-Image OCR redaction · PDF/DOCX pipeline · browser extension for typed input · more providers (Gemini, Bedrock) · fine-tuned `parda-pii-edge` model ([training/](training/)) · GUI.
+Image OCR redaction · PDF/DOCX pipeline · browser extension for typed input · more providers (Gemini, Bedrock) · INT8 `parda-pii-edge` (smaller, faster; needs an ONNX Runtime upgrade) · GUI.
 
 ## License
 

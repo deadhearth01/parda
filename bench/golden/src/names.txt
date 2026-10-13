@@ -120,3 +120,15 @@ NEG	Explain the difference between a PAN card and an Aadhaar card.
 NEG	Draft a policy for remote work for our Hyderabad office.
 NEG	The train from Howrah to Puri leaves at 22:35.
 NEG	Write a haiku about monsoon in Kerala.
+IN	Send the offer letter to [[Priya Sharma|Person]], [[priya.s@outlook.com|Email]], call [[+91 98765 43210|Phone]]. Also loop in [[Venkatesh Iyer|Person]] and [[Siobhan O'Brien|Person]].
+IN	Meeting notes: [[Anil Kapoor|Person]] presented the Q3 numbers. [[Sunita Rao|Person]] raised concerns about the Pune warehouse. Action items go to [[Mohit Bansal|Person]] and [[Deepika Menon|Person]] by Friday.
+IN	Hi team, [[Rahul|Person]] is on leave this week. Please route Chennai escalations to [[Karthik Subramanian|Person]]; billing issues go to [[Neelam Gupta|Person]] at [[neelam.g@acmecorp.in|Email]].
+IN	The tenant [[Arvind Joshi|Person]] has paid rent for September. His wife [[Shalini Joshi|Person]] called about the leaking tap. Their daughter [[Ishita|Person]] will collect the keys on Sunday.
+IN	bhai kal [[Sameer|Person]] ka birthday hai. [[Pooja|Person]] cake la rahi hai aur [[Nitin Chauhan|Person]] decorations dekh lega. Mera number [[98201 44556|Phone]] hai agar kuch chahiye.
+IN	Patient [[Rukmini Iyengar|Person]], 67, was admitted on Monday. Her son [[Srinivas Iyengar|Person]] is the emergency contact. Discharge summary to be shared with [[Dr. Farah Naqvi|Person]].
+IN	Please draft a reply to the complaint. The customer, [[Gagandeep Singh|Person]], says the courier left the parcel with his neighbour [[Harjit Kaur|Person]]. Our delivery agent [[Babu Lal|Person]] disputes this.
+IN	Interview panel: [[Meghna Bose|Person]] (chair), [[Pradeep Nair|Person]] and [[Zaid Hussain|Person]]. Candidates [[Tanvi Kulkarni|Person]] and [[Rohan D'Costa|Person]] are shortlisted for the final round.
+GL	Please summarise this thread. [[Emma Thompson|Person]] asked for the budget. [[Lukas Becker|Person]] replied that finance is still reviewing it. [[Ana Souza|Person]] will follow up on Monday.
+GL	Draft an apology to [[Michael Chen|Person]] about the delayed refund. Copy [[Rachel Adams|Person]] from support and [[Omar Farouk|Person]] from billing, who approved it yesterday.
+GL	Board update: [[Hiroko Sato|Person]] joins as CFO next month. [[Daniel Okafor|Person]] steps down after six years. The search was led by [[Isabelle Laurent|Person]].
+GL	Hey, can you check whether [[Mateo Rossi|Person]] signed the lease? [[Sofia Lindqvist|Person]] said she emailed it to [[mateo.rossi@example.org|Email]] last week, and [[Tom Walsh|Person]] is waiting for the deposit.
