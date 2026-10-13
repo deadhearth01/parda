@@ -86,6 +86,11 @@ pub struct ProxyConfig {
     pub allow_non_loopback: bool,
     /// Largest request body accepted, in bytes.
     pub max_body_bytes: usize,
+    /// Opt-in: request paths forwarded unchanged (unfiltered, with a warning
+    /// event) instead of being refused as unknown endpoints. An entry is an
+    /// exact path (`/v1/files`) or, when it ends in `*`, a prefix (`/api/*`).
+    /// Endpoints parda knows how to redact are never passed through.
+    pub passthrough_paths: Vec<String>,
 }
 
 impl Default for ProxyConfig {
@@ -99,6 +104,7 @@ impl Default for ProxyConfig {
             allowed_origins: Vec::new(),
             allow_non_loopback: false,
             max_body_bytes: 64 * 1024 * 1024,
+            passthrough_paths: Vec::new(),
         }
     }
 }
@@ -287,6 +293,17 @@ mod tests {
         assert_eq!(c.clipboard.scope, "global");
         assert!(!c.privacy.log_values);
         assert!(c.protection.enabled);
+    }
+
+    #[test]
+    fn passthrough_paths_default_to_none_and_parse() {
+        let c = Config::from_toml_str("").unwrap();
+        assert!(c.proxy.passthrough_paths.is_empty());
+        let c = Config::from_toml_str("[proxy]\npassthrough_paths = [\"/api/*\", \"/v1/files\"]\n")
+            .unwrap();
+        assert_eq!(c.proxy.passthrough_paths, ["/api/*", "/v1/files"]);
+        let again = Config::from_toml_str(&c.to_toml_string().unwrap()).unwrap();
+        assert_eq!(again.proxy.passthrough_paths, c.proxy.passthrough_paths);
     }
 
     #[test]

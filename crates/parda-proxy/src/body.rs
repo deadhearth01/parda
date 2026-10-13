@@ -102,6 +102,26 @@ pub(crate) fn parse_json(body: &[u8]) -> Result<Value, BodyError> {
     }
 }
 
+/// [`parse_json`] for the bodies of routes parda rewrites: every one of them
+/// is a JSON object, so any other value (`["text"]`, a bare string, …) is
+/// refused rather than walked as if it held no text.
+pub(crate) fn parse_object(body: &[u8]) -> Result<Value, BodyError> {
+    let v = parse_json(body)?;
+    if v.is_object() {
+        return Ok(v);
+    }
+    let found = match v {
+        Value::Array(_) => "an array",
+        Value::String(_) => "a string",
+        Value::Number(_) => "a number",
+        Value::Bool(_) => "a boolean",
+        _ => "null",
+    };
+    Err(BodyError::Unparseable(format!(
+        "the top-level value must be a JSON object, not {found}"
+    )))
+}
+
 fn hex4(b: &[u8]) -> Option<u16> {
     let s = std::str::from_utf8(b.get(..4)?).ok()?;
     u16::from_str_radix(s, 16).ok()

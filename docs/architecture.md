@@ -64,7 +64,7 @@ Per scope, an Aho-Corasick automaton over all surrogates (leftmost-longest, ASCI
 ## Proxy
 
 - Guards: `Host` must be loopback (DNS rebinding); requests with an `Origin` header are refused unless allow-listed (browser CSRF). No CORS headers are sent.
-- Requests to `/v1/messages`, `/v1/messages/count_tokens`, `/v1/chat/completions` and `/v1/responses` are rewritten; everything else passes through untouched.
+- Requests to `/v1/messages` (and `count_tokens`, `batches`), `/v1/complete`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/responses` (and its side endpoints) and `/v1/conversations` are rewritten (the body must be a JSON object; decoding, parsing and redaction run on a blocking thread). Other paths pass through only if their body holds no text; a body with text on an unknown path is refused unless the path is listed in `proxy.passthrough_paths` (forwarded unfiltered, with a warning event per request).
 - Every redactable string of a request is collected by a provider walker and redacted in one engine batch (one model call), then written back. `thinking` / `redacted_thinking` blocks (signed) and unknown block types are never modified.
 - Responses: JSON bodies are restored; SSE streams are parsed event by event and each content block / choice / output item gets its own stream restorer, flushed with a synthetic delta just before its stop/done event. Upstream errors are passed through with their strings restored.
 

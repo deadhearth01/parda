@@ -52,6 +52,8 @@ Both SDKs also read `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`.
 
 Set `proxy.openai_upstream` to the server's base URL (OpenRouter, Ollama, vLLM, LM Studio, Azure-style gateways that accept `/v1/chat/completions`), restart the daemon, and point clients at parda as above.
 
+Ollama's native API (`/api/chat`, `/api/generate`) is not one parda can redact, so requests with text to it are refused by default. If you accept sending those unfiltered, list them: `passthrough_paths = ["/api/*"]` (see [configuration](configuration.md)); every such request raises a warning.
+
 ## Separate scopes per project
 
 Send `x-parda-scope: my-project` on requests (most SDKs accept default headers) to keep a project's stand-ins separate from everything else.
@@ -65,3 +67,6 @@ Send `x-parda-scope: my-project` on requests (most SDKs accept default headers) 
 | Images / PDFs in the request | forwarded unscanned and reported in the TUI; `unscanned_media = "block"` refuses them (`400 parda_unscanned_media`) |
 | The upstream returns an error | passed through, with surrogates in the message restored |
 | A web page tries to call the proxy | `403` (Origin guard) |
+| Text sent to an endpoint parda does not know | `400`, `parda_unknown_endpoint` (unless the path is in `proxy.passthrough_paths`) |
+| A request body that is not a JSON object, or not JSON | `400`, `parda_unparseable_body` |
+| More than 256 distinct `x-parda-scope` values | `429`, `parda_too_many_scopes` for new scopes; existing ones keep working |

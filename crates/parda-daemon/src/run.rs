@@ -113,11 +113,22 @@ impl Daemon {
         paths.ensure().context("creating parda directories")?;
         // Before loading the model or touching the clipboard: a second
         // daemon must not start services, nor clean up the live one's files.
-        if opts.ipc && parda_ipc::Client::connect(&paths.runtime_dir).is_ok() {
-            anyhow::bail!(
-                "another parda daemon is already running (its IPC socket is in use); \
-                 stop it first with `parda stop`"
-            );
+        if opts.ipc {
+            match parda_ipc::Client::connect(&paths.runtime_dir) {
+                Ok(_) => anyhow::bail!(
+                    "another parda daemon is already running (its IPC socket is in use); \
+                     stop it first with `parda stop`"
+                ),
+                // Only "nothing there" (no socket, stale file) lets us start. A
+                // daemon of another version or one that does not answer is
+                // still a daemon: leave its files alone.
+                Err(e) if e.is_not_running() => {}
+                Err(e) => anyhow::bail!(
+                    "something is listening on parda's IPC socket but it is not a compatible \
+                     parda daemon ({e}); not starting. If it is an older or hung parda daemon, \
+                     stop it first (`parda stop`, or end the process)"
+                ),
+            }
         }
         let config = load_config(&paths)?;
         for key in config.suspicious_action_keys() {

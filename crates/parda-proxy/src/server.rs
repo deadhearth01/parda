@@ -22,10 +22,13 @@ use serde_json::Value;
 use crate::body::{self, BodyError};
 use crate::error::error_response;
 use crate::route::{Provider, route};
-use crate::route::{SUPPORTED, normalize_path};
+use crate::route::{SUPPORTED, normalize_path, passthrough_listed};
 use crate::sse::{Restorers, StreamRewriter};
 use crate::walk::{Unscanned, Visit, leaves, preserve_numbers};
-use crate::{ProxyEvent, ProxyState, anthropic, guard, legacy, openai_chat, openai_responses, sse};
+use crate::{
+    DEFAULT_SCOPE, ProxyEvent, ProxyState, anthropic, guard, legacy, openai_chat, openai_responses,
+    sse,
+};
 
 /// Header naming the vault scope of a request (default `global`).
 pub const SCOPE_HEADER: &str = "x-parda-scope";
@@ -47,7 +50,7 @@ pub async fn bind(cfg: &ProxyConfig) -> anyhow::Result<tokio::net::TcpListener> 
         anyhow::bail!("proxy.listen = {} resolves to no address", cfg.listen);
     }
     if !cfg.allow_non_loopback
-        && let Some(a) = addrs.iter().find(|a| !a.ip().is_loopback())
+        && let Some(a) = addrs.iter().find(|a| !a.ip().to_canonical().is_loopback())
     {
         anyhow::bail!(
             "proxy.listen = {} resolves to {a}, which is not a loopback address; parda only \
@@ -136,7 +139,7 @@ fn scope_of(headers: &HeaderMap) -> String {
                 && s.chars()
                     .all(|c| c.is_ascii_alphanumeric() || "_.:-".contains(c))
         })
-        .unwrap_or("global")
+        .unwrap_or(DEFAULT_SCOPE)
         .to_string()
 }
 
@@ -221,6 +224,33 @@ fn redact_body(
         unscanned,
         paused,
     })
+}
+
+/// Why a request body could not be turned into a redacted one.
+enum PrepareError {
+    Body(BodyError),
+    TooManyScopes,
+    Engine(EngineError),
+}
+
+/// Everything CPU-heavy that happens to a request body, for a blocking
+/// thread: undo `Content-Encoding` (up to `max` bytes), parse, check it is a
+/// JSON object, admit its scope (only now that it is a valid request), then
+/// redact.
+fn prepare_body(
+    state: &ProxyState,
+    walker: Walker,
+    headers: &HeaderMap,
+    body: Bytes,
+    max: usize,
+    scope: &str,
+) -> Result<Redacted, PrepareError> {
+    let raw = body::decode(headers, body, max).map_err(PrepareError::Body)?;
+    let v = body::parse_object(&raw).map_err(PrepareError::Body)?;
+    if !state.admit_scope(scope) {
+        return Err(PrepareError::TooManyScopes);
+    }
+    redact_body(&state.engine, walker, &raw, v, scope).map_err(PrepareError::Engine)
 }
 
 fn restore_body(
@@ -369,6 +399,13 @@ fn finish(
         streaming = event.streaming,
         "proxied request"
     );
+    if event.passthrough {
+        tracing::warn!(
+            provider = event.provider,
+            path = %event.path,
+            "passed through unfiltered (proxy.passthrough_paths)"
+        );
+    }
     let _ = state.events.send(event);
     resp
 }
@@ -395,6 +432,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         status: 0,
         streaming: false,
         paused: false,
+        passthrough: false,
         error: None,
     };
 
@@ -403,19 +441,6 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         return finish(&state, event, resp, Some("parda_forbidden".into()));
     }
     let scope = scope_of(&parts.headers);
-    if provider.rewrites() && !state.admit_scope(&scope) {
-        let resp = error_response(
-            provider,
-            StatusCode::BAD_REQUEST,
-            "parda_too_many_scopes",
-            &format!(
-                "this proxy already serves {} vault scopes (x-parda-scope); restart the \
-                 daemon to reset them",
-                crate::MAX_SCOPES
-            ),
-        );
-        return finish(&state, event, resp, Some("parda_too_many_scopes".into()));
-    }
     let body = match axum::body::to_bytes(body, cfg.max_body_bytes).await {
         Ok(b) => b,
         Err(_) => {
@@ -429,51 +454,57 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         }
     };
 
-    // An endpoint parda cannot redact may only carry bodies without text.
-    if !provider.rewrites()
-        && !body.is_empty()
-        && !carries_no_text(&parts.headers, &body, cfg.max_body_bytes)
-    {
-        let resp = error_response(
-            provider,
-            StatusCode::BAD_REQUEST,
-            "parda_unknown_endpoint",
-            &format!(
-                "parda does not know which fields of {} {path} carry text, so it cannot redact \
-                 them; the request was not sent. Endpoints parda redacts: {SUPPORTED}",
-                parts.method
-            ),
-        );
-        return finish(&state, event, resp, Some("parda_unknown_endpoint".into()));
+    // An endpoint parda cannot redact may only carry bodies without text,
+    // unless the user listed its path in `proxy.passthrough_paths`.
+    if !provider.rewrites() {
+        if passthrough_listed(&cfg.passthrough_paths, &path) {
+            event.passthrough = true;
+        } else if !body.is_empty() {
+            let (headers, body2, max) = (parts.headers.clone(), body.clone(), cfg.max_body_bytes);
+            let no_text =
+                tokio::task::spawn_blocking(move || carries_no_text(&headers, &body2, max))
+                    .await
+                    .unwrap_or(false);
+            if !no_text {
+                let resp = error_response(
+                    provider,
+                    StatusCode::BAD_REQUEST,
+                    "parda_unknown_endpoint",
+                    &format!(
+                        "parda does not know which fields of {} {path} carry text, so it cannot \
+                         redact them; the request was not sent. Endpoints parda redacts: \
+                         {SUPPORTED}. To forward this path unfiltered, list it in \
+                         proxy.passthrough_paths.",
+                        parts.method
+                    ),
+                );
+                return finish(&state, event, resp, Some("parda_unknown_endpoint".into()));
+            }
+        }
     }
 
     // Redact the request. A body parda cannot read is refused, never
-    // forwarded as is.
+    // forwarded as is. Decoding, parsing and redacting all happen on a
+    // blocking thread: a 64 MiB inflate must not stall the async workers.
     let mut out_body = body.clone();
     let mut redact_ms = 0;
     let mut decoded = false;
+    let had_body = !body.is_empty();
     if let Some(walker) = request_walker(provider)
-        && !body.is_empty()
+        && had_body
     {
-        let (raw, v) = match body::decode(&parts.headers, body, cfg.max_body_bytes)
-            .and_then(|raw| body::parse_json(&raw).map(|v| (raw, v)))
-        {
-            Ok(x) => x,
-            Err(e) => {
-                let (resp, code) = body_error(provider, &e);
-                return finish(&state, event, resp, Some(code));
-            }
-        };
-        decoded = body::is_encoded(&parts.headers);
         let started = Instant::now();
-        let engine = state.engine.clone();
-        let scope2 = scope.clone();
-        let res =
-            tokio::task::spawn_blocking(move || redact_body(&engine, walker, &raw, v, &scope2))
-                .await;
+        let st = state.clone();
+        let headers = parts.headers.clone();
+        let (max, scope2) = (cfg.max_body_bytes, scope.clone());
+        let res = tokio::task::spawn_blocking(move || {
+            prepare_body(&st, walker, &headers, body, max, &scope2)
+        })
+        .await;
         redact_ms = started.elapsed().as_millis() as u64;
         match res {
             Ok(Ok(r)) => {
+                decoded = body::is_encoded(&parts.headers);
                 event.counts = r.counts;
                 event.ml_ms = r.ml_ms;
                 event.unscanned_media = r.unscanned.media;
@@ -493,7 +524,25 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
                 }
                 out_body = Bytes::from(r.body);
             }
-            Ok(Err(e)) => {
+            Ok(Err(PrepareError::Body(e))) => {
+                let (resp, code) = body_error(provider, &e);
+                return finish(&state, event, resp, Some(code));
+            }
+            Ok(Err(PrepareError::TooManyScopes)) => {
+                let resp = error_response(
+                    provider,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "parda_too_many_scopes",
+                    &format!(
+                        "this proxy already serves {} vault scopes (x-parda-scope), so the \
+                         scope `{scope}` was not added and the request was not sent; use one \
+                         of the existing scopes or restart the daemon to reset them",
+                        crate::MAX_SCOPES
+                    ),
+                );
+                return finish(&state, event, resp, Some("parda_too_many_scopes".into()));
+            }
+            Ok(Err(PrepareError::Engine(e))) => {
                 let (resp, code) = engine_error(provider, &e);
                 return finish(&state, event, resp, Some(code));
             }
@@ -508,6 +557,9 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
             }
         }
     }
+    // A request with no body used no scope (none was admitted for it), so
+    // there is nothing of that scope to restore in the answer.
+    let scope_usable = had_body || state.scope_known(&scope);
 
     // Forward.
     let base = if provider.is_anthropic() {
@@ -554,7 +606,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         .and_then(|v| v.to_str().ok())
         .is_some_and(|c| c.starts_with("text/event-stream"));
 
-    if is_sse && provider.restores() {
+    if is_sse && provider.restores() && scope_usable {
         let restorers = Restorers::new(state.engine.clone(), &scope);
         let rw: Box<dyn StreamRewriter> = match provider {
             Provider::Anthropic => Box::new(anthropic::AnthropicStream::new(restorers)),
@@ -572,11 +624,12 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         return finish(&state, event, resp, None);
     }
 
-    let restore = if status.is_success() {
-        provider.restores()
-    } else {
-        provider.rewrites()
-    };
+    let restore = scope_usable
+        && if status.is_success() {
+            provider.restores()
+        } else {
+            provider.rewrites()
+        };
     if !restore {
         // Nothing to restore: pass the body through as it arrives.
         event.added_ms = redact_ms;

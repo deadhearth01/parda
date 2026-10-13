@@ -125,6 +125,32 @@ pub fn normalize_path(raw: &str) -> String {
     format!("/{}", segments.join("/"))
 }
 
+/// True if parda redacts `POST` requests to this path, so listing it in
+/// `proxy.passthrough_paths` (or using another method on it) never makes it
+/// skip redaction.
+fn is_redacted_path(path: &str) -> bool {
+    route(&Method::POST, path, &HeaderMap::new()).rewrites()
+}
+
+fn entry_matches(entry: &str, path: &str) -> bool {
+    match entry.strip_suffix('*') {
+        Some(prefix) => {
+            let mut p = normalize_path(prefix);
+            if prefix.ends_with('/') && !p.ends_with('/') {
+                p.push('/');
+            }
+            path.starts_with(&p)
+        }
+        None => normalize_path(entry) == path,
+    }
+}
+
+/// True if `path` (already normalised) is listed in `proxy.passthrough_paths`
+/// and is not an endpoint parda knows how to redact.
+pub(crate) fn passthrough_listed(entries: &[String], path: &str) -> bool {
+    !entries.is_empty() && !is_redacted_path(path) && entries.iter().any(|e| entry_matches(e, path))
+}
+
 /// Route a request by method and normalised path (see [`normalize_path`]).
 pub fn route(method: &Method, path: &str, headers: &HeaderMap) -> Provider {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -194,6 +220,41 @@ mod tests {
             route(&Method::GET, "/v1/models", &a),
             Provider::PassAnthropic
         );
+    }
+
+    #[test]
+    fn passthrough_entries_match_exactly_or_by_prefix() {
+        let list = |e: &[&str]| e.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let e = list(&[
+            "/api/*",
+            "/v1/files",
+            "/v1/chat/completions",
+            "/v1/messages/*",
+        ]);
+        for (path, want) in [
+            ("/api/generate", true),
+            ("/api/a/b", true),
+            ("/api", false),
+            ("/apiary", false),
+            ("/v1/files", true),
+            ("/v1/files/f1", false),
+            ("/v1/filesx", false),
+            ("/v1/threads", false),
+            // Redacted endpoints are never passed through, even if listed.
+            ("/v1/chat/completions", false),
+            ("/v1/messages", false),
+            ("/v1/messages/batches", false),
+            ("/v1/messages/count_tokens", false),
+            ("/v1/messages/batches/b1/cancel", true),
+        ] {
+            assert_eq!(passthrough_listed(&e, path), want, "{path}");
+        }
+        assert!(!passthrough_listed(&[], "/api/generate"));
+        // Entries are normalised like request paths; a bare `*` is everything
+        // that is not redacted.
+        assert!(passthrough_listed(&list(&["//v1/./files/"]), "/v1/files"));
+        assert!(passthrough_listed(&list(&["*"]), "/anything"));
+        assert!(!passthrough_listed(&list(&["*"]), "/v1/embeddings"));
     }
 
     #[test]

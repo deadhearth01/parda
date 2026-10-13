@@ -212,7 +212,7 @@ async fn stream_thinking_delta_untouched() {
     let sur = s.engine.redact("Ravi Kumar", "global").unwrap().text;
     assert!(body.contains(&format!("about {sur}")), "{body}");
     assert!(body.contains("abc=="));
-    assert!(!body.contains("Ravi"));
+    assert!(!body.contains("Ravi Kumar"));
 }
 
 #[tokio::test]

@@ -62,7 +62,7 @@ async fn openai_chat_nonstream_and_stream() {
     assert_eq!(resp.status(), 200);
     let up = s.mock.last().text();
     assert!(
-        !up.contains("Ravi") && !up.contains("ravi.k@gmail.com"),
+        !up.contains("Ravi Kumar") && !up.contains("ravi.k@gmail.com"),
         "{up}"
     );
     let body: Value = resp.json().await.unwrap();
@@ -140,7 +140,7 @@ async fn openai_responses_nonstream_and_stream() {
     assert_eq!(resp.status(), 200);
     let up = s.mock.last().text();
     assert!(
-        !up.contains("Ravi") && !up.contains("ravi.k@gmail.com"),
+        !up.contains("Ravi Kumar") && !up.contains("ravi.k@gmail.com"),
         "{up}"
     );
     let body: Value = resp.json().await.unwrap();

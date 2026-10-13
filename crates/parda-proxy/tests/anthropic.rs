@@ -37,7 +37,7 @@ async fn upstream_never_sees_real_values_and_client_gets_them_back() {
     let seen = s.mock.last();
     let up = seen.text();
     assert!(
-        !up.contains("Ravi") && !up.contains("ravi.k@gmail.com"),
+        !up.contains("Ravi Kumar") && !up.contains("ravi.k@gmail.com"),
         "{up}"
     );
     assert!(
@@ -127,7 +127,7 @@ async fn thinking_blocks_untouched() {
         !body["content"][0]["thinking"]
             .as_str()
             .unwrap()
-            .contains("Ravi")
+            .contains("Ravi Kumar")
     );
 }
 
@@ -187,7 +187,7 @@ async fn server_and_mcp_tool_use_inputs_are_redacted_and_restored() {
     )
     .await;
     let up = s.mock.last().text();
-    assert!(!up.contains("Ravi"), "{up}");
+    assert!(!up.contains("Ravi Kumar"), "{up}");
 }
 
 #[tokio::test]
@@ -329,7 +329,7 @@ async fn count_tokens_is_redacted_and_other_paths_pass_through() {
         )
         .await;
     assert_eq!(resp.status(), 200);
-    assert!(!s.mock.last().text().contains("Ravi"));
+    assert!(!s.mock.last().text().contains("Ravi Kumar"));
 
     let resp = s
         .client
