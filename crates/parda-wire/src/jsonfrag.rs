@@ -81,6 +81,15 @@ impl JsonFragRestorer {
         out
     }
 
+    /// Text held back: a possible surrogate prefix or an unfinished escape.
+    pub fn pending_len(&self) -> usize {
+        self.restorer
+            .as_ref()
+            .map_or(0, StreamRestorer::pending_len)
+            + self.escape.len()
+            + self.high.as_ref().map_or(0, |(_, raw)| raw.len())
+    }
+
     /// Flush everything held back (the document may be truncated).
     pub fn finish(&mut self) -> String {
         let mut out = String::new();
@@ -318,6 +327,23 @@ mod tests {
             // Keys are left exactly as they came.
             assert_eq!(v[format!("k\"{name}")], 1);
         }
+    }
+
+    #[test]
+    fn pending_len_counts_what_is_held_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path());
+        let tag = e.redact("Ravi Kumar", "global").unwrap().text;
+        let mut r = JsonFragRestorer::new(e.clone(), "global");
+        assert_eq!(r.push("{\"a\": \"x "), "{\"a\": \"x ");
+        assert_eq!(r.pending_len(), 0);
+        let half = &tag[..tag.len() - 2];
+        assert_eq!(r.push(half), "");
+        assert_eq!(r.pending_len(), half.len());
+        r.push("\\u00");
+        assert_eq!(r.pending_len(), half.len() + 4);
+        assert_eq!(r.finish(), format!("{half}\\u00"));
+        assert_eq!(r.pending_len(), 0);
     }
 
     #[test]
