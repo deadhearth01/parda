@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use bytes::Bytes;
 use http::HeaderMap;
 use http::header::CONTENT_TYPE;
-use parda_core::{InterceptConfig, UnscannedMedia};
+use parda_core::{INTERCEPT_SCOPE_PER_HOST, InterceptConfig, UnscannedMedia};
 use parda_engine::{Engine, EngineError};
 use parda_wire::body::{self, BodyError};
 use parda_wire::walk::preserve_numbers;
@@ -23,16 +23,32 @@ use crate::{BodyTransform, Refusal, StreamTransform};
 
 /// The settings one request uses (a snapshot of `[intercept]`).
 struct Settings {
-    scope: String,
+    /// A fixed vault scope, or `None` for one scope per site.
+    scope: Option<String>,
     unscanned: UnscannedMedia,
     skip_keys: Vec<String>,
     hosts: HostList,
 }
 
 impl Settings {
+    /// The vault scope of `host`: `intercept:<listed host>` per site, so a
+    /// site's answers only restore tags issued for text sent to it.
+    fn scope_for(&self, host: &str) -> String {
+        match &self.scope {
+            Some(fixed) => fixed.clone(),
+            None => {
+                let site = self.hosts.entry_for(host).map_or_else(
+                    || host.trim_end_matches('.').to_ascii_lowercase(),
+                    str::to_string,
+                );
+                format!("intercept:{site}")
+            }
+        }
+    }
+
     fn from_config(cfg: &InterceptConfig) -> Self {
         Settings {
-            scope: cfg.scope.clone(),
+            scope: (cfg.scope != INTERCEPT_SCOPE_PER_HOST).then(|| cfg.scope.clone()),
             unscanned: cfg.unscanned,
             skip_keys: cfg.skip_keys.clone(),
             hosts: HostList::new(&cfg.hosts),
@@ -122,7 +138,7 @@ impl EngineTransform {
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let reds = self
             .engine
-            .redact_many_tiered(&refs, &rules_only, &st.scope)
+            .redact_many_tiered(&refs, &rules_only, &st.scope_for(host))
             .map_err(engine_refusal)?;
         let mut counts = BTreeMap::new();
         for r in &reds {
@@ -359,8 +375,9 @@ impl BodyTransform for EngineTransform {
         path: &str,
         content_type: &str,
     ) -> Box<dyn StreamTransform> {
-        let _ = (host, path);
-        crate::restore::for_content_type(&self.engine, &self.settings().scope, content_type)
+        let _ = path;
+        let scope = self.settings().scope_for(host);
+        crate::restore::for_content_type(&self.engine, &scope, content_type)
     }
 
     fn request_outcome(
@@ -401,6 +418,8 @@ pub(crate) mod tests {
     use serde_json::{Value, json};
 
     pub(crate) const UUID: &str = "aaa2b8c1-55f4-4bd2-9a1c-0123456789ab";
+    /// A value that needs JSON escaping.
+    pub(crate) const QUOTED: &str = "Flat 4\\B, \"Lotus\" Pune";
 
     /// An engine that knows "Ravi Kumar" (no ML model unless `ml`).
     pub(crate) fn engine_with(
@@ -417,6 +436,10 @@ pub(crate) mod tests {
                 rules: RulesFile {
                     person: vec![PersonBlock {
                         name: "Ravi Kumar".into(),
+                        ..Default::default()
+                    }],
+                    term: vec![parda_detect::Term {
+                        text: QUOTED.into(),
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -503,7 +526,7 @@ pub(crate) mod tests {
         // The same value gets the same tag again; a lower-case echo of the
         // tag restores too.
         assert_eq!(
-            e.restore("[NAME_1] / [name_1]", "global"),
+            e.restore("[NAME_1] / [name_1]", "intercept:chatgpt.com"),
             "Ravi Kumar / Ravi Kumar"
         );
     }
@@ -694,7 +717,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             out.body,
-            "conversation_id=%5BNAME_1%5D&at=AJvLN6M%3A1697000000000&type=%5BEMAIL_3%5D"
+            "conversation_id=%5BNAME_1%5D&at=AJvLN6M%3A1697000000000&type=%5BEMAIL_1%5D"
         );
         let out = t
             .rewrite_request(
@@ -714,6 +737,46 @@ pub(crate) mod tests {
             Bytes::from(mp),
         );
         assert_eq!(out.body, mp.replace("Ravi Kumar", "[NAME_1]"));
+    }
+
+    /// Restore `body` as the answer of `host`.
+    fn answer(t: &EngineTransform, host: &str, body: &str) -> String {
+        let mut r = t.response_stream(host, "/", "text/plain");
+        let mut out = r.push(body.as_bytes()).to_vec();
+        out.extend_from_slice(&r.finish());
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn scopes_are_per_site_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path());
+        let t = transform(&e, |_| {});
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "text/plain",
+            Bytes::from("I am Ravi Kumar"),
+        );
+        assert_eq!(out.body, "I am [NAME_1]");
+        // Only the site the tag was issued for gets the value back
+        // (subdomains are the same site).
+        assert_eq!(answer(&t, "chatgpt.com", "hi [NAME_1]"), "hi Ravi Kumar");
+        assert_eq!(answer(&t, "ab.chatgpt.com", "hi [NAME_1]"), "hi Ravi Kumar");
+        assert_eq!(answer(&t, "claude.ai", "hi [NAME_1]"), "hi [NAME_1]");
+        assert_eq!(e.restore("[NAME_1]", "intercept:chatgpt.com"), "Ravi Kumar");
+        // Tags from other surfaces (the clipboard, the agent proxy) are not
+        // restored on any site.
+        let dir2 = tempfile::tempdir().unwrap();
+        let e2 = engine(dir2.path());
+        assert_eq!(e2.redact("Ravi Kumar", "global").unwrap().text, "[NAME_1]");
+        let t2 = transform(&e2, |_| {});
+        assert_eq!(answer(&t2, "claude.ai", "hi [NAME_1]"), "hi [NAME_1]");
+        // A fixed scope name is shared by every site.
+        let t3 = transform(&e2, |c| c.scope = "global".into());
+        assert_eq!(answer(&t3, "claude.ai", "hi [NAME_1]"), "hi Ravi Kumar");
+        let out = rewrite(&t3, "claude.ai", "text/plain", Bytes::from("Ravi Kumar"));
+        assert_eq!(out.body, "[NAME_1]");
     }
 
     fn multipart_body() -> Bytes {

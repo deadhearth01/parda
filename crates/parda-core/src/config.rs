@@ -200,6 +200,9 @@ impl Default for ClipboardConfig {
     }
 }
 
+/// `intercept.scope` value giving each site its own vault scope.
+pub const INTERCEPT_SCOPE_PER_HOST: &str = "per-host";
+
 /// The AI sites intercepted by default.
 pub const DEFAULT_INTERCEPT_HOSTS: [&str; 11] = [
     "chatgpt.com",
@@ -225,8 +228,11 @@ pub struct InterceptConfig {
     /// Hosts decrypted and filtered (subdomains included); every other host
     /// is tunnelled untouched.
     pub hosts: Vec<String>,
-    /// Vault scope for intercepted traffic (`global` shares tags with the
-    /// clipboard and the agent proxy).
+    /// Vault scope for intercepted traffic. `per-host` (the default) gives
+    /// each listed site its own scope, `intercept:<host>`, so a site's
+    /// answers can only restore tags issued for text sent to that same site.
+    /// Any other value is a fixed scope name shared by every site (`global`
+    /// also shares tags with the clipboard and the agent proxy).
     pub scope: String,
     /// Request parts parda cannot read (file uploads, binary bodies):
     /// forwarded with a warning (`allow`) or refused (`block`).
@@ -242,7 +248,7 @@ impl Default for InterceptConfig {
             enabled: false,
             listen: "127.0.0.1:8788".into(),
             hosts: DEFAULT_INTERCEPT_HOSTS.map(String::from).to_vec(),
-            scope: "global".into(),
+            scope: INTERCEPT_SCOPE_PER_HOST.into(),
             unscanned: UnscannedMedia::Allow,
             skip_keys: Vec::new(),
         }
@@ -453,7 +459,7 @@ mod tests {
                 "poe.com",
             ]
         );
-        assert_eq!(c.intercept.scope, "global");
+        assert_eq!(c.intercept.scope, "per-host");
         assert_eq!(c.intercept.unscanned, UnscannedMedia::Allow);
         assert!(c.intercept.skip_keys.is_empty());
 

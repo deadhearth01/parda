@@ -487,3 +487,29 @@ fn the_fake_site_answers_for_listed_hosts_only() {
         assert!(hosts.matches(s));
     }
 }
+
+#[tokio::test]
+async fn a_tag_issued_for_one_site_is_not_restored_for_another() {
+    let up = start_upstream(site()).await;
+    let parda = start_parda(&up, |_| {}, None).await;
+    let c = parda.client();
+    let post = |host: &str, body: &str| {
+        c.post(format!("https://{host}:{}/echo", up.port))
+            .header("content-type", "text/plain")
+            .body(body.to_string())
+            .send()
+    };
+    // chatgpt.com gets [NAME_1] for Ravi Kumar, and its echo comes back real.
+    let res = post("chatgpt.com", "I am Ravi Kumar").await.unwrap();
+    assert_eq!(res.text().await.unwrap(), "echo: I am Ravi Kumar");
+    // claude.ai answering with that tag gets nothing back.
+    let res = post("claude.ai", "[NAME_1]").await.unwrap();
+    assert_eq!(res.text().await.unwrap(), "echo: [NAME_1]");
+    let seen = up.seen();
+    assert_eq!(seen[0].text(), "I am [NAME_1]");
+    assert_eq!(seen[1].text(), "[NAME_1]");
+    assert_eq!(
+        parda.engine.restore("[NAME_1]", "intercept:chatgpt.com"),
+        "Ravi Kumar"
+    );
+}
