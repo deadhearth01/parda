@@ -546,35 +546,48 @@ enum Check {
 /// inside a word), or a match that is not one of the placed stand-ins (a
 /// stand-in running into neighbouring text that together read as another
 /// stand-in). Each region is widened to whole words.
+///
+/// `r.placed` and the matches are both sorted by output offset, so this is
+/// one merge walk plus a binary search per bad match.
 fn self_check(table: &RestoreTable, input: &str, r: &Rendered) -> Check {
     if table.apply(&r.text, None) == input {
         return Check::Ok;
     }
     let found = table.find(&r.text, None);
+    let placed = &r.placed;
     let mut regions: Vec<(Span, EntityKind)> = Vec::new();
-    for p in &r.placed {
-        let ok = found.iter().any(|f| {
-            f.start == p.out.start
-                && f.end == p.out.end
-                && table.replacement(f.pattern, &r.text[f.start..f.end])
-                    == input[p.input.start..p.input.end]
-        });
-        if !ok {
-            regions.push((p.input, p.kind.clone()));
+    let (mut i, mut j) = (0, 0);
+    loop {
+        match (placed.get(i), found.get(j)) {
+            (Some(p), Some(f)) if p.out.start == f.start && p.out.end == f.end => {
+                if table.replacement(f.pattern, &r.text[f.start..f.end])
+                    != input[p.input.start..p.input.end]
+                {
+                    regions.push((p.input, p.kind.clone()));
+                }
+                i += 1;
+                j += 1;
+            }
+            // A stand-in restore does not find where it was placed.
+            (Some(p), Some(f)) if p.out.start <= f.start => {
+                regions.push((p.input, p.kind.clone()));
+                i += 1;
+            }
+            (Some(p), None) => {
+                regions.push((p.input, p.kind.clone()));
+                i += 1;
+            }
+            // A match that is not a placed stand-in.
+            (_, Some(f)) => {
+                let span = Span::new(
+                    map_to_input(placed, f.start, false),
+                    map_to_input(placed, f.end, true),
+                );
+                regions.push((span, table.kind(f.pattern).clone()));
+                j += 1;
+            }
+            (None, None) => break,
         }
-    }
-    for f in &found {
-        if r.placed
-            .iter()
-            .any(|p| p.out.start == f.start && p.out.end == f.end)
-        {
-            continue;
-        }
-        let span = Span::new(
-            map_to_input(&r.placed, f.start, false),
-            map_to_input(&r.placed, f.end, true),
-        );
-        regions.push((span, table.kind(f.pattern).clone()));
     }
     let repairs: Vec<Detection> = regions
         .into_iter()
@@ -585,7 +598,10 @@ fn self_check(table: &RestoreTable, input: &str, r: &Rendered) -> Check {
             source: Source::Dictionary,
         })
         // A region that cannot grow would fail the same way again.
-        .filter(|d| !r.placed.iter().any(|p| p.input == d.span))
+        .filter(|d| {
+            let k = placed.partition_point(|p| p.input.start < d.span.start);
+            placed.get(k).is_none_or(|p| p.input != d.span)
+        })
         .collect();
     if repairs.is_empty() {
         Check::Fail
@@ -596,23 +612,22 @@ fn self_check(table: &RestoreTable, input: &str, r: &Rendered) -> Check {
 
 /// Input offset of output offset `o`: inside a stand-in it maps to the start
 /// (or, for an `end` offset, the end) of the real value it replaced.
+/// `placed` is sorted by output offset.
 fn map_to_input(placed: &[Placed], o: usize, end: bool) -> usize {
-    let (mut out_pos, mut in_pos) = (0usize, 0usize);
-    for p in placed {
-        let inside = if end {
-            p.out.start < o && o <= p.out.end
-        } else {
-            p.out.start <= o && o < p.out.end
-        };
-        if inside {
-            return if end { p.input.end } else { p.input.start };
-        }
-        if p.out.start >= o {
-            break;
-        }
-        (out_pos, in_pos) = (p.out.end, p.input.end);
+    // The last stand-in starting before `o` (at or before it, for a start).
+    let k = if end {
+        placed.partition_point(|p| p.out.start < o)
+    } else {
+        placed.partition_point(|p| p.out.start <= o)
+    };
+    let Some(p) = k.checked_sub(1).map(|k| &placed[k]) else {
+        return o;
+    };
+    match (end, o < p.out.end, o == p.out.end) {
+        (false, true, _) => p.input.start,
+        (true, true, _) | (true, _, true) => p.input.end,
+        _ => p.input.end + (o - p.out.end),
     }
-    in_pos + (o - out_pos)
 }
 
 /// `span` grown left and right over adjacent letters and digits.
@@ -1498,6 +1513,60 @@ mod tests {
         assert_eq!(map_to_input(&placed, 3, true), 4);
         assert_eq!(map_to_input(&placed, 11, true), 10);
         assert_eq!(map_to_input(&placed, 6, false), 5);
+    }
+
+    #[test]
+    fn self_check_scales_to_many_stand_ins() {
+        // 50k e-mail stand-ins in 2 MB and one model span cut inside a word.
+        let entries = [
+            Entry {
+                surrogate: "arjun.m@gmail.com".into(),
+                real: "ravi.k@gmail.com".into(),
+                kind: EntityKind::Email,
+            },
+            Entry {
+                surrogate: "Madhuri".into(),
+                real: "Zubin".into(),
+                kind: EntityKind::Person,
+            },
+        ];
+        let table = RestoreTable::build(&entries);
+        let (mut input, mut out, mut placed) = (String::new(), String::new(), Vec::new());
+        for _ in 0..50_000 {
+            input.push_str("Contact ");
+            out.push_str("Contact ");
+            let (i, o) = (input.len(), out.len());
+            input.push_str("ravi.k@gmail.com");
+            out.push_str("arjun.m@gmail.com");
+            placed.push(Placed {
+                out: Span::new(o, out.len()),
+                input: Span::new(i, input.len()),
+                kind: EntityKind::Email,
+            });
+            input.push_str(" about order 12345.\n");
+            out.push_str(" about order 12345.\n");
+        }
+        let (i, o) = (input.len(), out.len());
+        input.push_str("Zubinx is here");
+        out.push_str("Madhurix is here");
+        placed.push(Placed {
+            out: Span::new(o, o + 7),
+            input: Span::new(i, i + 5),
+            kind: EntityKind::Person,
+        });
+        let r = Rendered {
+            text: out,
+            replaced: Vec::new(),
+            placed,
+        };
+        let started = Instant::now();
+        let Check::Repair(regions) = self_check(&table, &input, &r) else {
+            panic!("expected a repair");
+        };
+        let elapsed = started.elapsed();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(&input[regions[0].span.start..regions[0].span.end], "Zubinx");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
     }
 
     #[test]
