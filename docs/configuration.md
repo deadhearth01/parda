@@ -15,6 +15,7 @@ unscanned_media = "allow"                    # allow | block — images / binary
 allowed_origins = []                         # web origins allowed to call the proxy
 allow_non_loopback = false                   # accept non-localhost Host headers
 max_body_bytes = 67108864
+passthrough_paths = []                       # paths forwarded unfiltered, e.g. ["/api/*"] (see below)
 
 [detect]
 mode = "strict"                    # strict: refuse if the model fails · fast: continue with rules
@@ -52,6 +53,26 @@ Built-in names ignore case and `_` / `-` / spaces (`secret`, `IP_ADDRESS` work);
 taken as a custom kind exactly as written, so it must match the `kind` in `rules.toml`. A key one or
 two letters away from a built-in name (`Aadhar`, `Pasport`) is almost certainly a typo: it names a
 custom kind nothing detects, and the built-in kind keeps its default action.
+
+### Endpoints parda does not know
+
+parda redacts the endpoints it knows (Messages, Chat Completions, Responses, legacy completions,
+embeddings, batches, conversations). A request with text in its body to any **other** path is
+refused (`400 parda_unknown_endpoint`) because parda cannot tell which fields carry text; bodies
+without text (`{}` for a cancel call, `GET /v1/models`) pass through.
+
+`proxy.passthrough_paths` opts specific paths in. An entry is an exact path (`"/v1/files"`) or, when
+it ends in `*`, a prefix (`"/api/*"` matches `/api/generate` and `/api/chat`, not `/api`). Matching
+uses the normalised path (`//api/%67enerate` is `/api/generate`). Requests to a listed path are
+forwarded **unchanged and unfiltered**, and each one raises a warning event ("passed through
+unfiltered (proxy.passthrough_paths)") in the TUI, `parda status` and the log. Endpoints parda knows
+how to redact are never passed through, even if listed. Example for Ollama's native API:
+
+```toml
+[proxy]
+openai_upstream = "http://127.0.0.1:11434"
+passthrough_paths = ["/api/*"]
+```
 
 ## Changing settings
 
