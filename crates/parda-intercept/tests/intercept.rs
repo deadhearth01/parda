@@ -887,4 +887,16 @@ async fn slow_and_idle_clients_are_disconnected() {
     .await
     .unwrap();
     closes(&mut tls, "idle decrypted connection").await;
+    // A streamed answer that pauses longer than the idle timeout (500 ms
+    // between events) is not cut: the timer only runs between requests.
+    let c = client(h.proxy, &h.state.ca.cert_pem());
+    let body = c
+        .get(format!("https://chat.test:{}/sse", up.port))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(body, "data: hello secret one\n\ndata: two secret\n\n");
 }

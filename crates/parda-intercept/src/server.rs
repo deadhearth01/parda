@@ -19,7 +19,7 @@ use http_body_util::{BodyExt, Empty, Full, LengthLimitError, Limited, StreamBody
 use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use rustls::crypto::CryptoProvider;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -175,8 +175,11 @@ pub async fn serve(listener: TcpListener, state: Arc<InterceptState>) -> anyhow:
         let state = state.clone();
         tokio::spawn(async move {
             let _ = tcp.set_nodelay(true);
+            let header_read = state.timeouts.header_read;
             let svc = service_fn(move |req| front(req, state.clone(), local));
             if let Err(e) = http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(header_read)
                 .serve_connection(TokioIo::new(tcp), svc)
                 .with_upgrades()
                 .await
@@ -351,16 +354,30 @@ async fn intercept_tls(
             return;
         }
     };
-    let tls = match TlsAcceptor::from(Arc::new(cfg)).accept(io).await {
-        Ok(t) => t,
-        Err(e) => {
+    let handshake = tokio::time::timeout(
+        state.timeouts.tls_handshake,
+        TlsAcceptor::from(Arc::new(cfg)).accept(io),
+    );
+    let tls = match handshake.await {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
             tracing::debug!(%host, error = %e, "intercept: client TLS handshake failed");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!(%host, "intercept: client TLS handshake timed out");
             return;
         }
     };
     let target = Arc::new(Target { host, port });
+    // hyper runs the header-read timer whenever the connection waits for a
+    // request head, so it is also the idle timeout between requests (not
+    // during a streamed response).
+    let idle = state.timeouts.idle;
     let svc = service_fn(move |req| forward(req, state.clone(), target.clone()));
     if let Err(e) = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(idle)
         .serve_connection(TokioIo::new(tls), svc)
         .with_upgrades()
         .await
@@ -399,6 +416,18 @@ async fn forward(
     state: Arc<InterceptState>,
     target: Arc<Target>,
 ) -> Result<Response<Body>, Infallible> {
+    // Origin-form ("/path") or absolute-form only: not "*" (OPTIONS *) and
+    // not authority-form.
+    let uri = req.uri();
+    let origin_form =
+        uri.scheme().is_none() && uri.authority().is_none() && uri.path().starts_with('/');
+    let absolute_form = uri.scheme().is_some() && uri.authority().is_some();
+    if !(origin_form || absolute_form) {
+        return Ok(text(
+            StatusCode::BAD_REQUEST,
+            "parda intercept: unsupported request target\n",
+        ));
+    }
     let path = req.uri().path().to_string();
     // Requests on this connection may only go to the CONNECT host.
     let host_ok = req
