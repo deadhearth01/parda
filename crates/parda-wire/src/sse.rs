@@ -25,6 +25,12 @@ impl SseEvent {
         }
     }
 
+    #[cfg(test)]
+    fn with_raw(mut self, raw: &'static [u8]) -> Self {
+        self.raw = Some(Bytes::from_static(raw));
+        self
+    }
+
     /// Replace the data (drops the raw bytes).
     pub fn set_data(&mut self, data: String) {
         self.data = data;
@@ -142,6 +148,19 @@ impl SseParser {
                 }
             }
         }
+    }
+
+    /// Bytes held for an event that is not complete yet.
+    pub fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Take the bytes held for an incomplete event, as they came (for a
+    /// caller that gives up on parsing, e.g. an event too large to hold).
+    pub fn take_buffered(&mut self) -> Bytes {
+        self.scanned = 0;
+        self.searched = 0;
+        self.buf.split().freeze()
     }
 
     /// Whatever is left when the stream ends without a final blank line.
@@ -387,6 +406,19 @@ mod tests {
         for n in 1..12 {
             assert_eq!(all(n), whole, "{n}");
         }
+    }
+
+    #[test]
+    fn buffered_bytes_can_be_taken_back() {
+        let mut p = SseParser::default();
+        assert_eq!(
+            p.feed(b"data: a\n\ndata: long"),
+            [SseEvent::new(None, "a".into()).with_raw(b"data: a\n\n")]
+        );
+        assert_eq!(p.buffered(), 10);
+        assert_eq!(p.take_buffered(), Bytes::from_static(b"data: long"));
+        assert_eq!(p.buffered(), 0);
+        assert_eq!(p.feed(b"data: b\n\n").len(), 1);
     }
 
     #[test]

@@ -33,6 +33,16 @@ fn events(body: &[u8]) -> Vec<SseEvent> {
     evs
 }
 
+/// Gemini's answer frame (JSON inside a JSON string).
+const GEMINI_ANSWER: &str = "[[\"wrb.fr\",null,\"[[\\\"Hi [NAME_1]\\\"]]\"]]";
+
+/// A Google length-prefixed frame: the number counts the payload in UTF-16
+/// code units, starting right after the digits.
+fn gemini_frame(json: &str) -> String {
+    let payload = format!("\n{json}\n");
+    format!("{}{payload}", payload.encode_utf16().count())
+}
+
 /// The fake site: chatgpt.com, claude.ai and Gemini endpoints.
 fn site() -> Responder {
     Arc::new(|seen: &Seen| match seen.path.as_str() {
@@ -112,14 +122,19 @@ fn site() -> Responder {
                 (Some("message_stop"), json!({"type": "message_stop"})),
             ])
         }),
-        p if p.contains("StreamGenerate") => Reply::new(
-            "application/json; charset=utf-8",
-            vec![
-                ")]}'\n\n",
-                "64\n[[\"wrb.fr\",null,\"[[\\\"Hi [NA",
-                "ME_1]\\\"]]\"]]\n",
-            ],
-        ),
+        p if p.contains("StreamGenerate") => {
+            // A Google length-prefixed frame, split inside the tag.
+            let framed = gemini_frame(GEMINI_ANSWER);
+            let cut = framed.find("[NA").unwrap() + 3;
+            Reply::new(
+                "application/json; charset=utf-8",
+                vec![
+                    ")]}'\n\n".to_string(),
+                    framed[..cut].to_string(),
+                    framed[cut..].to_string(),
+                ],
+            )
+        }
         _ => Reply::new("text/plain", vec![format!("echo: {}", seen.text())]),
     })
 }
@@ -311,10 +326,13 @@ async fn gemini_form_with_json_in_strings() {
         .unwrap();
     assert_eq!(res.status(), 200);
     let answer = res.text().await.unwrap();
-    // The XSSI-prefixed JSON-in-text answer is restored in place.
+    // The XSSI-prefixed frame is restored, its length recomputed.
     assert_eq!(
         answer,
-        ")]}'\n\n64\n[[\"wrb.fr\",null,\"[[\\\"Hi Ravi Kumar\\\"]]\"]]\n"
+        format!(
+            ")]}}'\n\n{}",
+            gemini_frame(&GEMINI_ANSWER.replace("[NAME_1]", "Ravi Kumar"))
+        )
     );
 
     let seen = up.seen();

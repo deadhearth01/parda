@@ -39,6 +39,8 @@ use serde_json::Value;
 use crate::StreamTransform;
 use parda_wire::urlguard::Guarded;
 
+/// The most held for one SSE event, NDJSON line or Google frame.
+const MAX_ITEM_BYTES: usize = 16 * 1024 * 1024;
 /// JSON bodies up to this size are restored as whole documents.
 const MAX_JSON_BUFFER: usize = 16 * 1024 * 1024;
 /// Events held back waiting for undecided text, at most (then flushed).
@@ -59,6 +61,18 @@ pub(crate) fn for_content_type(
     scope: &str,
     content_type: &str,
 ) -> Box<dyn StreamTransform> {
+    for_content_type_capped(engine, scope, content_type, MAX_ITEM_BYTES)
+}
+
+/// [`for_content_type`] with `cap` bytes at most held for one event, line or
+/// frame: a larger one goes out as it came and the rest of the stream
+/// passes through unrestored.
+pub(crate) fn for_content_type_capped(
+    engine: &Engine,
+    scope: &str,
+    content_type: &str,
+    cap: usize,
+) -> Box<dyn StreamTransform> {
     let media = content_type
         .split(';')
         .next()
@@ -69,21 +83,20 @@ pub(crate) fn for_content_type(
         "text/event-stream" => Box::new(SseRestore {
             parser: SseParser::default(),
             events: Events::new(engine, scope),
+            cap,
+            raw: false,
         }),
         "application/x-ndjson"
         | "application/ndjson"
         | "application/jsonl"
         | "application/x-jsonlines"
-        | "application/stream+json" => Box::new(NdjsonRestore {
-            buf: Vec::new(),
-            scanned: 0,
-            events: Events::new(engine, scope),
-        }),
+        | "application/stream+json" => Box::new(NdjsonRestore::new(engine, scope, cap)),
         m if m == "application/json" || m == "text/json" || m.ends_with("+json") => {
             Box::new(JsonRestore {
                 engine: engine.clone(),
                 scope: scope.to_string(),
-                mode: JsonMode::Buffer(Vec::new()),
+                cap,
+                mode: JsonMode::Buffer(Vec::new(), TopLevel::default()),
             })
         }
         "text/plain" => Box::new(PlainRestore {
@@ -296,41 +309,116 @@ impl StreamTransform for PlainRestore {
 }
 
 enum JsonMode {
-    Buffer(Vec<u8>),
+    /// Buffered (and scanned for a second top-level value).
+    Buffer(Vec<u8>, TopLevel),
     Stream(TextStream),
-    /// `)]}'`-prefixed JSON-in-text: one JSON value per line.
-    Lines(JsonLines),
+    /// `)]}'`-prefixed: Google's length-prefixed frames.
+    Frames(Frames),
+    /// Several JSON values one per line: an NDJSON stream after all.
+    Lines(NdjsonRestore),
+}
+
+/// Where the first top-level JSON value of a body ends, and whether
+/// another follows on a later line (bytes are scanned once).
+#[derive(Default)]
+struct TopLevel {
+    pos: usize,
+    depth: u32,
+    in_string: bool,
+    escaped: bool,
+    started: bool,
+    /// The first value is not an object or array: never several values.
+    scalar: bool,
+    done: bool,
+    newline_after: bool,
+}
+
+impl TopLevel {
+    /// Scan the new bytes of `buf`: true once a second value starts on a
+    /// line after the first.
+    fn more_values(&mut self, buf: &[u8]) -> bool {
+        while self.pos < buf.len() && !self.scalar {
+            let b = buf[self.pos];
+            self.pos += 1;
+            if self.done {
+                if b == b'\n' {
+                    self.newline_after = true;
+                } else if !b.is_ascii_whitespace() {
+                    return self.newline_after;
+                }
+                continue;
+            }
+            if !self.started {
+                match b {
+                    b'{' | b'[' => {
+                        self.started = true;
+                        self.depth = 1;
+                    }
+                    0xef | 0xbb | 0xbf => {}
+                    b if b.is_ascii_whitespace() => {}
+                    _ => self.scalar = true,
+                }
+                continue;
+            }
+            if self.in_string {
+                match (self.escaped, b) {
+                    (true, _) => self.escaped = false,
+                    (false, b'\\') => self.escaped = true,
+                    (false, b'"') => self.in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match b {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => self.depth += 1,
+                b'}' | b']' => {
+                    self.depth -= 1;
+                    if self.depth == 0 {
+                        self.done = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
 }
 
 /// A JSON document: restored whole when it fits the buffer.
 struct JsonRestore {
     engine: Engine,
     scope: String,
+    cap: usize,
     mode: JsonMode,
 }
 
 impl StreamTransform for JsonRestore {
     fn push(&mut self, chunk: &[u8]) -> Bytes {
-        let buf = match &mut self.mode {
+        let (buf, top) = match &mut self.mode {
             JsonMode::Stream(s) => return Bytes::from(s.push_bytes(chunk)),
-            JsonMode::Lines(l) => return Bytes::from(l.push(chunk)),
-            JsonMode::Buffer(buf) => {
+            JsonMode::Frames(f) => return Bytes::from(f.push(chunk)),
+            JsonMode::Lines(l) => return l.push(chunk),
+            JsonMode::Buffer(buf, top) => {
                 buf.extend_from_slice(chunk);
-                buf
+                (buf, top)
             }
         };
-        if buf.starts_with(XSSI_PREFIX) {
-            // JSON inside text, sent in pieces: each line as it completes.
+        if buf.len() >= XSSI_PREFIX.len() && buf.starts_with(XSSI_PREFIX) {
+            // JSON inside text, sent in pieces: frame by frame.
             let held = std::mem::take(buf);
-            let mut lines = JsonLines {
-                engine: self.engine.clone(),
-                scope: self.scope.clone(),
-                buf: Vec::new(),
-                scanned: 0,
-            };
+            let mut frames = Frames::new(&self.engine, &self.scope, self.cap);
+            let out = frames.push(&held);
+            self.mode = JsonMode::Frames(frames);
+            return Bytes::from(out);
+        }
+        if top.more_values(buf) {
+            // A stream of JSON values under a JSON content type.
+            let held = std::mem::take(buf);
+            let mut lines = NdjsonRestore::new(&self.engine, &self.scope, self.cap);
             let out = lines.push(&held);
             self.mode = JsonMode::Lines(lines);
-            return Bytes::from(out);
+            return out;
         }
         if buf.len() <= MAX_JSON_BUFFER {
             return Bytes::new();
@@ -345,18 +433,14 @@ impl StreamTransform for JsonRestore {
     fn finish(&mut self) -> Bytes {
         match &mut self.mode {
             JsonMode::Stream(s) => Bytes::from(s.finish_bytes()),
-            JsonMode::Lines(l) => Bytes::from(l.finish()),
-            JsonMode::Buffer(buf) => {
+            JsonMode::Frames(f) => Bytes::from(f.finish()),
+            JsonMode::Lines(l) => l.finish(),
+            JsonMode::Buffer(buf, _) => {
                 let raw = std::mem::take(buf);
                 if raw.starts_with(XSSI_PREFIX) {
-                    let mut lines = JsonLines {
-                        engine: self.engine.clone(),
-                        scope: self.scope.clone(),
-                        buf: Vec::new(),
-                        scanned: 0,
-                    };
-                    let mut out = lines.push(&raw);
-                    out.extend(lines.finish());
+                    let mut frames = Frames::new(&self.engine, &self.scope, self.cap);
+                    let mut out = frames.push(&raw);
+                    out.extend(frames.finish());
                     return Bytes::from(out);
                 }
                 Bytes::from(restore_document(&self.engine, &self.scope, raw))
@@ -428,48 +512,150 @@ fn restore_string(engine: &Engine, scope: &str, s: &mut String, depth: usize) ->
     true
 }
 
-/// JSON-in-text, one JSON value per line (each a snapshot, restored whole);
-/// lines that are not JSON pass through.
-struct JsonLines {
+/// Google's length-prefixed frames after `)]}'`: `<digits><payload>`, the
+/// number counting the payload in UTF-16 code units from right after the
+/// digits. Each frame's JSON is restored (each is a snapshot) and its length
+/// recomputed; a frame that is not JSON passes with its own length, and
+/// text that is not framed passes as it came.
+struct Frames {
     engine: Engine,
     scope: String,
+    cap: usize,
     buf: Vec<u8>,
-    /// Bytes of `buf` known to hold no newline.
-    scanned: usize,
+    prefix_done: bool,
+    /// Gave up on framing: the rest passes through.
+    raw: bool,
 }
 
-impl JsonLines {
+/// How many bytes of `bytes` hold exactly `units` UTF-16 code units.
+enum Utf16Prefix {
+    Bytes(usize),
+    /// More bytes are needed.
+    Need,
+    /// Not valid (bad UTF-8, or the count ends inside a character).
+    Invalid,
+}
+
+fn utf16_prefix(bytes: &[u8], units: usize) -> Utf16Prefix {
+    let (text, rest_invalid) = match std::str::from_utf8(bytes) {
+        Ok(t) => (t, false),
+        Err(e) => (
+            std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or_default(),
+            e.error_len().is_some(),
+        ),
+    };
+    let mut count = 0;
+    for (i, c) in text.char_indices() {
+        if count == units {
+            return Utf16Prefix::Bytes(i);
+        }
+        count += c.len_utf16();
+        if count > units {
+            return Utf16Prefix::Invalid;
+        }
+    }
+    if count == units {
+        Utf16Prefix::Bytes(text.len())
+    } else if rest_invalid {
+        Utf16Prefix::Invalid
+    } else {
+        Utf16Prefix::Need
+    }
+}
+
+impl Frames {
+    fn new(engine: &Engine, scope: &str, cap: usize) -> Self {
+        Frames {
+            engine: engine.clone(),
+            scope: scope.to_string(),
+            cap,
+            buf: Vec::new(),
+            prefix_done: false,
+            raw: false,
+        }
+    }
+
     fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if self.raw {
+            return chunk.to_vec();
+        }
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(i) = self.buf[self.scanned..].iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..self.scanned + i + 1).collect();
-            self.scanned = 0;
-            out.extend(self.line(&line));
+        loop {
+            if !self.prefix_done {
+                // `)]}'` and its line ending.
+                match self.buf.iter().position(|&b| b == b'\n') {
+                    Some(i) => {
+                        out.extend(self.buf.drain(..=i));
+                        self.prefix_done = true;
+                        continue;
+                    }
+                    None if self.buf.len() > 64 => return self.give_up(out),
+                    None => return out,
+                }
+            }
+            let ws = self
+                .buf
+                .iter()
+                .take_while(|b| b.is_ascii_whitespace())
+                .count();
+            out.extend(self.buf.drain(..ws));
+            if self.buf.is_empty() {
+                return out;
+            }
+            let digits = self.buf.iter().take_while(|b| b.is_ascii_digit()).count();
+            if digits == 0 || digits > 12 {
+                return self.give_up(out);
+            }
+            if digits == self.buf.len() {
+                return out;
+            }
+            let Ok(units) = std::str::from_utf8(&self.buf[..digits])
+                .unwrap_or("")
+                .parse::<usize>()
+            else {
+                return self.give_up(out);
+            };
+            let n = match utf16_prefix(&self.buf[digits..], units) {
+                Utf16Prefix::Bytes(n) => n,
+                Utf16Prefix::Need if self.buf.len() <= self.cap => return out,
+                _ => return self.give_up(out),
+            };
+            let frame: Vec<u8> = self.buf.drain(..digits + n).collect();
+            out.extend(self.restore_frame(&frame, digits));
         }
-        self.scanned = self.buf.len();
+    }
+
+    /// One frame (`digits` digits, then the payload): restored with its
+    /// length recomputed, or as it came.
+    fn restore_frame(&self, frame: &[u8], digits: usize) -> Vec<u8> {
+        let payload = std::str::from_utf8(&frame[digits..]).unwrap_or_default();
+        let trimmed = payload.trim();
+        let restored = parda_wire::body::parse_json(trimmed.as_bytes())
+            .ok()
+            .and_then(|v| restore_json_value(&self.engine, &self.scope, trimmed.as_bytes(), v));
+        let Some(json) = restored else {
+            return frame.to_vec();
+        };
+        let lead = payload.len() - payload.trim_start().len();
+        let tail = payload.len() - payload.trim_end().len();
+        let mut new = payload.as_bytes()[..lead].to_vec();
+        new.extend(json);
+        new.extend_from_slice(&payload.as_bytes()[payload.len() - tail..]);
+        let new_payload = String::from_utf8_lossy(&new).into_owned();
+        let mut out = new_payload.encode_utf16().count().to_string().into_bytes();
+        out.extend(new_payload.into_bytes());
+        out
+    }
+
+    fn give_up(&mut self, mut out: Vec<u8>) -> Vec<u8> {
+        out.append(&mut self.buf);
+        self.raw = true;
         out
     }
 
     fn finish(&mut self) -> Vec<u8> {
-        self.scanned = 0;
-        let rest = std::mem::take(&mut self.buf);
-        self.line(&rest)
-    }
-
-    fn line(&self, line: &[u8]) -> Vec<u8> {
-        let body_len = line.len() - usize::from(line.ends_with(b"\n"));
-        let body = &line[..body_len];
-        let restored = serde_json::from_slice::<Value>(body)
-            .ok()
-            .and_then(|v| restore_json_value(&self.engine, &self.scope, body, v));
-        match restored {
-            Some(mut new) => {
-                new.extend_from_slice(&line[body_len..]);
-                new
-            }
-            None => line.to_vec(),
-        }
+        std::mem::take(&mut self.buf)
     }
 }
 
@@ -477,18 +663,32 @@ impl JsonLines {
 struct SseRestore {
     parser: SseParser,
     events: Events,
+    cap: usize,
+    /// An event was too large: the rest passes through.
+    raw: bool,
 }
 
 impl StreamTransform for SseRestore {
     fn push(&mut self, chunk: &[u8]) -> Bytes {
+        if self.raw {
+            return Bytes::copy_from_slice(chunk);
+        }
         let mut out = Vec::new();
         for ev in self.parser.feed(chunk) {
             render_all(self.events.on_item(Item::sse(ev)), &mut out);
+        }
+        if self.parser.buffered() > self.cap {
+            render_all(self.events.finish(), &mut out);
+            out.extend_from_slice(&self.parser.take_buffered());
+            self.raw = true;
         }
         Bytes::from(out)
     }
 
     fn finish(&mut self) -> Bytes {
+        if self.raw {
+            return Bytes::new();
+        }
         let mut out = Vec::new();
         if let Some(ev) = self.parser.finish() {
             render_all(self.events.on_item(Item::sse(ev)), &mut out);
@@ -504,22 +704,55 @@ struct NdjsonRestore {
     /// Bytes of `buf` known to hold no newline.
     scanned: usize,
     events: Events,
+    cap: usize,
+    /// A line was too large: the rest passes through.
+    raw: bool,
+}
+
+impl NdjsonRestore {
+    fn new(engine: &Engine, scope: &str, cap: usize) -> Self {
+        NdjsonRestore {
+            buf: Vec::new(),
+            scanned: 0,
+            events: Events::new(engine, scope),
+            cap,
+            raw: false,
+        }
+    }
 }
 
 impl StreamTransform for NdjsonRestore {
     fn push(&mut self, chunk: &[u8]) -> Bytes {
+        if self.raw {
+            return Bytes::copy_from_slice(chunk);
+        }
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
         while let Some(i) = self.buf[self.scanned..].iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.buf.drain(..self.scanned + i + 1).collect();
             self.scanned = 0;
+            if line.len() > self.cap {
+                render_all(self.events.finish(), &mut out);
+                out.extend(line);
+                out.append(&mut self.buf);
+                self.raw = true;
+                return Bytes::from(out);
+            }
             render_all(self.events.on_item(Item::line(line)), &mut out);
         }
         self.scanned = self.buf.len();
+        if self.buf.len() > self.cap {
+            render_all(self.events.finish(), &mut out);
+            out.append(&mut self.buf);
+            self.raw = true;
+        }
         Bytes::from(out)
     }
 
     fn finish(&mut self) -> Bytes {
+        if self.raw {
+            return Bytes::new();
+        }
         let mut out = Vec::new();
         if !self.buf.is_empty() {
             let line = std::mem::take(&mut self.buf);
@@ -1252,7 +1485,7 @@ impl Events {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine_transform::tests::{QUOTED, engine};
+    use crate::engine_transform::tests::{EMOJI, QUOTED, engine};
     use parda_wire::sse::{SseEvent, SseParser};
     use proptest::prelude::*;
     use serde_json::{Value, json};
@@ -1597,23 +1830,162 @@ mod tests {
             let inner: Value = serde_json::from_str(v["inner"].as_str().unwrap()).unwrap();
             assert_eq!(inner[0][0], format!("at {QUOTED}"));
         }
-        // Gemini-style `)]}'` JSON-in-text: line by line, JSON in strings
-        // restored at its own level.
-        let body = ")]}'\n\n42\n[[\"wrb.fr\",null,\"[[\\\"Hi [NAME_1]\\\"]]\"]]\n";
-        let out = run(&e, "application/json; charset=utf-8", body.as_bytes(), 3);
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            body.replace("[NAME_1]", "Ravi Kumar")
-        );
-        let line = json!(["wrb.fr", null, json!([[format!("Hi {q}")]]).to_string()]).to_string();
-        let body = format!(")]}}'\n\n9\n{line}\n");
-        let out = String::from_utf8(run(&e, "application/json", body.as_bytes(), 5)).unwrap();
-        let last: Value = serde_json::from_str(out.lines().nth(3).unwrap()).unwrap();
-        let inner: Value = serde_json::from_str(last[2].as_str().unwrap()).unwrap();
-        assert_eq!(inner[0][0], format!("Hi {QUOTED}"));
         // Not JSON after all: passed through, never spliced into.
         let out = run(&e, "application/json", b"oops [NAME_1]", 4);
         assert_eq!(out, b"oops [NAME_1]");
+    }
+
+    fn utf16_len(s: &str) -> usize {
+        s.encode_utf16().count()
+    }
+
+    /// A Google length-prefixed frame: the number counts the payload in
+    /// UTF-16 code units, starting right after the digits.
+    fn frame(json: &str) -> String {
+        let payload = format!("\n{json}\n");
+        format!("{}{payload}", utf16_len(&payload))
+    }
+
+    /// The frames of a `)]}'` body, read as Gemini's client does (a wrong
+    /// length breaks this).
+    fn frames(body: &str) -> Vec<String> {
+        let rest = body.strip_prefix(")]}'\n").expect("prefix");
+        let u: Vec<u16> = rest.encode_utf16().collect();
+        let ws = |c: u16| c == 0x20 || c == 0x0a || c == 0x0d || c == 0x09;
+        let (mut i, mut out) = (0, Vec::new());
+        loop {
+            while i < u.len() && ws(u[i]) {
+                i += 1;
+            }
+            if i >= u.len() {
+                return out;
+            }
+            let start = i;
+            while i < u.len() && (0x30..=0x39).contains(&u[i]) {
+                i += 1;
+            }
+            let n: usize = String::from_utf16(&u[start..i]).unwrap().parse().unwrap();
+            assert!(i + n <= u.len(), "frame runs past the end: {body:?}");
+            out.push(String::from_utf16(&u[i..i + n]).unwrap().trim().to_string());
+            i += n;
+        }
+    }
+
+    #[test]
+    fn google_frames_are_restored_with_recomputed_lengths() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let q = quoted_tag(&e);
+        let em = e.redact(EMOJI, SCOPE).unwrap().text;
+        let f1 = json!([[
+            "wrb.fr",
+            null,
+            json!([[format!("Hi [NAME_1] {q}")]]).to_string()
+        ]])
+        .to_string();
+        let f2 = json!([["di", 42], ["af.httprm", 42, "-1", 7]]).to_string();
+        let f3 = json!([[
+            "wrb.fr",
+            null,
+            json!([[format!("at {em} \u{1f600}")]]).to_string()
+        ]])
+        .to_string();
+        let body = format!(")]}}'\n\n{}{}{}", frame(&f1), frame(&f2), frame(&f3));
+        for n in [1, 2, 3, 7, 50, body.len()] {
+            let out = run(&e, "application/json; charset=utf-8", body.as_bytes(), n);
+            let out = String::from_utf8(out).unwrap();
+            let fr = frames(&out);
+            assert_eq!(fr.len(), 3, "{n}: {out:?}");
+            let inner = |f: &str| -> Value {
+                let v: Value = serde_json::from_str(f).unwrap();
+                serde_json::from_str(v[0][2].as_str().unwrap()).unwrap()
+            };
+            assert_eq!(inner(&fr[0])[0][0], format!("Hi Ravi Kumar {QUOTED}"));
+            assert_eq!(fr[1], f2, "an unchanged frame keeps its bytes");
+            assert_eq!(inner(&fr[2])[0][0], format!("at {EMOJI} \u{1f600}"));
+        }
+        // A frame whose payload is not JSON passes with its own length;
+        // text that is not framed passes as it came.
+        for odd in [
+            format!(")]}}'\n\n{}", frame("not json [NAME_1]")),
+            ")]}'\nhello [NAME_1]".to_string(),
+            format!(")]}}'\n\n999{}", "\n[[\"[NAME_1]\"]]\n"),
+        ] {
+            for n in [1, 4, odd.len()] {
+                assert_eq!(
+                    run(&e, "application/json", odd.as_bytes(), n),
+                    odd.as_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn json_holding_several_values_streams_as_ndjson() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let lines = [
+            "{\"t\":\"Dear [NA\"}\n",
+            "{\"t\":\"ME_1], hi\"}\n",
+            "{\"done\":true}\n",
+        ];
+        let mut t = for_content_type(&e, SCOPE, "application/json");
+        let mut early = t.push(lines[0].as_bytes()).to_vec();
+        early.extend_from_slice(&t.push(lines[1].as_bytes()));
+        early.extend_from_slice(&t.push(&lines[2].as_bytes()[..4]));
+        // Incremental: the first two lines are out before the body ends.
+        let early = String::from_utf8(early).unwrap();
+        assert!(
+            early.contains("Dear ") && early.contains("Ravi Kumar, hi"),
+            "{early:?}"
+        );
+        let mut out = early.into_bytes();
+        out.extend_from_slice(&t.push(&lines[2].as_bytes()[4..]));
+        out.extend_from_slice(&t.finish());
+        let text: String = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter_map(|v| v["t"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(text, "Dear Ravi Kumar, hi");
+        // One pretty-printed document is still one document.
+        let doc = "{\n  \"a\": \"[NAME_1]\",\n  \"b\": [1,\n 2]\n}\n";
+        let out = run(&e, "application/json", doc.as_bytes(), 3);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["a"], "Ravi Kumar");
+    }
+
+    #[test]
+    fn oversized_items_pass_through_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let big = "x".repeat(300);
+        let sse_body = format!(
+            "data: {{\"t\":\"[NAME_1]\"}}\n\ndata: {{\"t\":\"[NAME_1] {big}\"}}\n\n\
+             data: {{\"t\":\"[NAME_1]\"}}\n\n"
+        );
+        let nd_body = format!(
+            "{{\"t\":\"[NAME_1]\"}}\n{{\"t\":\"[NAME_1] {big}\"}}\n{{\"t\":\"[NAME_1]\"}}\n"
+        );
+        for (ct, body) in [
+            ("text/event-stream", sse_body),
+            ("application/x-ndjson", nd_body),
+        ] {
+            let mut t = for_content_type_capped(&e, SCOPE, ct, 100);
+            let mut out = Vec::new();
+            for c in body.as_bytes().chunks(10) {
+                out.extend_from_slice(&t.push(c));
+            }
+            out.extend_from_slice(&t.finish());
+            // What came before the oversized item is restored; from it on,
+            // the stream passes through as it came.
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                body.replacen("[NAME_1]", "Ravi Kumar", 1),
+                "{ct}"
+            );
+        }
     }
 
     #[test]

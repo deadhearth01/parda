@@ -439,6 +439,8 @@ pub(crate) mod tests {
     pub(crate) const UUID: &str = "aaa2b8c1-55f4-4bd2-9a1c-0123456789ab";
     /// A value that needs JSON escaping.
     pub(crate) const QUOTED: &str = "Flat 4\\B, \"Lotus\" Pune";
+    /// A value outside the Basic Multilingual Plane (two UTF-16 units).
+    pub(crate) const EMOJI: &str = "Lotus \u{1f600} Society";
 
     /// An engine that knows "Ravi Kumar" (no ML model unless `ml`).
     pub(crate) fn engine_with(
@@ -457,10 +459,16 @@ pub(crate) mod tests {
                         name: "Ravi Kumar".into(),
                         ..Default::default()
                     }],
-                    term: vec![parda_detect::Term {
-                        text: QUOTED.into(),
-                        ..Default::default()
-                    }],
+                    term: vec![
+                        parda_detect::Term {
+                            text: QUOTED.into(),
+                            ..Default::default()
+                        },
+                        parda_detect::Term {
+                            text: EMOJI.into(),
+                            ..Default::default()
+                        },
+                    ],
                     ..Default::default()
                 },
                 data_dir: dir.join("data"),
