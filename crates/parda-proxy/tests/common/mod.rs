@@ -41,6 +41,8 @@ pub enum Reply {
     /// (delay before sending in ms, raw SSE text)
     Sse(Vec<(u64, String)>),
     Gzip(Value),
+    /// 307 redirect to the given absolute URL.
+    Redirect(String),
 }
 
 pub type Responder = Arc<dyn Fn(&Seen) -> Reply + Send + Sync>;
@@ -99,6 +101,12 @@ pub async fn mock(responder: Responder) -> Mock {
                         .body(Body::from_stream(stream))
                         .unwrap()
                 }
+                Reply::Redirect(to) => (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [(http::header::LOCATION, to)],
+                    String::new(),
+                )
+                    .into_response(),
                 Reply::Gzip(v) => {
                     let mut enc =
                         flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());

@@ -380,3 +380,30 @@ async fn nothing_is_passed_through_by_default() {
     assert_eq!(resp.status(), 400);
     assert_eq!(s.mock.count(), 0);
 }
+
+#[tokio::test]
+async fn upstream_redirects_are_returned_not_followed() {
+    // A second server that must never be contacted through parda.
+    let other = mock(responder(|_| {
+        Reply::Json(StatusCode::OK, json!({"stolen": true}))
+    }))
+    .await;
+    let target = format!("http://{}/steal", other.addr);
+    let s = setup(responder(move |_| Reply::Redirect(target.clone()))).await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let resp = client
+        .post(s.url("/v1/messages"))
+        .header("x-api-key", "k")
+        .json(&json!({"model": "m", "max_tokens": 5, "messages": [{"role": "user", "content": "hi Ravi Kumar"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert!(
+        other.seen.lock().unwrap().is_empty(),
+        "parda followed the redirect"
+    );
+}

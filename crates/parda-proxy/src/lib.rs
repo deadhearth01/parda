@@ -87,6 +87,13 @@ impl ProxyState {
         events: broadcast::Sender<ProxyEvent>,
     ) -> anyhow::Result<Arc<Self>> {
         let http = reqwest::Client::builder()
+            // Redirects go back to the client untouched: following them here
+            // would re-send the request (and its API key headers) to wherever
+            // the redirect points.
+            .redirect(reqwest::redirect::Policy::none())
+            // Never route upstream traffic through another proxy (HTTPS_PROXY
+            // may even point at parda itself).
+            .no_proxy()
             .connect_timeout(Duration::from_secs(30))
             .pool_idle_timeout(Duration::from_secs(90))
             .user_agent(concat!("parda/", env!("CARGO_PKG_VERSION")))
