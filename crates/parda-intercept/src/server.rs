@@ -72,6 +72,27 @@ pub struct InterceptState {
     pub timeouts: Timeouts,
 }
 
+impl InterceptState {
+    /// State with parda's own upstream clients ([`upstream_client_builder`])
+    /// and default timeouts.
+    pub fn new(
+        ca: Arc<Ca>,
+        hosts: HostList,
+        transform: Arc<dyn BodyTransform>,
+        events: broadcast::Sender<InterceptEvent>,
+    ) -> anyhow::Result<InterceptState> {
+        Ok(InterceptState {
+            ca,
+            hosts,
+            transform,
+            events,
+            upstream: upstream_client_builder().build()?,
+            upstream_http1: upstream_client_builder().http1_only().build()?,
+            timeouts: Timeouts::default(),
+        })
+    }
+}
+
 /// Connection timeouts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
@@ -565,8 +586,10 @@ async fn upgrade(
     if let Some(u) = req.headers().get(UPGRADE) {
         headers.insert(UPGRADE, u.clone());
     }
+    // A separate HTTP/1.1-only client: on an HTTP/2 connection (which the
+    // main client negotiates with most sites) there is no 101 to relay.
     let res = state
-        .upstream
+        .upstream_http1
         .request(req.method().clone(), &url)
         .version(http::Version::HTTP_11)
         .headers(headers)
@@ -740,6 +763,19 @@ fn is_loopback(ip: std::net::IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_state_uses_the_safe_upstream_clients() {
+        let (tx, _rx) = broadcast::channel(1);
+        let state = InterceptState::new(
+            Arc::new(Ca::generate().unwrap()),
+            HostList::new(&["chat.test".to_string()]),
+            Arc::new(crate::transform::tests_support::Identity),
+            tx,
+        )
+        .unwrap();
+        assert_eq!(state.timeouts, Timeouts::default());
+    }
 
     #[test]
     fn loopback_addresses_only() {

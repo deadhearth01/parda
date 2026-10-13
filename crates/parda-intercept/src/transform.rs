@@ -72,32 +72,37 @@ pub trait StreamTransform: Send {
     fn finish(&mut self) -> Bytes;
 }
 
-/// Forwards bodies unchanged.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Passthrough;
+/// An identity transform for unit tests only: it would forward a compressed
+/// request body after the server dropped its `content-encoding`.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
 
-impl BodyTransform for Passthrough {
-    fn request(
-        &self,
-        _: &str,
-        _: &str,
-        _: &http::HeaderMap,
-        body: Bytes,
-    ) -> Result<Bytes, Refusal> {
-        Ok(body)
+    pub(crate) struct Identity;
+
+    impl BodyTransform for Identity {
+        fn request(
+            &self,
+            _: &str,
+            _: &str,
+            _: &http::HeaderMap,
+            body: Bytes,
+        ) -> Result<Bytes, Refusal> {
+            Ok(body)
+        }
+
+        fn response_stream(&self, _: &str, _: &str, _: &str) -> Box<dyn StreamTransform> {
+            Box::new(Identity)
+        }
     }
 
-    fn response_stream(&self, _: &str, _: &str, _: &str) -> Box<dyn StreamTransform> {
-        Box::new(Passthrough)
-    }
-}
+    impl StreamTransform for Identity {
+        fn push(&mut self, chunk: &[u8]) -> Bytes {
+            Bytes::copy_from_slice(chunk)
+        }
 
-impl StreamTransform for Passthrough {
-    fn push(&mut self, chunk: &[u8]) -> Bytes {
-        Bytes::copy_from_slice(chunk)
-    }
-
-    fn finish(&mut self) -> Bytes {
-        Bytes::new()
+        fn finish(&mut self) -> Bytes {
+            Bytes::new()
+        }
     }
 }

@@ -77,6 +77,7 @@ struct Seen {
     path: String,
     body: String,
     host: String,
+    version: http::Version,
 }
 
 struct Upstream {
@@ -109,11 +110,13 @@ async fn upstream_handle(
             .map(|h| h.to_str().unwrap().to_string())
             .unwrap_or_default(),
     };
+    let version = req.version();
     if path == "/ws" {
         seen.lock().unwrap().push(Seen {
             path,
             body: String::new(),
             host,
+            version,
         });
         if req.version() == http::Version::HTTP_2 {
             // No 101 in HTTP/2: the upgrade headers never even arrive.
@@ -148,6 +151,7 @@ async fn upstream_handle(
         path: path.clone(),
         body: body.clone(),
         host,
+        version,
     });
     match path.as_str() {
         "/redirect" => Ok(Response::builder()
@@ -407,6 +411,8 @@ async fn listed_host_is_decrypted_transformed_and_restored() {
     assert_eq!(seen[0].path, "/echo");
     assert_eq!(seen[0].body, "my SECRET plan");
     assert_eq!(seen[0].host, format!("chat.test:{}", up.port));
+    // parda talks HTTP/2 to sites that offer it.
+    assert_eq!(seen[0].version, http::Version::HTTP_2);
 
     let ev = next_event(&mut h.events).await;
     assert_eq!(ev.host, "chat.test");
@@ -741,6 +747,10 @@ async fn websocket_upgrade_is_relayed_and_tunnelled_unscanned() {
     assert_eq!(ev.path, "/ws");
     assert_eq!(ev.status, 101);
     assert_eq!(ev.unscanned, 1);
+    // The h2-capable site was asked over HTTP/1.1, where 101 exists.
+    let seen = up.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].version, http::Version::HTTP_11);
 }
 
 #[tokio::test]
