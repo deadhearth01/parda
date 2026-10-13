@@ -65,7 +65,7 @@ const NAMED: &[(&str, EntityKind)] = &[
 ];
 
 /// `name` lower-cased without `_`, `-` and spaces: "IP_ADDRESS" → "ipaddress".
-fn fold(name: &str) -> String {
+pub(crate) fn fold(name: &str) -> String {
     name.chars()
         .filter(|c| !matches!(c, '_' | '-' | ' '))
         .flat_map(char::to_lowercase)

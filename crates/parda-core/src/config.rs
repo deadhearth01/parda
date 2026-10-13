@@ -115,26 +115,11 @@ pub struct DetectConfig {
     pub ml_timeout_ms: u64,
     /// `auto`, `cpu`, `coreml`, `directml` or `cuda`.
     pub execution_provider: String,
-    /// Per built-in kind. Names ignore case (`secret`, `IP_ADDRESS`); an
-    /// unknown name is a configuration error rather than a silent no-op.
-    #[serde(deserialize_with = "builtin_actions")]
+    /// Per kind. Built-in names ignore case and `_` / `-` / spaces
+    /// (`secret`, `IP_ADDRESS`); any other key is a custom kind from
+    /// `rules.toml`, exactly as written. See
+    /// [`Config::suspicious_action_keys`] for likely typos.
     pub actions: BTreeMap<EntityKind, Action>,
-}
-
-fn builtin_actions<'de, D: serde::Deserializer<'de>>(
-    d: D,
-) -> std::result::Result<BTreeMap<EntityKind, Action>, D::Error> {
-    use serde::de::Error as _;
-    BTreeMap::<String, Action>::deserialize(d)?
-        .into_iter()
-        .map(|(name, action)| match EntityKind::builtin(&name) {
-            Some(kind) => Ok((kind, action)),
-            None => Err(D::Error::custom(format!(
-                "unknown entity kind `{name}` in [detect.actions]; expected one of: {}",
-                EntityKind::builtin_names()
-            ))),
-        })
-        .collect()
 }
 
 impl Default for DetectConfig {
@@ -224,6 +209,34 @@ impl Config {
         toml::to_string_pretty(self).map_err(|e| Error::Config(e.to_string()))
     }
 
+    /// Custom-kind keys in `[detect.actions]` that look like a misspelt
+    /// built-in kind (`Aadhar`, `Pasport`, `secrets`): within edit distance 2
+    /// of a built-in name, ignoring case and separators, and less than half
+    /// that name's length away (so short custom kinds like `Tag` are not
+    /// flagged against `Pan`). Such a key is still a valid custom kind; this
+    /// is for a warning at startup.
+    pub fn suspicious_action_keys(&self) -> Vec<String> {
+        let builtins: Vec<String> = EntityKind::all()
+            .map(|k| crate::kind::fold(&k.to_string()))
+            .collect();
+        self.detect
+            .actions
+            .keys()
+            .filter_map(|k| match k {
+                EntityKind::Custom(name) => Some(name),
+                _ => None,
+            })
+            .filter(|name| {
+                let folded = crate::kind::fold(name);
+                builtins.iter().any(|b| {
+                    let d = edit_distance(&folded, b);
+                    (1..=2).contains(&d) && 2 * d < b.chars().count()
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn action_for(&self, kind: &EntityKind) -> Action {
         self.detect
             .actions
@@ -231,6 +244,22 @@ impl Config {
             .copied()
             .unwrap_or(Action::Redact)
     }
+}
+
+/// Levenshtein distance in characters.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = Vec::with_capacity(b.len() + 1);
+        cur.push(i + 1);
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != *cb);
+            cur.push(sub.min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }
 
 #[cfg(test)]
@@ -285,11 +314,44 @@ mod tests {
     }
 
     #[test]
-    fn unknown_action_key_is_an_error() {
-        let err = Config::from_toml_str("[detect.actions]\nsecrets = \"block\"\n")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("secrets") && err.contains("Secret"), "{err}");
+    fn custom_action_keys_are_kept_as_written() {
+        let c = Config::from_toml_str(
+            "[detect.actions]\nCodename = \"block\"\n\"employee id\" = \"ignore\"\nsecret = \"warn\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.action_for(&EntityKind::Custom("Codename".into())),
+            Action::Block
+        );
+        assert_eq!(
+            c.action_for(&EntityKind::Custom("employee id".into())),
+            Action::Ignore
+        );
+        assert_eq!(c.action_for(&EntityKind::Secret), Action::Warn);
+        let back = Config::from_toml_str(&c.to_toml_string().unwrap()).unwrap();
+        assert_eq!(back.detect.actions, c.detect.actions);
+    }
+
+    #[test]
+    fn near_misses_of_builtin_names_are_reported() {
+        let c = Config::from_toml_str(
+            "[detect.actions]\nAadhar = \"block\"\nPasport = \"block\"\nsecrets = \"block\"\n\
+             Emial = \"warn\"\nCodename = \"block\"\nEmployeeId = \"block\"\nHandle = \"ignore\"\n\
+             Tag = \"ignore\"\nSecret = \"block\"\n",
+        )
+        .unwrap();
+        let mut got = c.suspicious_action_keys();
+        got.sort();
+        assert_eq!(got, ["Aadhar", "Emial", "Pasport", "secrets"]);
+        assert!(Config::default().suspicious_action_keys().is_empty());
+    }
+
+    #[test]
+    fn edit_distances() {
+        assert_eq!(edit_distance("aadhar", "aadhaar"), 1);
+        assert_eq!(edit_distance("emial", "email"), 2);
+        assert_eq!(edit_distance("", "pan"), 3);
+        assert_eq!(edit_distance("secret", "secret"), 0);
     }
 
     #[test]
