@@ -869,6 +869,7 @@ async fn slow_and_idle_clients_are_disconnected() {
             tls_handshake: short,
             header_read: short,
             idle: short,
+            body_read: short,
         },
     )
     .await;
@@ -889,6 +890,25 @@ async fn slow_and_idle_clients_are_disconnected() {
     .await
     .unwrap();
     closes(&mut tls, "idle decrypted connection").await;
+    // A request body that trickles (10 of 100 bytes, then nothing): 408,
+    // and nothing goes upstream.
+    let mut tls = tls_via_connect(
+        h.proxy,
+        &target,
+        &h.state.ca.cert_pem(),
+        ServerName::try_from("chat.test").unwrap(),
+    )
+    .await
+    .unwrap();
+    tls.write_all(
+        format!("POST /echo HTTP/1.1\r\nHost: {target}\r\nContent-Length: 100\r\n\r\n0123456789")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let head = read_head(&mut tls).await;
+    assert!(head.starts_with("HTTP/1.1 408"), "{head}");
+    assert!(up.seen.lock().unwrap().is_empty());
     // A streamed answer that pauses longer than the idle timeout (500 ms
     // between events) is not cut: the timer only runs between requests.
     let c = client(h.proxy, &h.state.ca.cert_pem());

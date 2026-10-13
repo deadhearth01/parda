@@ -102,6 +102,8 @@ pub struct Timeouts {
     pub header_read: Duration,
     /// A decrypted connection waiting for its next request is closed after this.
     pub idle: Duration,
+    /// Reading a whole request body to a listed host (else 408).
+    pub body_read: Duration,
 }
 
 impl Default for Timeouts {
@@ -110,6 +112,7 @@ impl Default for Timeouts {
             tls_handshake: Duration::from_secs(10),
             header_read: Duration::from_secs(30),
             idle: Duration::from_secs(90),
+            body_read: Duration::from_secs(60),
         }
     }
 }
@@ -127,10 +130,11 @@ const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(300);
 ///   browser, which judges it under the right origin (following it here
 ///   would fetch another site under the AI site's origin, with its headers);
 /// - no proxy (an `HTTPS_PROXY` pointing at parda would loop) and https only;
-/// - certificates verified against the webpki (Mozilla) roots built into
-///   reqwest, never the OS store, so parda's own CA, once trusted by the
-///   OS, is never trusted for upstream connections. (The workspace must keep
-///   reqwest's native-roots features off.)
+/// - rustls with the webpki (Mozilla) roots built into reqwest only, never
+///   the OS store, so parda's own CA, once trusted by the OS, is never
+///   trusted for upstream connections. The OS-root switch is turned off
+///   explicitly, and `tests/upstream_trust.rs` fails if a crate that loads
+///   the OS store (rustls-native-certs, native-tls, …) enters Cargo.lock;
 /// - connect and per-read timeouts, but no total timeout (it would cut
 ///   long event streams).
 pub fn upstream_client_builder() -> reqwest::ClientBuilder {
@@ -138,7 +142,9 @@ pub fn upstream_client_builder() -> reqwest::ClientBuilder {
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .https_only(true)
-        .tls_built_in_root_certs(true)
+        .use_rustls_tls()
+        .tls_built_in_root_certs(false)
+        .tls_built_in_webpki_certs(true)
         .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
         .read_timeout(UPSTREAM_READ_TIMEOUT)
 }
@@ -493,13 +499,22 @@ async fn forward(
     }
 
     let (parts, body) = req.into_parts();
-    let body = match read_body(&parts.headers, body, MAX_REQUEST_BODY).await {
+    let body = match read_body(
+        &parts.headers,
+        body,
+        MAX_REQUEST_BODY,
+        state.timeouts.body_read,
+    )
+    .await
+    {
         Ok(b) => b,
         Err(status) => {
-            let msg = if status == StatusCode::PAYLOAD_TOO_LARGE {
-                "parda intercept: request body too large to filter\n"
-            } else {
-                "parda intercept: could not read the request body\n"
+            let msg = match status {
+                StatusCode::PAYLOAD_TOO_LARGE => {
+                    "parda intercept: request body too large to filter\n"
+                }
+                StatusCode::REQUEST_TIMEOUT => "parda intercept: request body took too long\n",
+                _ => "parda intercept: could not read the request body\n",
             };
             emit(
                 &state,
@@ -778,9 +793,15 @@ fn end_to_end(headers: &HeaderMap) -> HeaderMap {
     out
 }
 
-/// Read a whole request body of at most `limit` bytes. Errors are the status
-/// to answer with: 413 when too large, 400 when the body broke off.
-async fn read_body<B>(headers: &HeaderMap, body: B, limit: usize) -> Result<Bytes, StatusCode>
+/// Read a whole request body of at most `limit` bytes within `timeout`.
+/// Errors are the status to answer with: 413 when too large, 408 when it
+/// takes too long (a trickling client), 400 when the body broke off.
+async fn read_body<B>(
+    headers: &HeaderMap,
+    body: B,
+    limit: usize,
+    timeout: Duration,
+) -> Result<Bytes, StatusCode>
 where
     B: hyper::body::Body<Data = Bytes>,
     B::Error: Into<BoxError>,
@@ -792,7 +813,11 @@ where
     if declared.is_some_and(|n| n > limit as u64) || body.size_hint().lower() > limit as u64 {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
-    match Limited::new(body, limit).collect().await {
+    let collected = tokio::time::timeout(timeout, Limited::new(body, limit).collect()).await;
+    let Ok(collected) = collected else {
+        return Err(StatusCode::REQUEST_TIMEOUT);
+    };
+    match collected {
         Ok(c) => Ok(c.to_bytes()),
         Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
             Err(StatusCode::PAYLOAD_TOO_LARGE)
@@ -886,14 +911,27 @@ mod tests {
     #[tokio::test]
     async fn body_limit_gives_413() {
         let none = HeaderMap::new();
-        let ok = read_body(&none, Full::new(Bytes::from(vec![b'a'; 10])), 10).await;
+        let t = Duration::from_secs(5);
+        let ok = read_body(&none, Full::new(Bytes::from(vec![b'a'; 10])), 10, t).await;
         assert_eq!(ok.unwrap().len(), 10);
-        let big = read_body(&none, Full::new(Bytes::from(vec![b'a'; 11])), 10).await;
+        let big = read_body(&none, Full::new(Bytes::from(vec![b'a'; 11])), 10, t).await;
         assert_eq!(big.unwrap_err(), StatusCode::PAYLOAD_TOO_LARGE);
         let mut declared = HeaderMap::new();
         declared.insert(CONTENT_LENGTH, HeaderValue::from_static("1000"));
-        let big = read_body(&declared, Empty::<Bytes>::new(), 10).await;
+        let big = read_body(&declared, Empty::<Bytes>::new(), 10, t).await;
         assert_eq!(big.unwrap_err(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn a_trickled_body_times_out_with_408() {
+        let never = StreamBody::new(futures::stream::pending::<Result<Frame<Bytes>, Infallible>>());
+        let r = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_body(&HeaderMap::new(), never, 10, Duration::from_millis(50)),
+        )
+        .await
+        .expect("read_body must give up on its own");
+        assert_eq!(r.unwrap_err(), StatusCode::REQUEST_TIMEOUT);
     }
 
     #[test]
