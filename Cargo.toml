@@ -22,6 +22,7 @@ parda-ipc = { path = "crates/parda-ipc", version = "0.1.0" }
 parda-daemon = { path = "crates/parda-daemon", version = "0.1.0" }
 parda-clip = { path = "crates/parda-clip", version = "0.1.0" }
 parda-tui = { path = "crates/parda-tui", version = "0.1.0" }
+parda-intercept = { path = "crates/parda-intercept", version = "0.1.0" }
 
 # general
 serde = { version = "1", features = ["derive"] }
@@ -44,12 +45,23 @@ directories = "6"
 # async / http
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
+# Keep native-tls and the native-roots features off: parda-intercept relies on
+# webpki roots so that its own CA (once trusted by the OS) is never trusted for
+# upstream TLS. Guarded by crates/parda-intercept/tests/upstream_trust.rs.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip", "brotli", "deflate", "json", "http2"] }
 bytes = "1"
 futures = "0.3"
 http = "1"
 http-body-util = "0.1"
 tower = "0.5"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+# TLS: the ring provider, the same one reqwest's rustls backend already pulls in.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = "1"
+# x509-parser: reload the CA (issuer name, key id) from its PEM.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
 
 # crypto / storage
 rusqlite = { version = "0.37", features = ["bundled"] }
