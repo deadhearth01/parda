@@ -127,9 +127,20 @@ pub fn normalize_path(raw: &str) -> String {
 
 /// True if parda redacts `POST` requests to this path, so listing it in
 /// `proxy.passthrough_paths` (or using another method on it) never makes it
-/// skip redaction.
+/// skip redaction. Also true for spellings a lenient upstream might map to
+/// such an endpoint: other letter case, encoded slashes, `;params`.
 fn is_redacted_path(path: &str) -> bool {
-    route(&Method::POST, path, &HeaderMap::new()).rewrites()
+    let lenient = {
+        let lower = path.to_ascii_lowercase().replace("%2f", "/");
+        let no_params: Vec<&str> = lower
+            .split('/')
+            .map(|seg| seg.split(';').next().unwrap_or(""))
+            .collect();
+        normalize_path(&no_params.join("/"))
+    };
+    [path, lenient.as_str()]
+        .iter()
+        .any(|p| route(&Method::POST, p, &HeaderMap::new()).rewrites())
 }
 
 fn entry_matches(entry: &str, path: &str) -> bool {
@@ -255,6 +266,17 @@ mod tests {
         assert!(passthrough_listed(&list(&["//v1/./files/"]), "/v1/files"));
         assert!(passthrough_listed(&list(&["*"]), "/anything"));
         assert!(!passthrough_listed(&list(&["*"]), "/v1/embeddings"));
+        // Spellings a lenient upstream may treat as a redacted endpoint are
+        // never passed through, even under a broad glob.
+        for p in [
+            "/V1/Chat/Completions",
+            "/v1%2Fchat%2Fcompletions",
+            "/v1%2fmessages",
+            "/v1/messages;v=1",
+            "/V1/MESSAGES/COUNT_TOKENS",
+        ] {
+            assert!(!passthrough_listed(&list(&["*"]), p), "{p}");
+        }
     }
 
     #[test]
