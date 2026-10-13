@@ -15,13 +15,13 @@ use hyper::body::{Frame, Incoming};
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use parda_intercept::{
-    BodyTransform, Ca, HostList, InterceptEvent, InterceptState, Refusal, StreamTransform, pac,
-    serve,
+    BodyTransform, Ca, HostList, InterceptEvent, InterceptState, Refusal, StreamTransform,
+    Timeouts, pac, serve, upstream_client_builder,
 };
 use rcgen::{CertificateParams, DnType, IsCa, Issuer, KeyPair};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
@@ -61,7 +61,8 @@ fn test_pki(names: &[&str]) -> TestPki {
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
     )
     .unwrap();
-    server.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // Like real AI sites: HTTP/2 preferred, HTTP/1.1 offered.
+    server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     TestPki {
         ca_pem: ca_cert.pem(),
         leaf_der: leaf.der().clone(),
@@ -94,21 +95,33 @@ fn full(s: impl Into<Bytes>) -> Body {
 
 async fn upstream_handle(
     mut req: Request<Incoming>,
+    port: u16,
     seen: Arc<Mutex<Vec<Seen>>>,
     sse_done: Arc<AtomicBool>,
 ) -> Result<Response<Body>, Infallible> {
     let path = req.uri().path().to_string();
-    let host = req
-        .headers()
-        .get("host")
-        .map(|h| h.to_str().unwrap().to_string())
-        .unwrap_or_default();
+    // HTTP/2 carries the authority in the URI, HTTP/1.1 in Host.
+    let host = match req.uri().authority() {
+        Some(a) => a.to_string(),
+        None => req
+            .headers()
+            .get("host")
+            .map(|h| h.to_str().unwrap().to_string())
+            .unwrap_or_default(),
+    };
     if path == "/ws" {
         seen.lock().unwrap().push(Seen {
             path,
             body: String::new(),
             host,
         });
+        if req.version() == http::Version::HTTP_2 {
+            // No 101 in HTTP/2: the upgrade headers never even arrive.
+            return Ok(Response::builder()
+                .status(400)
+                .body(full("no upgrade over h2"))
+                .unwrap());
+        }
         let on_upgrade = hyper::upgrade::on(&mut req);
         tokio::spawn(async move {
             let mut io = TokioIo::new(on_upgrade.await.unwrap());
@@ -137,6 +150,11 @@ async fn upstream_handle(
         host,
     });
     match path.as_str() {
+        "/redirect" => Ok(Response::builder()
+            .status(302)
+            .header("location", format!("https://other.test:{port}/x"))
+            .body(full(""))
+            .unwrap()),
         "/sse" => {
             let events = futures::stream::unfold(0u8, move |step| {
                 let sse_done = sse_done.clone();
@@ -182,13 +200,22 @@ async fn start_upstream(pki: TestPki) -> Upstream {
                 let Ok(tls) = acceptor.accept(tcp).await else {
                     return;
                 };
+                let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
                 let svc = hyper::service::service_fn(move |req| {
-                    upstream_handle(req, s.clone(), d.clone())
+                    upstream_handle(req, port, s.clone(), d.clone())
                 });
-                let _ = hyper::server::conn::http1::Builder::new()
+                if h2 {
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
                     .serve_connection(TokioIo::new(tls), svc)
-                    .with_upgrades()
                     .await;
+                } else {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(tls), svc)
+                        .with_upgrades()
+                        .await;
+                }
             });
         }
     });
@@ -268,26 +295,42 @@ struct Harness {
     events: broadcast::Receiver<InterceptEvent>,
 }
 
-/// parda intercept listing `chat.test`, whose upstream client trusts
-/// `upstream_ca_pem` only and resolves the test names to 127.0.0.1.
-async fn start_parda(upstream_ca_pem: &str) -> Harness {
-    let upstream = reqwest::Client::builder()
-        .no_proxy()
-        .tls_built_in_root_certs(false)
+/// parda's own upstream client builder, plus trust in the fake site's CA
+/// and the test names resolved to 127.0.0.1.
+fn test_upstream(builder: reqwest::ClientBuilder, upstream_ca_pem: &str) -> reqwest::Client {
+    builder
         .add_root_certificate(reqwest::Certificate::from_pem(upstream_ca_pem.as_bytes()).unwrap())
         .resolve("chat.test", "127.0.0.1:0".parse().unwrap())
         .resolve("other.test", "127.0.0.1:0".parse().unwrap())
-        .timeout(T)
         .build()
-        .unwrap();
+        .unwrap()
+}
+
+/// State for parda intercept listing `chat.test`.
+fn state_for(
+    upstream_ca_pem: &str,
+    timeouts: Timeouts,
+) -> (InterceptState, broadcast::Receiver<InterceptEvent>) {
     let (tx, rx) = broadcast::channel(64);
-    let state = Arc::new(InterceptState {
+    let state = InterceptState {
         ca: Arc::new(Ca::generate().unwrap()),
         hosts: HostList::new(&["chat.test".to_string()]),
         transform: Arc::new(Upper),
         events: tx,
-        upstream,
-    });
+        upstream: test_upstream(upstream_client_builder(), upstream_ca_pem),
+        upstream_http1: test_upstream(upstream_client_builder().http1_only(), upstream_ca_pem),
+        timeouts,
+    };
+    (state, rx)
+}
+
+async fn start_parda(upstream_ca_pem: &str) -> Harness {
+    start_parda_with(upstream_ca_pem, Timeouts::default()).await
+}
+
+async fn start_parda_with(upstream_ca_pem: &str, timeouts: Timeouts) -> Harness {
+    let (state, rx) = state_for(upstream_ca_pem, timeouts);
+    let state = Arc::new(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = listener.local_addr().unwrap();
     tokio::spawn(serve(listener, state.clone()));
@@ -298,10 +341,12 @@ async fn start_parda(upstream_ca_pem: &str) -> Harness {
     }
 }
 
-/// A client that uses parda as its proxy and trusts exactly `ca_pem`.
+/// A client that uses parda as its proxy, trusts exactly `ca_pem` and does
+/// not follow redirects.
 fn client(proxy: SocketAddr, ca_pem: &str) -> reqwest::Client {
     reqwest::Client::builder()
         .proxy(reqwest::Proxy::all(format!("http://{proxy}")).unwrap())
+        .redirect(reqwest::redirect::Policy::none())
         .tls_built_in_root_certs(false)
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .resolve("chat.test", "127.0.0.1:0".parse().unwrap())
@@ -563,6 +608,38 @@ async fn host_header_must_match_the_connect_target() {
     assert!(up.seen.lock().unwrap().is_empty());
 }
 
+/// Read one response head (up to the blank line).
+async fn read_head<S: AsyncRead + Unpin>(s: &mut S) -> String {
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut b = [0u8; 1];
+        tokio::time::timeout(T, s.read_exact(&mut b))
+            .await
+            .unwrap()
+            .unwrap();
+        head.push(b[0]);
+    }
+    String::from_utf8(head).unwrap()
+}
+
+/// A CONNECT tunnel to `target` through parda.
+async fn connect_tunnel(proxy: SocketAddr, target: &str) -> TcpStream {
+    let mut tcp = TcpStream::connect(proxy).await.unwrap();
+    tcp.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let head = read_head(&mut tcp).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    tcp
+}
+
+/// The peer closes `s` within the test timeout.
+async fn closes<S: AsyncRead + Unpin>(s: &mut S, what: &str) {
+    let mut sink = Vec::new();
+    let r = tokio::time::timeout(T, s.read_to_end(&mut sink)).await;
+    assert!(r.is_ok(), "{what}: connection was not closed");
+}
+
 /// Open a CONNECT tunnel to `target` through parda and start TLS with `sni`.
 async fn tls_via_connect(
     proxy: SocketAddr,
@@ -570,16 +647,7 @@ async fn tls_via_connect(
     ca_pem: &str,
     sni: ServerName<'static>,
 ) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let mut tcp = TcpStream::connect(proxy).await?;
-    tcp.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
-        .await?;
-    let mut head = Vec::new();
-    while !head.ends_with(b"\r\n\r\n") {
-        let mut b = [0u8; 1];
-        tcp.read_exact(&mut b).await?;
-        head.push(b[0]);
-    }
-    assert!(head.starts_with(b"HTTP/1.1 200"));
+    let tcp = connect_tunnel(proxy, target).await;
     let mut roots = rustls::RootCertStore::empty();
     for c in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
         roots.add(c.unwrap()).unwrap();
@@ -673,4 +741,140 @@ async fn websocket_upgrade_is_relayed_and_tunnelled_unscanned() {
     assert_eq!(ev.path, "/ws");
     assert_eq!(ev.status, 101);
     assert_eq!(ev.unscanned, 1);
+}
+
+#[tokio::test]
+async fn upstream_redirects_are_relayed_not_followed() {
+    let up = start_upstream(test_pki(&["chat.test", "other.test"])).await;
+    let h = start_parda(&up.ca_pem).await;
+    let c = client(h.proxy, &h.state.ca.cert_pem());
+    let res = c
+        .get(format!("https://chat.test:{}/redirect", up.port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 302);
+    assert_eq!(
+        res.headers()["location"].to_str().unwrap(),
+        format!("https://other.test:{}/x", up.port)
+    );
+    let paths: Vec<String> = up
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| s.path.clone())
+        .collect();
+    assert_eq!(paths, ["/redirect"], "parda must not follow the redirect");
+}
+
+#[tokio::test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "binding 0.0.0.0 can raise the macOS firewall prompt; the address check is unit-tested"
+)]
+async fn serve_refuses_a_non_loopback_listener() {
+    let pki = test_pki(&["chat.test"]);
+    let (state, _rx) = state_for(&pki.ca_pem, Timeouts::default());
+    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let r = tokio::time::timeout(T, serve(listener, Arc::new(state)))
+        .await
+        .expect("serve must return at once");
+    assert!(r.is_err());
+}
+
+#[tokio::test]
+async fn pac_endpoint_refuses_foreign_hosts_and_origins() {
+    let up = start_upstream(test_pki(&["chat.test"])).await;
+    let h = start_parda(&up.ca_pem).await;
+    let plain = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(T)
+        .build()
+        .unwrap();
+    let url = format!("http://{}/parda.pac", h.proxy);
+    let ok = plain.get(&url).send().await.unwrap();
+    assert_eq!(ok.status(), 200);
+    assert_eq!(ok.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(ok.headers()["cross-origin-resource-policy"], "same-origin");
+    let ok = plain
+        .get(&url)
+        .header("host", format!("localhost:{}", h.proxy.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    // DNS rebinding: a page on evil.example resolving to 127.0.0.1.
+    let rebound = plain
+        .get(&url)
+        .header("host", "evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rebound.status(), 403);
+    // Any cross-origin fetch from a web page.
+    let cross = plain
+        .get(&url)
+        .header("origin", "https://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross.status(), 403);
+}
+
+#[tokio::test]
+async fn request_targets_must_be_origin_or_absolute_form() {
+    let up = start_upstream(test_pki(&["chat.test"])).await;
+    let h = start_parda(&up.ca_pem).await;
+    let target = format!("chat.test:{}", up.port);
+    let mut tls = tokio::time::timeout(
+        T,
+        tls_via_connect(
+            h.proxy,
+            &target,
+            &h.state.ca.cert_pem(),
+            ServerName::try_from("chat.test").unwrap(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tls.write_all(format!("OPTIONS * HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let head = read_head(&mut tls).await;
+    assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+    assert!(up.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn slow_and_idle_clients_are_disconnected() {
+    let up = start_upstream(test_pki(&["chat.test"])).await;
+    let short = Duration::from_millis(300);
+    let h = start_parda_with(
+        &up.ca_pem,
+        Timeouts {
+            tls_handshake: short,
+            header_read: short,
+            idle: short,
+        },
+    )
+    .await;
+    let target = format!("chat.test:{}", up.port);
+    // Proxy side: connected, never sends a request.
+    let mut tcp = TcpStream::connect(h.proxy).await.unwrap();
+    closes(&mut tcp, "no request").await;
+    // CONNECT accepted, never starts TLS.
+    let mut tcp = connect_tunnel(h.proxy, &target).await;
+    closes(&mut tcp, "no TLS handshake").await;
+    // Decrypted connection that stays idle.
+    let mut tls = tls_via_connect(
+        h.proxy,
+        &target,
+        &h.state.ca.cert_pem(),
+        ServerName::try_from("chat.test").unwrap(),
+    )
+    .await
+    .unwrap();
+    closes(&mut tls, "idle decrypted connection").await;
 }

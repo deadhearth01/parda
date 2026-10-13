@@ -83,8 +83,14 @@ mod tests {
             "bad host",
             "x\";alert(1)//",
             "a:443",
+            // No dot, IP literals, empty labels.
+            "localhost",
+            "127.0.0.1",
+            "10.1.2.3",
+            "a..b",
         ]);
         assert_eq!(l.entries(), ["chat.test", "claude.ai"]);
+        assert!(!l.matches("127.0.0.1"));
         assert!(l.matches("chat.test"));
         assert!(!list(&[]).matches("chat.test"));
     }

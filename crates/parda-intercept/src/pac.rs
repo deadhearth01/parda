@@ -63,7 +63,10 @@ mod tests {
         script.push_str(
             "\nfor (const h of ['chat.test','x.chat.test','CHAT.TEST','api.claude.ai',\
              'example.com','evilchat.test','chat.test.evil.com']) \
-             console.log(h + '=' + FindProxyForURL('https://' + h + '/', h));\n",
+             console.log(h + '=' + FindProxyForURL('https://' + h + '/', h));\n\
+             for (const u of ['http://chat.test/', 'wss://chat.test/', 'ws://chat.test/', \
+             'HTTPS://x.chat.test/', 'ftp://chat.test/']) \
+             console.log(u + '=' + FindProxyForURL(u, u.split('/')[2]));\n",
         );
         let out = match std::process::Command::new("node")
             .arg("-e")
@@ -90,6 +93,13 @@ mod tests {
             ("example.com", "DIRECT"),
             ("evilchat.test", "DIRECT"),
             ("chat.test.evil.com", "DIRECT"),
+            // Only TLS URLs go to parda; plain http stays DIRECT so the site
+            // can redirect to https.
+            ("http://chat.test/", "DIRECT"),
+            ("wss://chat.test/", proxy),
+            ("ws://chat.test/", "DIRECT"),
+            ("HTTPS://x.chat.test/", proxy),
+            ("ftp://chat.test/", "DIRECT"),
         ] {
             assert!(out.contains(&format!("{h}={want}\n")), "{h}: {out}");
         }

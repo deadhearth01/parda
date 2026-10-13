@@ -12,5 +12,5 @@ pub mod transform;
 pub use ca::Ca;
 pub use hosts::HostList;
 pub use pac::pac;
-pub use server::{InterceptEvent, InterceptState, serve};
+pub use server::{InterceptEvent, InterceptState, Timeouts, serve, upstream_client_builder};
 pub use transform::{BodyTransform, Passthrough, Refusal, RequestOutcome, StreamTransform};

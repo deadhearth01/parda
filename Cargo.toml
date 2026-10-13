@@ -45,6 +45,8 @@ directories = "6"
 # async / http
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
+# Keep the native-roots features off: parda-intercept relies on webpki roots so
+# that its own CA (once trusted by the OS) is never trusted for upstream TLS.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip", "brotli", "deflate", "json", "http2"] }
 bytes = "1"
 futures = "0.3"

@@ -67,6 +67,59 @@ pub struct InterceptState {
     pub events: broadcast::Sender<InterceptEvent>,
     /// Client for the real servers. Must keep certificate verification on.
     pub upstream: reqwest::Client,
+    /// HTTP/1.1-only client for upgrade (WebSocket) requests.
+    pub upstream_http1: reqwest::Client,
+    pub timeouts: Timeouts,
+}
+
+/// Connection timeouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    /// Client TLS handshake on a decrypted tunnel.
+    pub tls_handshake: Duration,
+    /// Waiting for a request head on the proxy-facing side (CONNECT, PAC).
+    pub header_read: Duration,
+    /// A decrypted connection waiting for its next request is closed after this.
+    pub idle: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Timeouts {
+            tls_handshake: Duration::from_secs(10),
+            header_read: Duration::from_secs(30),
+            idle: Duration::from_secs(90),
+        }
+    }
+}
+
+/// How long connecting to a real server may take.
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest silence between two reads from a real server. Per read, not per
+/// response: a streamed answer may run for minutes.
+const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The builder for parda's upstream clients. Callers may add roots or DNS
+/// overrides (tests do) but should not loosen it:
+///
+/// - redirects are never followed: a 3xx from an AI host is relayed to the
+///   browser, which judges it under the right origin (following it here
+///   would fetch another site under the AI site's origin, with its headers);
+/// - no proxy (an `HTTPS_PROXY` pointing at parda would loop) and https only;
+/// - certificates verified against the webpki (Mozilla) roots built into
+///   reqwest, never the OS store, so parda's own CA, once trusted by the
+///   OS, is never trusted for upstream connections. (The workspace must keep
+///   reqwest's native-roots features off.)
+/// - connect and per-read timeouts, but no total timeout (it would cut
+///   long event streams).
+pub fn upstream_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .https_only(true)
+        .tls_built_in_root_certs(true)
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .read_timeout(UPSTREAM_READ_TIMEOUT)
 }
 
 /// Serve the proxy on `listener`. Binding it to loopback is the caller's job.
@@ -669,9 +722,31 @@ fn text(status: StatusCode, msg: &str) -> Response<Body> {
     res
 }
 
+/// Loopback, including IPv4-mapped IPv6 loopback.
+fn is_loopback(_ip: std::net::IpAddr) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_addresses_only() {
+        for ok in ["127.0.0.1", "127.8.9.10", "::1", "::ffff:127.0.0.1"] {
+            assert!(is_loopback(ok.parse().unwrap()), "{ok}");
+        }
+        for bad in [
+            "0.0.0.0",
+            "::",
+            "192.168.1.2",
+            "10.0.0.1",
+            "::ffff:10.0.0.1",
+            "fe80::1",
+        ] {
+            assert!(!is_loopback(bad.parse().unwrap()), "{bad}");
+        }
+    }
 
     #[tokio::test]
     async fn body_limit_gives_413() {

@@ -27,6 +27,8 @@ time = "0.3"
 rand.workspace = true
 
 [dev-dependencies]
+# The fake upstream speaks HTTP/2 like real AI sites.
+hyper = { workspace = true, features = ["http2"] }
 x509-parser = "0.18"
 
 [lints]
