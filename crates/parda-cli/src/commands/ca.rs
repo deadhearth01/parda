@@ -68,7 +68,7 @@ pub fn uninstall() -> anyhow::Result<()> {
 pub fn status() -> anyhow::Result<()> {
     let p = paths()?;
     let pem = ca_cert_path(&p);
-    if !ca_exists(&p) {
+    if !pem.is_file() {
         println!("certificate: not created (`parda ca create` or `parda ca install`)");
         return Ok(());
     }

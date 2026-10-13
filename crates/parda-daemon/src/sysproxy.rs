@@ -297,11 +297,17 @@ pub fn enable(
         Ok(())
     })();
     if let Err(e) = applied {
-        let rollback = disable(r, paths);
-        return Err(match rollback {
-            Ok(_) => e.context("could not point the system at parda; earlier changes were rolled back"),
+        return Err(match disable(r, paths) {
+            Ok(Some(r)) if r.failed.is_empty() => e.context(
+                "could not point the system at parda; every change was undone (protection is off)",
+            ),
+            Ok(Some(r)) => e.context(format!(
+                "could not point the system at parda, and these settings could not be put back: {} — run `parda intercept off` to retry",
+                r.failed.join(", ")
+            )),
+            Ok(None) => e.context("could not point the system at parda"),
             Err(r_err) => e.context(format!(
-                "could not point the system at parda, and rolling back failed too ({r_err:#}); run `parda intercept off`"
+                "could not point the system at parda, and undoing the changes failed too ({r_err:#}); run `parda intercept off`"
             )),
         });
     }
@@ -317,8 +323,10 @@ fn still_ours(
 ) -> anyhow::Result<bool> {
     Ok(match platform {
         Platform::MacOs => {
+            // Ours only while the service still uses parda's PAC: a user who
+            // switched auto-proxy off meanwhile keeps it off.
             let now = mac_get(r, &s.target)?;
-            now.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url))
+            now.enabled && now.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url))
         }
         Platform::Windows => win_query(r).is_some_and(|u| is_parda_pac(&u, pac_url)),
         Platform::Linux => {
@@ -592,13 +600,47 @@ mod tests {
         os.failing
             .push("networksetup -setautoproxyurl iPhone".into());
         let e = enable(&mut os, &p, Platform::MacOs, PAC).unwrap_err();
-        assert!(format!("{e:#}").contains("rolled back"), "{e:#}");
+        assert!(
+            format!("{e:#}").contains("every change was undone"),
+            "{e:#}"
+        );
         assert_eq!(
             snapshot(&os)["Thunderbolt Bridge"],
             before["Thunderbolt Bridge"]
         );
         assert!(!os.mac["Wi-Fi"].1, "Wi-Fi switched back off");
         assert!(load_state(&p).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_rollback_that_fails_names_what_is_left() {
+        let (_d, p) = paths();
+        let mut os = mac();
+        // Applying fails at iPhone USB; putting Thunderbolt back fails too.
+        os.failing
+            .push("networksetup -setautoproxyurl iPhone USB http://127".into());
+        os.failing
+            .push("networksetup -setautoproxyurl Thunderbolt Bridge http://corp".into());
+        let e = format!(
+            "{:#}",
+            enable(&mut os, &p, Platform::MacOs, PAC).unwrap_err()
+        );
+        assert!(
+            e.contains("Thunderbolt Bridge") && e.contains("parda intercept off"),
+            "{e}"
+        );
+        assert!(load_state(&p).unwrap().is_some(), "kept for a later off");
+    }
+
+    #[test]
+    fn auto_proxy_switched_off_by_the_user_stays_off() {
+        let (_d, p) = paths();
+        let mut os = mac();
+        enable(&mut os, &p, Platform::MacOs, PAC).unwrap();
+        os.mac.get_mut("Thunderbolt Bridge").unwrap().1 = false;
+        let r = disable(&mut os, &p).unwrap().unwrap();
+        assert!(r.kept.contains(&"Thunderbolt Bridge".to_string()));
+        assert!(!os.mac["Thunderbolt Bridge"].1);
     }
 
     #[test]
