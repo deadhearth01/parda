@@ -67,6 +67,12 @@ fn site() -> Responder {
             v.push("data: [DONE]\n\n".into());
             v
         }),
+        p if p.starts_with("/backend-api/share/") => Reply::new(
+            "application/json",
+            vec![
+                json!({"title": "Shared by someone", "text": "Hi [NAME_1] [EMAIL_1]"}).to_string(),
+            ],
+        ),
         p if p.starts_with("/backend-api/conversation/") => Reply::new(
             "application/json",
             vec![
@@ -512,4 +518,40 @@ async fn a_tag_issued_for_one_site_is_not_restored_for_another() {
         parda.engine.restore("[NAME_1]", "intercept:chatgpt.com"),
         "Ravi Kumar"
     );
+}
+
+#[tokio::test]
+async fn shared_pages_are_never_restored() {
+    let up = start_upstream(site()).await;
+    let parda = start_parda(&up, |_| {}, None).await;
+    let c = parda.client();
+    let base = format!("https://chatgpt.com:{}", up.port);
+    // The user's own send issues the tags.
+    let res = c
+        .post(format!("{base}/echo"))
+        .header("content-type", "text/plain")
+        .body("Ravi Kumar, ravi@example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.text().await.unwrap(),
+        "echo: Ravi Kumar, ravi@example.com"
+    );
+    // A page someone else wrote, full of those tags, stays tags.
+    let res = c
+        .get(format!("{base}/backend-api/share/6f1c2a9e"))
+        .send()
+        .await
+        .unwrap();
+    let v: Value = res.json().await.unwrap();
+    assert_eq!(v["text"], "Hi [NAME_1] [EMAIL_1]");
+    // The user's own history is restored.
+    let res = c
+        .get(format!("{base}/backend-api/conversation/{CONV}"))
+        .send()
+        .await
+        .unwrap();
+    let v: Value = res.json().await.unwrap();
+    assert_eq!(v["title"], "Note to Ravi Kumar");
 }

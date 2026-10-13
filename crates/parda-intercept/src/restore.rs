@@ -95,6 +95,11 @@ pub(crate) fn for_content_type(
     }
 }
 
+/// A rewriter that changes nothing.
+pub(crate) fn passthrough() -> Box<dyn StreamTransform> {
+    Box::new(Passthrough)
+}
+
 /// Bodies parda does not rewrite (images, binaries, unknown types).
 struct Passthrough;
 

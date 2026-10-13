@@ -369,13 +369,32 @@ impl BodyTransform for EngineTransform {
         self.rewrite(host, path, headers, body).map(|o| o.body)
     }
 
+    /// As for the answer to a POST (see
+    /// [`BodyTransform::response_stream_for`]).
     fn response_stream(
         &self,
         host: &str,
         path: &str,
         content_type: &str,
     ) -> Box<dyn StreamTransform> {
-        let _ = path;
+        self.response_stream_for(&http::Method::POST, host, path, content_type)
+    }
+
+    /// Answers are restored only for the user's own sends (POST) and own
+    /// history (allowlisted GET endpoints per site); everything else passes
+    /// through, so a page someone else wrote never gets the viewer's values.
+    fn response_stream_for(
+        &self,
+        method: &http::Method,
+        host: &str,
+        path: &str,
+        content_type: &str,
+    ) -> Box<dyn StreamTransform> {
+        let own = *method == http::Method::POST
+            || (*method == http::Method::GET && sites::restores_get(host, path));
+        if !own {
+            return crate::restore::passthrough();
+        }
         let scope = self.settings().scope_for(host);
         crate::restore::for_content_type(&self.engine, &scope, content_type)
     }
@@ -745,6 +764,81 @@ pub(crate) mod tests {
         let mut out = r.push(body.as_bytes()).to_vec();
         out.extend_from_slice(&r.finish());
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn only_post_answers_and_own_history_are_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        let restores = |method: http::Method, host: &str, path: &str| {
+            !t.response_stream_for(&method, host, path, "application/json")
+                .is_passthrough()
+        };
+        use http::Method;
+        // The user's own sends.
+        assert!(restores(
+            Method::POST,
+            "chatgpt.com",
+            "/backend-api/conversation"
+        ));
+        assert!(restores(
+            Method::POST,
+            "gemini.google.com",
+            "/_/BardChatUi/data/batchexecute"
+        ));
+        // The user's own history.
+        assert!(restores(
+            Method::GET,
+            "chatgpt.com",
+            "/backend-api/conversation/6f1c2a9e"
+        ));
+        assert!(restores(
+            Method::GET,
+            "chatgpt.com",
+            "/backend-api/conversations"
+        ));
+        assert!(restores(
+            Method::GET,
+            "claude.ai",
+            "/api/organizations/o1/chat_conversations/c1"
+        ));
+        assert!(restores(
+            Method::GET,
+            "claude.ai",
+            "/api/organizations/o1/chat_conversations"
+        ));
+        // Everything else: shared pages, GPTs, snapshots, other methods.
+        assert!(!restores(
+            Method::GET,
+            "chatgpt.com",
+            "/backend-api/share/abc"
+        ));
+        assert!(!restores(
+            Method::GET,
+            "chatgpt.com",
+            "/backend-api/gizmos/g-1"
+        ));
+        assert!(!restores(
+            Method::GET,
+            "chatgpt.com",
+            "/backend-api/conversation/a/b"
+        ));
+        assert!(!restores(
+            Method::GET,
+            "claude.ai",
+            "/api/chat_snapshots/s1"
+        ));
+        assert!(!restores(Method::GET, "perplexity.ai", "/rest/thread/x"));
+        assert!(!restores(
+            Method::PUT,
+            "chatgpt.com",
+            "/backend-api/conversation"
+        ));
+        assert!(!restores(
+            Method::PATCH,
+            "chatgpt.com",
+            "/backend-api/conversation/x"
+        ));
     }
 
     #[test]

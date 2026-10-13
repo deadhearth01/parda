@@ -646,7 +646,7 @@ async fn forward(
             stream,
             state
                 .transform
-                .response_stream(&target.host, &path, &content_type),
+                .response_stream_for(&parts.method, &target.host, &path, &content_type),
         )
     };
     let mut out = Response::new(body);

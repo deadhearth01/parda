@@ -49,6 +49,20 @@ pub trait BodyTransform: Send + Sync + 'static {
         content_type: &str,
     ) -> Box<dyn StreamTransform>;
 
+    /// [`BodyTransform::response_stream`] for the answer to a request made
+    /// with `method`. The server calls this one; the default ignores the
+    /// method.
+    fn response_stream_for(
+        &self,
+        method: &http::Method,
+        host: &str,
+        path: &str,
+        content_type: &str,
+    ) -> Box<dyn StreamTransform> {
+        let _ = method;
+        self.response_stream(host, path, content_type)
+    }
+
     /// [`BodyTransform::request`] plus what it did, for the event feed. The
     /// default reports no counts; engine-backed transforms override it.
     fn request_outcome(

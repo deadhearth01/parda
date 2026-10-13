@@ -12,6 +12,12 @@ pub(crate) struct Site {
     pub(crate) hosts: &'static [&'static str],
     /// Key patterns (`*` matches any run of characters), case-insensitive.
     pub(crate) skip_keys: &'static [&'static str],
+    /// GET endpoints holding the user's own history, whose answers are
+    /// restored (`*` matches one path segment). Answers to POST requests
+    /// are always restored; every other answer passes through, so a page
+    /// someone else wrote (a shared conversation, a GPT) never gets the
+    /// viewer's real values.
+    pub(crate) history: &'static [&'static str],
 }
 
 pub(crate) static SITES: &[Site] = &[
@@ -31,10 +37,15 @@ pub(crate) static SITES: &[Site] = &[
             "websocket_*",
             "*_proof*",
         ],
+        history: &["/backend-api/conversation/*", "/backend-api/conversations"],
     },
     Site {
         hosts: &["claude.ai"],
         skip_keys: &["rendering_mode", "sync_sources", "files"],
+        history: &[
+            "/api/organizations/*/chat_conversations",
+            "/api/organizations/*/chat_conversations/*",
+        ],
     },
     Site {
         // Form fields and query parameters of the batchexecute endpoints;
@@ -50,10 +61,12 @@ pub(crate) static SITES: &[Site] = &[
             "soc-*",
             "source-path",
         ],
+        history: &[],
     },
     Site {
         hosts: &["copilot.microsoft.com"],
         skip_keys: &["mode", "channel", "api-version"],
+        history: &[],
     },
     Site {
         hosts: &["perplexity.ai"],
@@ -67,18 +80,22 @@ pub(crate) static SITES: &[Site] = &[
             "language",
             "attachments",
         ],
+        history: &[],
     },
     Site {
         hosts: &["chat.deepseek.com"],
         skip_keys: &["challenge*", "thinking_enabled", "search_enabled"],
+        history: &[],
     },
     Site {
         hosts: &["chat.mistral.ai"],
         skip_keys: &["mode", "features"],
+        history: &[],
     },
     Site {
         hosts: &["grok.com"],
         skip_keys: &["*Attachments", "deviceEnvInfo", "toolOverrides"],
+        history: &[],
     },
     Site {
         // GraphQL over form posts: the prompt is inside `variables` (JSON
@@ -94,12 +111,31 @@ pub(crate) static SITES: &[Site] = &[
             "server_timestamps",
             "doc_id",
         ],
+        history: &[],
     },
     Site {
         hosts: &["poe.com"],
         skip_keys: &["queryName", "hash", "bot", "sdid", "extensions"],
+        history: &[],
     },
 ];
+
+/// Is a GET to `path` on `host` the user's own history (its answer is
+/// restored)?
+pub(crate) fn restores_get(host: &str, path: &str) -> bool {
+    let Some(site) = for_host(host) else {
+        return false;
+    };
+    let segs: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+    site.history.iter().any(|pattern| {
+        let pat: Vec<&str> = pattern.split('/').collect();
+        pat.len() == segs.len()
+            && pat
+                .iter()
+                .zip(&segs)
+                .all(|(p, s)| (*p == "*" && !s.is_empty()) || p == s)
+    })
+}
 
 /// The site entry for `host` (exact or a subdomain), if parda knows it.
 pub(crate) fn for_host(host: &str) -> Option<&'static Site> {
