@@ -41,6 +41,9 @@ impl Default for RunOptions {
 
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 
+/// Lowest model threshold the Settings tab offers; the model decodes at this.
+const MODEL_THRESHOLD_FLOOR: f32 = 0.3;
+
 /// Load the configured ML model, or explain why not. A warm-up inference
 /// keeps the first real request fast.
 pub fn load_model(paths: &Paths, config: &Config) -> (Option<Arc<dyn MlDetector>>, Option<String>) {
@@ -58,7 +61,10 @@ pub fn load_model(paths: &Paths, config: &Config) -> (Option<Arc<dyn MlDetector>
         .execution_provider
         .parse()
         .unwrap_or(ExecutionProvider::Auto);
-    match parda_ml::load_detector(&paths.models_dir(), &id, ep, config.detect.ml_threshold) {
+    // Decode at a low floor; the engine keeps only findings at or above the
+    // configured `ml_threshold`, so changing it applies without a reload.
+    let floor = config.detect.ml_threshold.min(MODEL_THRESHOLD_FLOOR);
+    match parda_ml::load_detector(&paths.models_dir(), &id, ep, floor) {
         Ok(det) => {
             let t = Instant::now();
             match det.detect_batch(&["Warm-up: Ravi Kumar met Anna Schmidt in Pune."]) {
@@ -114,6 +120,12 @@ impl Daemon {
             );
         }
         let config = load_config(&paths)?;
+        for key in config.suspicious_action_keys() {
+            tracing::warn!(
+                key = %key,
+                "[detect.actions] key looks like a misspelt built-in kind; it is treated as a custom kind"
+            );
+        }
         let rules = load_rules(&paths)?;
         let (ml, model_error) = load_model(&paths, &config);
         let engine = Engine::open(

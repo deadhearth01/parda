@@ -200,3 +200,45 @@ fn using_the_fp32_model_raises_the_ml_time_budget() {
     assert!(cfg.contains("ml_timeout_ms = 1000"), "{cfg}");
     assert!(cfg.contains("model = \"parda-pii-edge\""), "{cfg}");
 }
+
+#[test]
+fn setup_keeps_an_installed_model_you_already_chose() {
+    let h = home();
+    let dir = h.path().join("data/models/parda-pii-edge");
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in ["model.onnx", "tokenizer.json", "gliner_config.json"] {
+        std::fs::write(dir.join(f), b"x").unwrap();
+    }
+    parda(&h)
+        .args(["model", "use", "parda-pii-edge"])
+        .assert()
+        .success();
+    parda(&h)
+        .args(["setup", "--yes", "--no-service"])
+        .assert()
+        .success();
+    let cfg = std::fs::read_to_string(h.path().join("config.toml")).unwrap();
+    assert!(cfg.contains("model = \"parda-pii-edge\""), "{cfg}");
+    // An explicit --model still wins.
+    parda(&h)
+        .args(["setup", "--yes", "--no-service", "--model", "none"])
+        .assert()
+        .success();
+    let cfg = std::fs::read_to_string(h.path().join("config.toml")).unwrap();
+    assert!(cfg.contains("model = \"none\""), "{cfg}");
+}
+
+#[test]
+fn doctor_flags_misspelt_action_keys() {
+    let h = home();
+    let cfg = std::fs::read_to_string(h.path().join("config.toml")).unwrap();
+    std::fs::write(
+        h.path().join("config.toml"),
+        format!("{cfg}[detect.actions]\nAadhar = \"block\"\n"),
+    )
+    .unwrap();
+    parda(&h)
+        .arg("doctor")
+        .assert()
+        .stdout(predicate::str::contains("`Aadhar` is not a built-in kind"));
+}

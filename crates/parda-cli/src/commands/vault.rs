@@ -3,7 +3,7 @@
 use dialoguer::Confirm;
 use parda_daemon::load_config;
 use parda_ipc::Request;
-use parda_vault::{Store, load_or_create_key};
+use parda_vault::{Store, open_vault};
 
 use super::{daemon_client, paths};
 
@@ -11,8 +11,8 @@ fn local_store() -> anyhow::Result<Store> {
     let p = paths()?;
     p.ensure()?;
     let config = load_config(&p)?;
-    let (key, _) = load_or_create_key(&p.data_dir, config.vault.use_keyring)?;
-    Ok(Store::open(&p.vault_db(), key)?)
+    // Same key lookup as the daemon, including the fallback to the other key store.
+    Ok(open_vault(&p.data_dir, config.vault.use_keyring)?.0)
 }
 
 pub fn stats() -> anyhow::Result<()> {

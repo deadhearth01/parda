@@ -12,24 +12,37 @@ pub fn run(yes: bool, model_arg: Option<String>, no_service: bool) -> anyhow::Re
     println!("parda setup — config in {}", p.config_dir.display());
 
     let mut config = load_config(&p)?;
+    // A model chosen earlier (`parda model use`) stays unless it is gone.
+    let mm = ModelManager::new(&p.models_dir());
+    let current = match config.detect.model.as_str() {
+        "default" | "" => None,
+        "none" => Some("none".to_string()),
+        id if mm.is_installed(id) => Some(id.to_string()),
+        _ => None,
+    };
     let model_id = match model_arg {
         Some(m) => m,
-        None if yes => default_model_id().to_string(),
+        None if yes => current.unwrap_or_else(|| default_model_id().to_string()),
         None => {
-            let choices = [
-                format!(
-                    "{} (recommended: names, addresses — ~50 MB)",
-                    default_model_id()
-                ),
-                "none (rules and your own name list only; nothing to download)".to_string(),
-            ];
-            match Select::new()
+            let mut choices = Vec::new();
+            if let Some(c) = &current {
+                choices.push(format!("{c} (keep current)"));
+            }
+            choices.push(format!(
+                "{} (recommended: names, addresses — ~50 MB)",
+                default_model_id()
+            ));
+            choices
+                .push("none (rules and your own name list only; nothing to download)".to_string());
+            let picked = Select::new()
                 .with_prompt("Name detection model")
                 .items(&choices)
                 .default(0)
-                .interact()?
-            {
-                0 => default_model_id().to_string(),
+                .interact()?;
+            let offset = usize::from(current.is_some());
+            match (picked, &current) {
+                (0, Some(c)) => c.clone(),
+                (i, _) if i == offset => default_model_id().to_string(),
                 _ => "none".to_string(),
             }
         }
@@ -43,7 +56,6 @@ pub fn run(yes: bool, model_arg: Option<String>, no_service: bool) -> anyhow::Re
     println!("✓ wrote {}", p.config_file().display());
 
     if model_id != "none" {
-        let mm = ModelManager::new(&p.models_dir());
         if mm.is_installed(&model_id) {
             println!("✓ model {model_id} already installed");
         } else if parda_ml::find_model(&model_id).is_some() {

@@ -44,6 +44,14 @@ pub fn run() -> anyhow::Result<()> {
                     "defaults (no config.toml; run `parda setup`)"
                 },
             );
+            for key in c.suspicious_action_keys() {
+                r.warn(
+                    "config",
+                    format!(
+                        "[detect.actions] `{key}` is not a built-in kind (typo?) — it only applies to custom terms named `{key}`"
+                    ),
+                );
+            }
             c
         }
         Err(e) => {

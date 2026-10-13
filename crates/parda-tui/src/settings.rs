@@ -148,8 +148,7 @@ pub fn row(s: &Setting, c: &Config) -> Row {
             r.group = "detection";
             r.label = "model confidence threshold".into();
             r.value = format!("{:.2}", c.detect.ml_threshold);
-            r.help = "Lower finds more names (and more false alarms); higher is stricter about what counts as a name. A higher value applies at once; a lower one after a daemon restart.";
-            r.restart = true;
+            r.help = "Lower finds more names (and more false alarms); higher is stricter about what counts as a name. Applies at once.";
         }
         Setting::Timeout => {
             r.group = "detection";
@@ -363,12 +362,12 @@ mod tests {
     }
 
     #[test]
-    fn model_threshold_is_marked_restart_required() {
-        // The model is loaded with the threshold; a lower value only takes
-        // effect after the daemon reloads it.
+    fn model_threshold_applies_live() {
+        // The daemon decodes at a 0.3 floor and the engine filters by the
+        // configured threshold, so every offered value applies at once.
         let r = row(&Setting::Threshold, &Config::default());
-        assert!(r.restart);
-        assert!(r.help.contains("restart"), "{}", r.help);
+        assert!(!r.restart);
+        assert!(THRESHOLDS.iter().all(|t| *t >= 0.3));
     }
 
     #[test]
