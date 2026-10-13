@@ -10,8 +10,9 @@ pub mod ml;
 pub mod validators;
 
 pub use config::{
-    Action, ClipboardConfig, Config, DetectConfig, Mode, PrivacyConfig, ProtectionConfig,
-    ProxyConfig, ReplaceConfig, Style, UnscannedMedia, VaultConfig,
+    Action, ClipboardConfig, Config, DEFAULT_INTERCEPT_HOSTS, DetectConfig, InterceptConfig, Mode,
+    PrivacyConfig, ProtectionConfig, ProxyConfig, ReplaceConfig, Style, UnscannedMedia,
+    VaultConfig,
 };
 pub use detection::{Detection, Source, Span};
 pub use error::{Error, Result};

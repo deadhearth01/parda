@@ -44,6 +44,15 @@ hotkey = "default"                 # Cmd+Alt+V on macOS, Ctrl+Alt+V elsewhere; e
 restore_on_copy = true
 scope = "global"
 
+[intercept]                        # AI websites and desktop apps (see "Intercept" below)
+enabled = false
+listen = "127.0.0.1:8788"
+hosts = ["chatgpt.com", "chat.openai.com", "claude.ai", "gemini.google.com", "copilot.microsoft.com",
+         "perplexity.ai", "chat.deepseek.com", "chat.mistral.ai", "grok.com", "meta.ai", "poe.com"]
+scope = "global"                   # same tags as the clipboard and the agent proxy
+unscanned = "allow"                # allow | block — file uploads and binary bodies
+skip_keys = []                     # extra JSON / form keys never changed, e.g. ["trace_tag"]
+
 [privacy]
 log_values = false
 ```
@@ -73,6 +82,24 @@ how to redact are never passed through, even if listed. Example for Ollama's nat
 openai_upstream = "http://127.0.0.1:11434"
 passthrough_paths = ["/api/*"]
 ```
+
+### Intercept
+
+`[intercept]` filters what you type into AI websites (and desktop apps that use the system proxy).
+Only the listed hosts and their subdomains are decrypted; everything else is tunnelled untouched.
+Tags follow `replace.style` (there is no separate style for intercept).
+
+- **Requests**: JSON bodies have every string value redacted except identifier fields — keys such
+  as `id`, `*_id`, `*Id`, `uuid`, `model`, `token`, `nonce`, `timestamp`, `parent*`, `client_*`,
+  `type`, `role`, `status` (plus `skip_keys` and a built-in list per site) — and values that look
+  like identifiers (UUIDs, long hex or base64 strings, links to the site itself). JSON carried inside
+  a string (Gemini's `f.req`) is opened and filtered too. Form bodies, query strings and `text/plain`
+  bodies are filtered; multipart text fields are filtered and file parts count as unscanned.
+  Compressed bodies are decoded first. A body that claims to be JSON but is not is refused
+  (`400 parda_unparseable_body`) rather than sent unfiltered. In `detect.mode = "strict"` a failed name
+  detector refuses the send (`503`); a `block` action refuses it with `403`.
+- **Answers**: JSON, NDJSON, server-sent-event streams and plain text get the real values back,
+  including tags split across stream events.
 
 ## Changing settings
 

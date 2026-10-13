@@ -25,7 +25,7 @@
   - Windows: PAC via `HKCU\…\Internet Settings\AutoConfigURL` + `InternetSetOption` refresh; certificate via `certutil -user -addstore Root` (Windows shows its own confirmation).
   - Linux: GNOME `gsettings` proxy autoconfig URL; certificate instructions (system store requires sudo) — documented, not automated.
   - Firefox: uses its own settings; `parda intercept on` prints the two prefs to set (`network.proxy.autoconfig_url`, `security.enterprise_roots.enabled`).
-- Tags: replacement style `token` with a configurable format; new default token format `[{LABEL}_{N}]` with friendly labels (Person → NAME, Email → EMAIL, Phone → PHONE, Aadhaar → AADHAAR, Pan → PAN, CreditCard → CARD, BankAccount → ACCOUNT, Address → ADDRESS, Upi → UPI, Secret → SECRET …). Restoration accepts the exact tag and case variants. The intercept surface defaults to tags; the agent proxy keeps the global `replace.style`. Config: `replace.style` (global), `intercept.style` (overrides for intercept; default `token`), `replace.token_format`.
+- Tags: replacement style `token`, format `[{LABEL}_{N}]` with friendly labels (Person → NAME, Email → EMAIL, Phone → PHONE, Aadhaar → AADHAAR, Pan → PAN, CreditCard → CARD, BankAccount → ACCOUNT, Address → ADDRESS, Upi → UPI, Secret → SECRET …). Restoration accepts the exact tag and case variants. Every surface, intercept included, uses the global `replace.style` (default `token`). *(Superseded 2026-10-13: an earlier draft had a separate `intercept.style` and a configurable `replace.token_format`; the controller ruled for one global style; the tag format is fixed, as already shipped by parda-vault.)*
 - TUI/CLI: intercept status on the dashboard and Settings tab (on/off, CA trusted?, hosts); events per surface `intercept`.
 
 ### Out (later)

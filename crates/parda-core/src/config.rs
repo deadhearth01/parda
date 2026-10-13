@@ -37,7 +37,7 @@ pub enum Mode {
 pub enum Style {
     /// Realistic same-kind fake values.
     Surrogate,
-    /// Typed placeholder tokens such as `⟦PERSON_1⟧`.
+    /// Typed tags such as `[NAME_1]`.
     Token,
 }
 
@@ -57,6 +57,7 @@ pub struct Config {
     pub replace: ReplaceConfig,
     pub vault: VaultConfig,
     pub clipboard: ClipboardConfig,
+    pub intercept: InterceptConfig,
     pub privacy: PrivacyConfig,
 }
 
@@ -195,6 +196,55 @@ impl Default for ClipboardConfig {
             hotkey: "default".into(),
             restore_on_copy: true,
             scope: "global".into(),
+        }
+    }
+}
+
+/// The AI sites intercepted by default.
+pub const DEFAULT_INTERCEPT_HOSTS: [&str; 11] = [
+    "chatgpt.com",
+    "chat.openai.com",
+    "claude.ai",
+    "gemini.google.com",
+    "copilot.microsoft.com",
+    "perplexity.ai",
+    "chat.deepseek.com",
+    "chat.mistral.ai",
+    "grok.com",
+    "meta.ai",
+    "poe.com",
+];
+
+/// System-wide HTTPS interception of AI sites (`parda intercept`). Tags
+/// follow the global `replace.style`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InterceptConfig {
+    pub enabled: bool,
+    pub listen: String,
+    /// Hosts decrypted and filtered (subdomains included); every other host
+    /// is tunnelled untouched.
+    pub hosts: Vec<String>,
+    /// Vault scope for intercepted traffic (`global` shares tags with the
+    /// clipboard and the agent proxy).
+    pub scope: String,
+    /// Request parts parda cannot read (file uploads, binary bodies):
+    /// forwarded with a warning (`allow`) or refused (`block`).
+    pub unscanned: UnscannedMedia,
+    /// Extra JSON / form keys whose values are never changed (identifiers a
+    /// site needs verbatim), on top of the built-in identifier keys.
+    pub skip_keys: Vec<String>,
+}
+
+impl Default for InterceptConfig {
+    fn default() -> Self {
+        InterceptConfig {
+            enabled: false,
+            listen: "127.0.0.1:8788".into(),
+            hosts: DEFAULT_INTERCEPT_HOSTS.map(String::from).to_vec(),
+            scope: "global".into(),
+            unscanned: UnscannedMedia::Allow,
+            skip_keys: Vec::new(),
         }
     }
 }
@@ -380,6 +430,48 @@ mod tests {
         let back = Config::from_toml_str(&s).unwrap();
         assert_eq!(back.detect.mode, Mode::Fast);
         assert_eq!(back.replace.style, Style::Surrogate);
+    }
+
+    #[test]
+    fn intercept_section_defaults_and_parses() {
+        let c = Config::from_toml_str("").unwrap();
+        assert!(!c.intercept.enabled);
+        assert_eq!(c.intercept.listen, "127.0.0.1:8788");
+        assert_eq!(
+            c.intercept.hosts,
+            [
+                "chatgpt.com",
+                "chat.openai.com",
+                "claude.ai",
+                "gemini.google.com",
+                "copilot.microsoft.com",
+                "perplexity.ai",
+                "chat.deepseek.com",
+                "chat.mistral.ai",
+                "grok.com",
+                "meta.ai",
+                "poe.com",
+            ]
+        );
+        assert_eq!(c.intercept.scope, "global");
+        assert_eq!(c.intercept.unscanned, UnscannedMedia::Allow);
+        assert!(c.intercept.skip_keys.is_empty());
+
+        let c = Config::from_toml_str(
+            "[intercept]\nenabled = true\nhosts = [\"chat.test\"]\nunscanned = \"block\"\n\
+             skip_keys = [\"trace\"]\nscope = \"web\"\n",
+        )
+        .unwrap();
+        assert!(c.intercept.enabled);
+        assert_eq!(c.intercept.hosts, ["chat.test"]);
+        assert_eq!(c.intercept.unscanned, UnscannedMedia::Block);
+        assert_eq!(c.intercept.skip_keys, ["trace"]);
+        assert_eq!(c.intercept.scope, "web");
+        let back = Config::from_toml_str(&c.to_toml_string().unwrap()).unwrap();
+        assert_eq!(back.intercept.hosts, c.intercept.hosts);
+        assert_eq!(back.intercept.unscanned, UnscannedMedia::Block);
+        // There is no per-surface style: `replace.style` applies everywhere.
+        assert!(Config::from_toml_str("[intercept]\nstyle = \"token\"\n").is_err());
     }
 
     #[test]
