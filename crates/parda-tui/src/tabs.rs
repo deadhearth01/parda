@@ -1011,12 +1011,13 @@ mod tests {
         app.on_key(key(KeyCode::Down), &mut b);
         app.on_key(key(KeyCode::Enter), &mut b);
         assert_eq!(cfg(&b).detect.mode, parda_core::Mode::Fast);
-        // Clicking the replacement-style row changes it; right-click changes it back.
+        // Tags are the default; clicking the style row changes it, right-click changes it back.
+        assert_eq!(cfg(&b).replace.style, parda_core::Style::Token);
         let (x, y) = find(&app, "replacement style");
         click_at(&mut app, &mut b, x, y, MouseButton::Left);
-        assert_eq!(cfg(&b).replace.style, parda_core::Style::Token);
-        click_at(&mut app, &mut b, x, y, MouseButton::Right);
         assert_eq!(cfg(&b).replace.style, parda_core::Style::Surrogate);
+        click_at(&mut app, &mut b, x, y, MouseButton::Right);
+        assert_eq!(cfg(&b).replace.style, parda_core::Style::Token);
         // Restart-required settings say so.
         let (x, y) = find(&app, "agent proxy");
         click_at(&mut app, &mut b, x, y, MouseButton::Left);

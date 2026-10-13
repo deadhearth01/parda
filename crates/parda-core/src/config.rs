@@ -148,7 +148,7 @@ pub struct ReplaceConfig {
 impl Default for ReplaceConfig {
     fn default() -> Self {
         ReplaceConfig {
-            style: Style::Surrogate,
+            style: Style::Token,
         }
     }
 }
@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(c.detect.model, "default");
         assert!(!c.detect.dates);
         assert_eq!(c.detect.packs, vec!["global", "india", "us_uk", "secrets"]);
-        assert_eq!(c.replace.style, Style::Surrogate);
+        assert_eq!(c.replace.style, Style::Token);
         assert_eq!(c.vault.ttl_days, 30);
         assert!(c.clipboard.enabled);
         assert!(c.clipboard.restore_on_copy);
@@ -358,11 +358,11 @@ mod tests {
     fn roundtrip_toml() {
         let mut c = Config::default();
         c.detect.mode = Mode::Fast;
-        c.replace.style = Style::Token;
+        c.replace.style = Style::Surrogate;
         let s = c.to_toml_string().unwrap();
         let back = Config::from_toml_str(&s).unwrap();
         assert_eq!(back.detect.mode, Mode::Fast);
-        assert_eq!(back.replace.style, Style::Token);
+        assert_eq!(back.replace.style, Style::Surrogate);
     }
 
     #[test]

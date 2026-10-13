@@ -25,7 +25,7 @@ fn redact_hides_email() {
         .assert()
         .success()
         .stdout(predicate::str::contains("ravi.k@").not())
-        .stdout(predicate::str::contains("@gmail.com"));
+        .stdout(predicate::str::contains("mail [EMAIL_1]"));
 }
 
 #[test]

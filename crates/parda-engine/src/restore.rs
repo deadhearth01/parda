@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn non_alnum_edges_skip_boundary_checks() {
-        let t = table(&[("⟦PERSON_1⟧", "Ravi")]);
-        assert_eq!(t.apply("hi⟦PERSON_1⟧'s", None), "hiRavi's");
+        let t = table(&[("[NAME_1]", "Ravi")]);
+        assert_eq!(t.apply("hi[NAME_1]'s", None), "hiRavi's");
     }
 }

@@ -270,9 +270,9 @@ fn token_numbers_skip_tokens_present_in_the_input() {
     c.replace.style = parda_core::Style::Token;
     let (_d, e) = engine_with(c, None);
     for t in [
-        "⟦EMAIL_1⟧ and ravi@x.com",
+        "[EMAIL_1] and ravi@x.com",
         "a@b.in c@d.in e@f.in g@h.in",
-        "⟦EMAIL_6⟧ and amit@y.com",
+        "[EMAIL_6] and amit@y.com",
     ] {
         let r = e.redact(t, "global").unwrap();
         assert_eq!(e.restore(&r.text, "global"), t, "sent {:?}", r.text);

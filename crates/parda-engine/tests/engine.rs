@@ -229,11 +229,11 @@ fn token_style() {
     let t = "Write to ravi.k@gmail.com and amit@corp.in, cc ravi.k@gmail.com";
     let r = e.redact(t, "global").unwrap();
     assert!(
-        r.text.contains("⟦EMAIL_1⟧") && r.text.contains("⟦EMAIL_2⟧"),
+        r.text.contains("[EMAIL_1]") && r.text.contains("[EMAIL_2]"),
         "{}",
         r.text
     );
-    assert_eq!(r.text.matches("⟦EMAIL_1⟧").count(), 2);
+    assert_eq!(r.text.matches("[EMAIL_1]").count(), 2);
     assert_eq!(e.restore(&r.text, "global"), t);
 }
 
@@ -340,4 +340,26 @@ fn paused_protection_passes_text_through_but_still_restores() {
     e.set_config(c);
     let r = e.redact(t, "global").unwrap();
     assert!(!r.paused && !r.text.contains("Ravi"));
+}
+
+#[test]
+fn default_style_is_tags_and_they_round_trip() {
+    let mut c = parda_core::Config::default();
+    c.detect.model = "none".into();
+    let (_d, e) = engine_with(c, None);
+    let t = "Mail ravi.k@gmail.com, call +91 98765 43210, Aadhaar 2345 6789 0124";
+    let r = e.redact(t, "global").unwrap();
+    assert!(
+        r.text.contains("[EMAIL_1]")
+            && r.text.contains("[PHONE_1]")
+            && r.text.contains("[AADHAAR_1]"),
+        "{}",
+        r.text
+    );
+    assert_eq!(e.restore(&r.text, "global"), t);
+    // The AI may echo a tag in another case.
+    assert_eq!(
+        e.restore("Sent to [email_1].", "global"),
+        "Sent to ravi.k@gmail.com."
+    );
 }
