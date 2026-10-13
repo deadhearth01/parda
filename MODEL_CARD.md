@@ -28,17 +28,21 @@ also caught by parda's rule tier, so the model's main job is names and addresses
 
 ### Through parda itself (Rust engine, all tiers, threshold 0.4)
 
-`parda-bench eval` on `bench/golden` (201 hand-written cases: 60 Indian, 40 global, negatives,
-identifiers, code and logs; never produced by the training templates):
+`parda-bench eval` on `bench/golden` (213 hand-written cases: Indian and global names, Hinglish,
+multi-sentence messages with several names, negatives, identifiers, code and logs; never produced by
+the training templates):
 
 | | gliner-pii-edge (base, INT8) | **parda-pii-edge** |
 |---|---|---|
-| Person recall, Indian names | 0.970 | **1.000** |
-| Person recall, global names | 0.955 | **1.000** |
-| Person precision | 0.922 | **1.000** |
+| Person recall, Indian names | 0.946 | **0.968** |
+| Person recall, global names | 0.964 | **1.000** |
+| Person precision | 0.934 | **1.000** |
 | Address recall / precision | 0.75 / 0.27 | **1.00 / 1.00** |
-| Cases with zero leaked values | 0.995 | **1.000** |
+| Cases with zero leaked values | 0.986 | **0.991** |
 | `restore(redact(x)) == x` | 1.000 | 1.000 |
+
+A second fine-tune with 35% stitched multi-sentence examples was more precise (no false positives)
+but missed more Indian names (0.946), so this release keeps the first.
 
 Base-model misses include "Venkatesh Iyer", "Yash", "Siobhan O'Brien", "Nguyễn Văn An" and
 two Indian addresses; it also labels many non-addresses as addresses.

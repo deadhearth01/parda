@@ -17,7 +17,7 @@ Models are read from `$PARDA_HOME/data/models` (or `--models DIR`). Reports are 
 
 | File | Cases | Contents |
 |---|---|---|
-| `names.jsonl` | 120 | 60 Indian and 40 global sentences with people and addresses (chat prompts, Hinglish, letters, tickets), 20 negatives |
+| `names.jsonl` | 132 | 68 Indian and 44 global sentences with people and addresses (chat prompts, Hinglish, letters, tickets, multi-sentence messages with several names), 20 negatives |
 | `rules.jsonl` | 81 | Structured identifiers: e-mail, phones (+91, US, UK), Aadhaar, PAN, GSTIN, UPI, IFSC, Voter ID, vehicle numbers, IBAN, cards, IP/MAC, URLs with tokens, SSN, NINO, API keys, JWTs, PEM keys — including inside Devanagari text |
 | `negatives.jsonl` | 43 | Look-alikes that must not be redacted (versions, order IDs, ISBNs, UUIDs, dates without DOB context …) |
 
@@ -32,11 +32,16 @@ Metrics:
 
 ## Results — Apple M4, CPU, threshold 0.4
 
+213 cases (names + rules files).
+
 | Model | Person recall IN / GL | Person precision | Address R / P | Zero-leak | Round-trip | Mean per case |
 |---|---|---|---|---|---|---|
-| none (rules + dictionary only) | 0 / 0 | — | — | 0.502 | 1.000 | < 0.1 ms |
-| gliner-pii-edge (INT8) | 0.970 / 0.955 | 0.922 | 0.75 / 0.27 | 0.995 | 1.000 | 2.3 ms |
-| **parda-pii-edge** (fp32) | **1.000 / 1.000** | **1.000** | **1.00 / 1.00** | **1.000** | 1.000 | 9.4 ms |
+| none (rules + dictionary only) | 0 / 0 | — | — | 0.474 | 1.000 | < 0.1 ms |
+| gliner-pii-edge (INT8) | 0.946 / 0.964 | 0.934 | 0.75 / 0.27 | 0.986 | 1.000 | 3.1 ms |
+| **parda-pii-edge** (fp32) | **0.968 / 1.000** | **1.000** | **1.00 / 1.00** | **0.991** | 1.000 | 8.1 ms |
+
+The remaining misses are names in the second sentence of dense multi-sentence messages
+("Siobhan O'Brien", "Pooja") — the main open detection gap.
 
 Every structured identifier kind (Aadhaar, PAN, GSTIN, UPI, IFSC, cards, IBAN, phones, e-mail,
 secrets …) has recall and precision 1.0 in all three rows: the rule tier validates checksums and
