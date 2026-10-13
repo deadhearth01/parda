@@ -55,8 +55,12 @@ pub fn ml_windows(text: &str, max_bytes: usize) -> Vec<Span> {
     }
     let overlap = ML_WINDOW_OVERLAP.min(max / 4);
     let mut out = split_fragments(text, max - overlap);
+    let mut prev_start = 0;
     for w in out.iter_mut().skip(1) {
-        let mut start = w.start - overlap;
+        // A short first fragment (a heading before one long line of tool
+        // output) leaves less than `overlap` before this one; never step
+        // back past the previous window either.
+        let mut start = w.start.saturating_sub(overlap).max(prev_start);
         while !text.is_char_boundary(start) {
             start += 1;
         }
@@ -71,6 +75,7 @@ pub fn ml_windows(text: &str, max_bytes: usize) -> Vec<Span> {
             start += i + c.len_utf8();
         }
         w.start = start;
+        prev_start = start;
     }
     out
 }
@@ -263,6 +268,45 @@ mod tests {
         let indic = "नमस्ते Ravi Kumar 🙏 ".repeat(200);
         for w in ml_windows(&indic, 300) {
             assert!(indic.is_char_boundary(w.start) && indic.is_char_boundary(w.end));
+        }
+    }
+
+    /// Windows cover `text`, stay within `max`, sit on char boundaries,
+    /// move forward and leave no gap.
+    fn check_windows(text: &str, max: usize) -> Vec<Span> {
+        let wins = ml_windows(text, max);
+        assert_eq!(wins.first().map(|w| w.start), Some(0));
+        assert_eq!(wins.last().map(|w| w.end), Some(text.len()));
+        for w in &wins {
+            assert!(w.start < w.end && w.len() <= max, "{w:?}");
+            assert!(text.is_char_boundary(w.start) && text.is_char_boundary(w.end));
+        }
+        for pair in wins.windows(2) {
+            assert!(
+                pair[0].start <= pair[1].start && pair[1].start <= pair[0].end,
+                "{pair:?}"
+            );
+        }
+        wins
+    }
+
+    #[test]
+    fn ml_windows_after_a_short_first_paragraph() {
+        // Agent tool output: a short heading, then one long unbroken line.
+        let json = format!(
+            "{{\"rows\":[{}]}}",
+            r#"{"name":"Ravi Kumar","phone":"9876543210"},"#.repeat(80)
+        );
+        assert!(!json.contains('\n') && json.len() > 3000);
+        check_windows(
+            &format!("Here's the output:\n{json}"),
+            DEFAULT_MAX_FRAGMENT_BYTES,
+        );
+        for n in 0..300 {
+            let text = format!("{}\n{json}", "a".repeat(n));
+            check_windows(&text, DEFAULT_MAX_FRAGMENT_BYTES);
+            let text = format!("{}\n\n{json}", "é".repeat(n / 2));
+            check_windows(&text, DEFAULT_MAX_FRAGMENT_BYTES);
         }
     }
 

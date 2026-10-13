@@ -359,3 +359,19 @@ fn mappings_deleted_behind_the_engine_are_recreated() {
         assert_eq!(fresh.restore(&r.text, "global"), t, "prune={prune}");
     }
 }
+
+/// Fix round 2: agent tool output — a short heading, then a long line with
+/// no newline — must not underflow the model window arithmetic.
+#[test]
+fn tool_output_after_a_short_heading_is_redacted() {
+    let ml = NameMl::new(&["Anna Schmidt"]);
+    let (_d, e) = engine_with(
+        ml_config(parda_core::Mode::Strict, 1000),
+        Some(ml as std::sync::Arc<dyn parda_core::MlDetector>),
+    );
+    let rows = r#"{"name":"Anna Schmidt","phone":"9876543210"},"#.repeat(80);
+    let t = format!("Here's the output:\n{{\"rows\":[{rows}]}}");
+    let r = e.redact(&t, "global").unwrap();
+    assert!(!r.text.contains("Anna Schmidt") && !r.text.contains("9876543210"));
+    assert_eq!(e.restore(&r.text, "global"), t);
+}
