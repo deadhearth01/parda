@@ -9,7 +9,7 @@ pub mod pac;
 pub mod server;
 pub mod transform;
 
-pub use ca::Ca;
+pub use ca::{CA_NAME, Ca};
 pub use hosts::HostList;
 pub use pac::pac;
 pub use server::{InterceptEvent, InterceptState, Timeouts, serve, upstream_client_builder};

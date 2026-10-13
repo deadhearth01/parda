@@ -15,6 +15,11 @@ parda-ml.workspace = true
 parda-proxy.workspace = true
 parda-ipc.workspace = true
 parda-clip.workspace = true
+parda-intercept.workspace = true
+parda-vault.workspace = true
+zeroize.workspace = true
+sha1 = "0.10"
+base64 = "0.22"
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -23,6 +28,9 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 directories.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinInet"] }
 
 [dev-dependencies]
 tempfile.workspace = true

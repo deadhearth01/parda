@@ -242,3 +242,32 @@ fn doctor_flags_misspelt_action_keys() {
         .assert()
         .stdout(predicate::str::contains("`Aadhar` is not a built-in kind"));
 }
+
+#[test]
+fn ca_create_path_and_status_without_touching_the_system() {
+    let h = home();
+    parda(&h)
+        .args(["ca", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("not created"));
+    parda(&h)
+        .args(["ca", "create"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("parda ca install"));
+    let pem = h.path().join("data/parda-ca.pem");
+    assert!(pem.is_file());
+    parda(&h)
+        .args(["ca", "path"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("parda-ca.pem"));
+    // A second create keeps the existing certificate.
+    parda(&h).args(["ca", "create"]).assert().failure();
+    parda(&h)
+        .args(["ca", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("created"));
+}

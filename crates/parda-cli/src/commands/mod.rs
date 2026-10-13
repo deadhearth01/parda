@@ -1,6 +1,7 @@
 //! Subcommands, and the shared "talk to the daemon, else run in-process"
 //! plumbing.
 
+pub mod ca;
 pub mod daemon;
 pub mod doctor;
 pub mod env;
