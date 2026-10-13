@@ -4,8 +4,9 @@ use std::net::SocketAddr;
 
 use crate::HostList;
 
-/// A JavaScript PAC returning `PROXY <proxy>` for listed hosts (and their
-/// subdomains) and `DIRECT` for everything else.
+/// A JavaScript PAC returning `PROXY <proxy>` for `https:`/`wss:` URLs of
+/// listed hosts (and their subdomains) and `DIRECT` for everything else.
+/// Plain `http:` stays DIRECT so a site can still redirect it to https.
 ///
 /// A listed host gets no `DIRECT` fallback: if parda stops while a browser
 /// still holds this PAC, AI requests fail instead of leaving unfiltered.
@@ -21,6 +22,8 @@ pub fn pac(hosts: &HostList, proxy: SocketAddr) -> String {
         r#"// parda: send AI hosts through the local PII filter, everything else DIRECT.
 var PARDA_HOSTS = [{list}];
 function FindProxyForURL(url, host) {{
+  var scheme = url.substring(0, url.indexOf(":")).toLowerCase();
+  if (scheme !== "https" && scheme !== "wss") return "DIRECT";
   var h = host.toLowerCase();
   if (h.charAt(h.length - 1) === ".") h = h.substring(0, h.length - 1);
   for (var i = 0; i < PARDA_HOSTS.length; i++) {{

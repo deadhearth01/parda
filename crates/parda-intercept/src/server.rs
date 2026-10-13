@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::header::{
     ACCEPT_ENCODING, ALLOW, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_TYPE, HOST, UPGRADE,
+    CONTENT_TYPE, HOST, ORIGIN, UPGRADE, X_CONTENT_TYPE_OPTIONS,
 };
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
@@ -197,6 +197,21 @@ async fn front(
         return Ok(connect(req, state).await);
     }
     if req.method() == Method::GET && req.uri().path() == "/parda.pac" && is_local(req.uri()) {
+        // The OS fetches the PAC with Host 127.0.0.1/localhost and no Origin.
+        // Refuse web pages: cross-origin fetches carry an Origin, and a
+        // DNS-rebound page carries its own host name.
+        let host_ok = req
+            .headers()
+            .get(HOST)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.parse::<http::uri::Authority>().ok())
+            .is_some_and(|a| is_local_host(a.host()));
+        if !host_ok || req.headers().contains_key(ORIGIN) {
+            return Ok(text(
+                StatusCode::FORBIDDEN,
+                "parda intercept: the PAC file is for this machine's proxy settings only\n",
+            ));
+        }
         let mut res = Response::new(full(pac(&state.hosts, local)));
         let h = res.headers_mut();
         h.insert(
@@ -204,6 +219,11 @@ async fn front(
             HeaderValue::from_static("application/x-ns-proxy-autoconfig"),
         );
         h.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        h.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+        h.insert(
+            "cross-origin-resource-policy",
+            HeaderValue::from_static("same-origin"),
+        );
         return Ok(res);
     }
     let mut res = text(
@@ -217,15 +237,13 @@ async fn front(
 
 /// Origin-form, or absolute-form naming this machine.
 fn is_local(uri: &http::Uri) -> bool {
-    match uri.host() {
-        None => true,
-        Some(h) => {
-            let h = h.trim_start_matches('[').trim_end_matches(']');
-            h.eq_ignore_ascii_case("localhost")
-                || h.parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        }
-    }
+    uri.host().is_none_or(is_local_host)
+}
+
+/// `localhost` or a loopback IP literal.
+fn is_local_host(h: &str) -> bool {
+    let h = h.trim_start_matches('[').trim_end_matches(']');
+    h.eq_ignore_ascii_case("localhost") || h.parse::<std::net::IpAddr>().is_ok_and(is_loopback)
 }
 
 async fn connect(req: Request<Incoming>, state: Arc<InterceptState>) -> Response<Body> {

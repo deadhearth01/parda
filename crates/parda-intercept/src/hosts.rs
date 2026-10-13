@@ -9,18 +9,21 @@ pub struct HostList {
 
 impl HostList {
     /// Normalizes entries (trim, lowercase, strip a leading `*.` or `.` and a
-    /// trailing dot) and drops any that are not plain host names
-    /// (`[a-z0-9.-]` only), so an entry can never inject into the PAC script.
+    /// trailing dot) and drops any that are not plain DNS names: only
+    /// `[a-z0-9.-]` (so an entry can never inject into the PAC script), at
+    /// least one dot, no empty label, not an IP literal.
     pub fn new(hosts: &[String]) -> HostList {
         let mut entries: Vec<String> = Vec::new();
         for h in hosts {
             let h = h.trim().to_ascii_lowercase();
             let h = h.strip_prefix("*.").unwrap_or(&h);
             let h = h.trim_start_matches('.').trim_end_matches('.');
-            let valid = !h.is_empty()
-                && h.bytes().all(|b| {
-                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-'
-                });
+            let valid = h
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+                && h.contains('.')
+                && h.split('.').all(|label| !label.is_empty())
+                && h.parse::<std::net::IpAddr>().is_err();
             if valid && !entries.iter().any(|e| e == h) {
                 entries.push(h.to_string());
             }
