@@ -11,7 +11,6 @@ mod restore;
 pub mod server;
 mod sites;
 pub mod transform;
-mod urlguard;
 mod walk;
 
 pub use ca::Ca;

@@ -7,10 +7,13 @@
 //! - [`walk`]: JSON string-leaf walking that keeps number literals as written.
 //! - [`jsonfrag`]: restoring surrogates in a JSON document that arrives in
 //!   fragments.
+//! - [`urlguard`]: never restoring inside URLs (links, images, autolinks,
+//!   HTML attribute values, CSS).
 
 pub mod body;
 pub mod jsonfrag;
 pub mod sse;
+pub mod urlguard;
 pub mod walk;
 
 pub use jsonfrag::JsonFragRestorer;

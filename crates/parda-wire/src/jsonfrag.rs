@@ -19,6 +19,12 @@ pub trait ValueRestorer: Send {
     fn finish(&mut self) -> String;
     /// Bytes held back.
     fn pending_len(&self) -> usize;
+    /// Text that went out around this restorer, unrestored (a URL part, an
+    /// incomplete escape): context for what comes next. Called with nothing
+    /// held back.
+    fn skip(&mut self, text: &str) {
+        let _ = text;
+    }
 }
 
 impl ValueRestorer for StreamRestorer {
@@ -30,6 +36,9 @@ impl ValueRestorer for StreamRestorer {
     }
     fn pending_len(&self) -> usize {
         StreamRestorer::pending_len(self)
+    }
+    fn skip(&mut self, text: &str) {
+        StreamRestorer::skip(self, text)
     }
 }
 
@@ -126,12 +135,13 @@ impl JsonFragRestorer {
                 raw.push_str(&h);
             }
             raw.push_str(&std::mem::take(&mut self.escape));
-            if let Some(mut r) = self.restorer.take() {
-                out.push_str(&escape(&r.finish()));
-            }
+            // The value goes on: keep its restorer (and whatever context it
+            // tracks, such as a URL guard's state).
+            let r = self.restorer.get_or_insert_with(|| (self.new_value)());
+            out.push_str(&escape(&r.finish()));
             // Incomplete escapes are re-emitted as they came.
+            r.skip(&raw);
             out.push_str(&raw);
-            self.restorer = Some((self.new_value)());
         }
         out
     }
