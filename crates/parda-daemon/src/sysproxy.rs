@@ -43,6 +43,8 @@ pub struct Restored {
     pub gone: Vec<String>,
     /// Entries that could not be restored; kept in the state file.
     pub failed: Vec<String>,
+    /// Entries changed by someone else while protection was on; left as they are.
+    pub kept: Vec<String>,
 }
 
 fn state_path(paths: &Paths) -> PathBuf {
@@ -65,9 +67,27 @@ fn save_state(paths: &Paths, state: &State) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `url` is a parda PAC address: the current one, or any loopback
+/// `…/parda.pac` (e.g. from an earlier run on another port).
+pub fn is_parda_pac(url: &str, pac_url: &str) -> bool {
+    if url == pac_url {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(h, _)| h)
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    path == "parda.pac" && matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
 /// A setting that already points at parda is not an "original" setting.
 fn forget_ours(mut s: Saved, pac_url: &str) -> Saved {
-    if s.url.as_deref() == Some(pac_url) {
+    if s.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url)) {
         s.url = None;
         s.enabled = false;
     }
@@ -76,16 +96,21 @@ fn forget_ours(mut s: Saved, pac_url: &str) -> Saved {
 
 // ---------- macOS ----------
 
-fn mac_services(r: &mut dyn Runner) -> anyhow::Result<Vec<String>> {
+/// Network services as `(name, enabled)`. A name listed twice (two
+/// "iPhone USB" services) can only be addressed once by name.
+fn mac_services(r: &mut dyn Runner) -> anyhow::Result<Vec<(String, bool)>> {
     let out = r.run("networksetup", &["-listallnetworkservices"])?;
     let mut seen = std::collections::HashSet::new();
     Ok(out
         .lines()
         .skip(1) // "An asterisk (*) denotes that a network service is disabled."
         .map(|l| l.trim_matches(|c: char| c == '\r' || c == '\n'))
-        .filter(|l| !l.trim().is_empty() && !l.starts_with('*'))
-        .filter(|l| seen.insert(l.to_string())) // the same name twice addresses one service
-        .map(str::to_string)
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| match l.strip_prefix('*') {
+            Some(name) => (name.to_string(), false),
+            None => (l.to_string(), true),
+        })
+        .filter(|(name, _)| seen.insert(name.clone()))
         .collect())
 }
 
@@ -208,7 +233,8 @@ fn gnome_set(r: &mut dyn Runner, mode: &str, url: &str) -> anyhow::Result<()> {
 
 /// Point the system at `pac_url`. The original settings are saved first; an
 /// existing state file (from an earlier `on`, or a crash) keeps its originals,
-/// and services enabled since then are added to it.
+/// and services enabled since then are added to it. If any change fails,
+/// everything done so far is rolled back before the error is returned.
 pub fn enable(
     r: &mut dyn Runner,
     paths: &Paths,
@@ -222,17 +248,22 @@ pub fn enable(
         saved: Vec::new(),
     });
     state.pac_url = pac_url.to_string();
+    let mut targets: Vec<String> = Vec::new();
     match platform {
         Platform::MacOs => {
-            let services = mac_services(r)?;
+            let services: Vec<String> = mac_services(r)?
+                .into_iter()
+                .filter_map(|(name, on)| on.then_some(name))
+                .collect();
             if services.is_empty() {
                 bail!("no enabled network service found (networksetup -listallnetworkservices)");
             }
-            for svc in services {
-                if !state.saved.iter().any(|s| s.target == svc) {
-                    state.saved.push(forget_ours(mac_get(r, &svc)?, pac_url));
+            for svc in &services {
+                if !state.saved.iter().any(|s| &s.target == svc) {
+                    state.saved.push(forget_ours(mac_get(r, svc)?, pac_url));
                 }
             }
+            targets = services;
         }
         Platform::Windows => {
             if state.saved.is_empty() {
@@ -242,7 +273,8 @@ pub fn enable(
         Platform::Linux => {
             if state.saved.is_empty() {
                 let mut s = gnome_get(r)?;
-                if s.target == "auto" && s.url.as_deref() == Some(pac_url) {
+                if s.target == "auto" && s.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url))
+                {
                     s.target = "none".into();
                     s.url = None;
                 }
@@ -251,46 +283,86 @@ pub fn enable(
         }
     }
     save_state(paths, &state)?;
-    match platform {
-        Platform::MacOs => {
-            for s in &state.saved {
-                r.run("networksetup", &["-setautoproxyurl", &s.target, pac_url])?;
-                r.run("networksetup", &["-setautoproxystate", &s.target, "on"])?;
+    let applied = (|| -> anyhow::Result<()> {
+        match platform {
+            Platform::MacOs => {
+                for svc in &targets {
+                    r.run("networksetup", &["-setautoproxyurl", svc, pac_url])?;
+                    r.run("networksetup", &["-setautoproxystate", svc, "on"])?;
+                }
             }
+            Platform::Windows => win_set(r, Some(pac_url))?,
+            Platform::Linux => gnome_set(r, "auto", pac_url)?,
         }
-        Platform::Windows => win_set(r, Some(pac_url))?,
-        Platform::Linux => gnome_set(r, "auto", pac_url)?,
+        Ok(())
+    })();
+    if let Err(e) = applied {
+        let rollback = disable(r, paths);
+        return Err(match rollback {
+            Ok(_) => e.context("could not point the system at parda; earlier changes were rolled back"),
+            Err(r_err) => e.context(format!(
+                "could not point the system at parda, and rolling back failed too ({r_err:#}); run `parda intercept off`"
+            )),
+        });
     }
     Ok(state)
 }
 
-/// Put back what [`enable`] saved. Every entry is attempted; failures stay in
-/// the state file (and are reported) so a later call can finish the job.
-/// Returns `None` when nothing was saved.
+/// Whether the current setting of `s.target` still points at parda.
+fn still_ours(
+    r: &mut dyn Runner,
+    platform: Platform,
+    s: &Saved,
+    pac_url: &str,
+) -> anyhow::Result<bool> {
+    Ok(match platform {
+        Platform::MacOs => {
+            let now = mac_get(r, &s.target)?;
+            now.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url))
+        }
+        Platform::Windows => win_query(r).is_some_and(|u| is_parda_pac(&u, pac_url)),
+        Platform::Linux => {
+            let now = gnome_get(r)?;
+            now.target == "auto" && now.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url))
+        }
+    })
+}
+
+/// Put back what [`enable`] saved. Every entry is attempted. A setting that
+/// no longer points at parda (changed by someone else meanwhile) is left as
+/// it is; failures stay in the state file (and are reported) so a later call
+/// can finish the job. Returns `None` when nothing was saved.
 pub fn disable(r: &mut dyn Runner, paths: &Paths) -> anyhow::Result<Option<Restored>> {
     let Some(mut state) = load_state(paths)? else {
         return Ok(None);
     };
     let mut out = Restored::default();
-    let current = match state.platform {
-        Platform::MacOs => Some(mac_services(r)?),
+    let listed: Option<Vec<String>> = match state.platform {
+        Platform::MacOs => Some(mac_services(r)?.into_iter().map(|(n, _)| n).collect()),
         _ => None,
     };
     let mut remaining = Vec::new();
     for s in std::mem::take(&mut state.saved) {
-        if let Some(services) = &current
-            && !services.contains(&s.target)
+        if let Some(names) = &listed
+            && !names.contains(&s.target)
         {
             out.gone.push(s.target.clone());
             continue;
         }
-        let result = match state.platform {
-            Platform::MacOs => mac_restore(r, &s),
-            Platform::Windows => win_set(r, s.url.as_deref().filter(|_| s.enabled)),
-            Platform::Linux => gnome_set(r, &s.target, s.url.as_deref().unwrap_or("")),
-        };
+        let result = still_ours(r, state.platform, &s, &state.pac_url).and_then(|ours| {
+            if !ours {
+                return Ok(false);
+            }
+            match state.platform {
+                Platform::MacOs => mac_restore(r, &s)?,
+                Platform::Windows => win_set(r, s.url.as_deref().filter(|_| s.enabled))?,
+                Platform::Linux => gnome_set(r, &s.target, s.url.as_deref().unwrap_or(""))?,
+            }
+            Ok(true)
+        });
         match result {
-            Ok(()) => out.restored.push(s.target.clone()),
+            Ok(true) => out.restored.push(s.target.clone()),
+            Ok(false) => out.kept.push(s.target.clone()),
             Err(e) => {
                 tracing::warn!(target = %s.target, error = %e, "could not restore proxy setting");
                 out.failed.push(s.target.clone());
@@ -310,24 +382,90 @@ pub fn disable(r: &mut dyn Runner, paths: &Paths) -> anyhow::Result<Option<Resto
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
+    /// A pretend OS that remembers settings, so tests observe real effects.
     #[derive(Default)]
-    struct Fake {
-        replies: HashMap<String, String>,
+    struct Os {
+        /// macOS: service → (url, enabled, service enabled)
+        mac: BTreeMap<String, (Option<String>, bool, bool)>,
+        /// Windows AutoConfigURL
+        win: Option<String>,
+        /// GNOME (mode, autoconfig-url)
+        gnome: (String, String),
+        /// Command prefixes that fail.
         failing: Vec<String>,
         calls: Vec<String>,
         refreshed: usize,
     }
 
-    impl Runner for Fake {
+    impl Runner for Os {
         fn run(&mut self, program: &str, args: &[&str]) -> anyhow::Result<String> {
             let line = format!("{program} {}", args.join(" "));
             self.calls.push(line.clone());
-            if self.failing.iter().any(|f| line.starts_with(f)) {
+            if self.failing.iter().any(|f| line.starts_with(f.as_str())) {
                 bail!("failed: {line}");
             }
-            Ok(self.replies.get(&line).cloned().unwrap_or_default())
+            Ok(match (program, args) {
+                ("networksetup", ["-listallnetworkservices"]) => {
+                    let mut out =
+                        "An asterisk (*) denotes that a network service is disabled.\n".to_string();
+                    for (name, (_, _, svc_on)) in &self.mac {
+                        out.push_str(&format!("{}{name}\n", if *svc_on { "" } else { "*" }));
+                    }
+                    out
+                }
+                ("networksetup", ["-getautoproxyurl", svc]) => {
+                    let Some((url, on, _)) = self.mac.get(*svc) else {
+                        bail!("no such service")
+                    };
+                    format!(
+                        "URL: {}\nEnabled: {}\n",
+                        url.as_deref().unwrap_or("(null)"),
+                        if *on { "Yes" } else { "No" }
+                    )
+                }
+                ("networksetup", ["-setautoproxyurl", svc, url]) => {
+                    let Some(e) = self.mac.get_mut(*svc) else {
+                        bail!("no such service")
+                    };
+                    e.0 = Some(url.to_string());
+                    e.1 = true;
+                    String::new()
+                }
+                ("networksetup", ["-setautoproxystate", svc, state]) => {
+                    let Some(e) = self.mac.get_mut(*svc) else {
+                        bail!("no such service")
+                    };
+                    e.1 = *state == "on";
+                    String::new()
+                }
+                ("reg", ["query", ..]) => match &self.win {
+                    Some(u) => {
+                        format!("\r\n{WIN_KEY}\r\n    AutoConfigURL    REG_SZ    {u}\r\n\r\n")
+                    }
+                    None => bail!("value not found"),
+                },
+                ("reg", ["add", .., url, "/f"]) => {
+                    self.win = Some(url.to_string());
+                    String::new()
+                }
+                ("reg", ["delete", ..]) => {
+                    self.win = None;
+                    String::new()
+                }
+                ("gsettings", ["get", _, "mode"]) => format!("'{}'\n", self.gnome.0),
+                ("gsettings", ["get", _, "autoconfig-url"]) => format!("'{}'\n", self.gnome.1),
+                ("gsettings", ["set", _, "mode", m]) => {
+                    self.gnome.0 = m.to_string();
+                    String::new()
+                }
+                ("gsettings", ["set", _, "autoconfig-url", u]) => {
+                    self.gnome.1 = u.to_string();
+                    String::new()
+                }
+                _ => String::new(),
+            })
         }
 
         fn refresh_proxy_settings(&mut self) {
@@ -342,213 +480,203 @@ mod tests {
     }
 
     const PAC: &str = "http://127.0.0.1:8788/parda.pac";
-    const LIST: &str = "networksetup -listallnetworkservices";
 
-    fn mac_fake() -> Fake {
-        let mut f = Fake::default();
-        f.replies.insert(
-            LIST.into(),
-            "An asterisk (*) denotes that a network service is disabled.\nWi-Fi\n*Bluetooth PAN\nThunderbolt Bridge\niPhone USB\n".into(),
+    fn mac() -> Os {
+        let mut os = Os::default();
+        os.mac.insert("Wi-Fi".into(), (None, false, true));
+        os.mac.insert("Bluetooth PAN".into(), (None, false, false));
+        os.mac.insert(
+            "Thunderbolt Bridge".into(),
+            (Some("http://corp/proxy.pac".into()), true, true),
         );
-        f.replies.insert(
-            "networksetup -getautoproxyurl Wi-Fi".into(),
-            "URL: (null)\nEnabled: No\n".into(),
+        os.mac.insert(
+            "iPhone USB".into(),
+            (Some("http://old/proxy.pac".into()), false, true),
         );
-        f.replies.insert(
-            "networksetup -getautoproxyurl Thunderbolt Bridge".into(),
-            "URL: http://corp/proxy.pac\nEnabled: Yes\n".into(),
-        );
-        f.replies.insert(
-            "networksetup -getautoproxyurl iPhone USB".into(),
-            "URL: http://old/proxy.pac\nEnabled: No\n".into(),
-        );
-        f
+        os
+    }
+
+    fn snapshot(os: &Os) -> BTreeMap<String, (Option<String>, bool, bool)> {
+        os.mac.clone()
     }
 
     #[test]
-    fn macos_enable_saves_then_points_every_enabled_service_at_parda() {
+    fn macos_on_then_off_restores_every_setting_exactly() {
         let (_d, p) = paths();
-        let mut f = mac_fake();
-        let st = enable(&mut f, &p, Platform::MacOs, PAC).unwrap();
-        assert_eq!(st.saved.len(), 3, "disabled services are skipped");
+        let mut os = mac();
+        let before = snapshot(&os);
+        enable(&mut os, &p, Platform::MacOs, PAC).unwrap();
         for svc in ["Wi-Fi", "Thunderbolt Bridge", "iPhone USB"] {
-            assert!(
-                f.calls
-                    .contains(&format!("networksetup -setautoproxyurl {svc} {PAC}"))
-            );
-            assert!(
-                f.calls
-                    .contains(&format!("networksetup -setautoproxystate {svc} on"))
-            );
+            assert_eq!(os.mac[svc].0.as_deref(), Some(PAC), "{svc}");
+            assert!(os.mac[svc].1, "{svc}");
         }
-        assert!(load_state(&p).unwrap().is_some());
-    }
-
-    #[test]
-    fn macos_disable_restores_exactly_including_url_set_but_disabled() {
-        let (_d, p) = paths();
-        let mut f = mac_fake();
-        enable(&mut f, &p, Platform::MacOs, PAC).unwrap();
-        f.calls.clear();
-        let r = disable(&mut f, &p).unwrap().unwrap();
-        assert_eq!(r.restored.len(), 3);
-        let changes: Vec<_> = f.calls.iter().filter(|c| c != &LIST).cloned().collect();
         assert_eq!(
-            changes,
-            [
-                "networksetup -setautoproxystate Wi-Fi off",
-                "networksetup -setautoproxyurl Thunderbolt Bridge http://corp/proxy.pac",
-                "networksetup -setautoproxystate Thunderbolt Bridge on",
-                "networksetup -setautoproxyurl iPhone USB http://old/proxy.pac",
-                "networksetup -setautoproxystate iPhone USB off",
-            ]
+            os.mac["Bluetooth PAN"].0, None,
+            "disabled services are left alone"
         );
+        let r = disable(&mut os, &p).unwrap().unwrap();
+        assert_eq!(r.restored.len(), 3);
+        // URL fields cannot be cleared through networksetup; the switch is what matters.
+        let after = snapshot(&os);
+        assert_eq!(after["Thunderbolt Bridge"], before["Thunderbolt Bridge"]);
+        assert_eq!(after["iPhone USB"], before["iPhone USB"]);
+        assert!(!after["Wi-Fi"].1, "Wi-Fi auto-proxy is off again");
         assert!(load_state(&p).unwrap().is_none());
         assert!(
-            disable(&mut f, &p).unwrap().is_none(),
+            disable(&mut os, &p).unwrap().is_none(),
             "second off is a no-op"
         );
     }
 
     #[test]
-    fn a_vanished_service_does_not_block_off() {
+    fn a_service_deleted_meanwhile_is_reported_gone_and_does_not_block_off() {
         let (_d, p) = paths();
-        let mut f = mac_fake();
-        enable(&mut f, &p, Platform::MacOs, PAC).unwrap();
-        // The iPhone was unplugged before `off`.
-        f.replies.insert(
-            LIST.into(),
-            "An asterisk (*) denotes that a network service is disabled.\nWi-Fi\nThunderbolt Bridge\n".into(),
-        );
-        let r = disable(&mut f, &p).unwrap().unwrap();
+        let mut os = mac();
+        enable(&mut os, &p, Platform::MacOs, PAC).unwrap();
+        os.mac.remove("iPhone USB");
+        let r = disable(&mut os, &p).unwrap().unwrap();
         assert_eq!(r.gone, ["iPhone USB"]);
         assert_eq!(r.restored.len(), 2);
         assert!(load_state(&p).unwrap().is_none());
     }
 
     #[test]
+    fn a_service_disabled_meanwhile_is_still_restored() {
+        let (_d, p) = paths();
+        let mut os = mac();
+        enable(&mut os, &p, Platform::MacOs, PAC).unwrap();
+        os.mac.get_mut("Thunderbolt Bridge").unwrap().2 = false; // user turned the service off
+        let r = disable(&mut os, &p).unwrap().unwrap();
+        assert!(r.restored.contains(&"Thunderbolt Bridge".to_string()));
+        assert_eq!(
+            os.mac["Thunderbolt Bridge"].0.as_deref(),
+            Some("http://corp/proxy.pac")
+        );
+    }
+
+    #[test]
+    fn a_setting_changed_by_the_user_meanwhile_is_left_alone() {
+        let (_d, p) = paths();
+        let mut os = mac();
+        enable(&mut os, &p, Platform::MacOs, PAC).unwrap();
+        os.mac.get_mut("Wi-Fi").unwrap().0 = Some("http://my-new/proxy.pac".into());
+        let r = disable(&mut os, &p).unwrap().unwrap();
+        assert_eq!(r.kept, ["Wi-Fi"]);
+        assert_eq!(
+            os.mac["Wi-Fi"].0.as_deref(),
+            Some("http://my-new/proxy.pac")
+        );
+    }
+
+    #[test]
     fn a_failed_restore_is_kept_for_retry_and_the_rest_still_restored() {
         let (_d, p) = paths();
-        let mut f = mac_fake();
-        enable(&mut f, &p, Platform::MacOs, PAC).unwrap();
-        f.failing
+        let mut os = mac();
+        enable(&mut os, &p, Platform::MacOs, PAC).unwrap();
+        os.failing
             .push("networksetup -setautoproxyurl Thunderbolt".into());
-        let r = disable(&mut f, &p).unwrap().unwrap();
+        let r = disable(&mut os, &p).unwrap().unwrap();
         assert_eq!(r.failed, ["Thunderbolt Bridge"]);
-        assert_eq!(r.restored, ["Wi-Fi", "iPhone USB"]);
-        let left = load_state(&p).unwrap().unwrap();
-        assert_eq!(left.saved.len(), 1);
-        f.failing.clear();
-        let r = disable(&mut f, &p).unwrap().unwrap();
+        assert_eq!(load_state(&p).unwrap().unwrap().saved.len(), 1);
+        os.failing.clear();
+        let r = disable(&mut os, &p).unwrap().unwrap();
         assert_eq!(r.restored, ["Thunderbolt Bridge"]);
         assert!(load_state(&p).unwrap().is_none());
     }
 
     #[test]
-    fn enabling_again_keeps_originals_adds_new_services_and_ignores_our_own_pac() {
+    fn a_failed_on_rolls_back_what_it_already_changed() {
         let (_d, p) = paths();
-        let mut f = mac_fake();
-        enable(&mut f, &p, Platform::MacOs, PAC).unwrap();
-        // The system now reports parda's PAC; a VPN service appeared.
-        f.replies.insert(
-            "networksetup -getautoproxyurl Wi-Fi".into(),
-            format!("URL: {PAC}\nEnabled: Yes\n"),
+        let mut os = mac();
+        let before = snapshot(&os);
+        os.failing
+            .push("networksetup -setautoproxyurl iPhone".into());
+        let e = enable(&mut os, &p, Platform::MacOs, PAC).unwrap_err();
+        assert!(format!("{e:#}").contains("rolled back"), "{e:#}");
+        assert_eq!(
+            snapshot(&os)["Thunderbolt Bridge"],
+            before["Thunderbolt Bridge"]
         );
-        f.replies.insert(
-            LIST.into(),
-            "An asterisk (*) denotes that a network service is disabled.\nWi-Fi\nThunderbolt Bridge\niPhone USB\nProtonVPN\n".into(),
+        assert!(!os.mac["Wi-Fi"].1, "Wi-Fi switched back off");
+        assert!(load_state(&p).unwrap().is_none());
+    }
+
+    #[test]
+    fn on_again_keeps_originals_adds_new_services_and_never_saves_a_parda_pac() {
+        let (_d, p) = paths();
+        let mut os = mac();
+        enable(&mut os, &p, Platform::MacOs, PAC).unwrap();
+        // A VPN appears that already carries a parda PAC from an older run on another port.
+        os.mac.insert(
+            "ProtonVPN".into(),
+            (Some("http://127.0.0.1:9999/parda.pac".into()), true, true),
         );
-        f.replies.insert(
-            "networksetup -getautoproxyurl ProtonVPN".into(),
-            format!("URL: {PAC}\nEnabled: Yes\n"),
-        );
-        let st = enable(&mut f, &p, Platform::MacOs, PAC).unwrap();
+        let st = enable(&mut os, &p, Platform::MacOs, PAC).unwrap();
         let get = |t: &str| st.saved.iter().find(|s| s.target == t).unwrap().clone();
-        assert_eq!(get("Wi-Fi").url, None);
-        assert!(!get("Wi-Fi").enabled);
-        assert_eq!(get("ProtonVPN").url, None, "our own PAC is not an original");
+        assert_eq!(get("Wi-Fi").url, None, "original kept, not parda's");
+        assert_eq!(
+            get("ProtonVPN").url,
+            None,
+            "an old parda PAC is not an original"
+        );
     }
 
     #[test]
     fn no_enabled_service_is_an_error_and_changes_nothing() {
         let (_d, p) = paths();
-        let mut f = Fake::default();
-        f.replies.insert(
-            LIST.into(),
-            "An asterisk (*) denotes that a network service is disabled.\n*Wi-Fi\n".into(),
-        );
-        assert!(enable(&mut f, &p, Platform::MacOs, PAC).is_err());
+        let mut os = Os::default();
+        os.mac.insert("Wi-Fi".into(), (None, false, false));
+        assert!(enable(&mut os, &p, Platform::MacOs, PAC).is_err());
         assert!(load_state(&p).unwrap().is_none());
     }
 
     #[test]
-    fn windows_parses_restores_previous_url_and_refreshes() {
+    fn windows_round_trip_with_previous_url_and_refresh() {
         let (_d, p) = paths();
-        let mut f = Fake::default();
-        let q = format!("reg query {WIN_KEY} /v AutoConfigURL");
-        f.replies.insert(
-            q.clone(),
-            format!("\r\n{WIN_KEY}\r\n    AutoConfigURL    REG_SZ    http://corp/w.pac\r\n\r\n"),
-        );
-        enable(&mut f, &p, Platform::Windows, PAC).unwrap();
-        assert!(
-            f.calls
-                .iter()
-                .any(|c| c.starts_with("reg add") && c.contains(PAC))
-        );
-        assert_eq!(f.refreshed, 1);
-        f.calls.clear();
-        disable(&mut f, &p).unwrap().unwrap();
-        assert!(
-            f.calls
-                .iter()
-                .any(|c| c.starts_with("reg add") && c.contains("http://corp/w.pac"))
-        );
-        assert_eq!(f.refreshed, 2);
+        let mut os = Os {
+            win: Some("http://corp/w.pac".into()),
+            ..Default::default()
+        };
+        enable(&mut os, &p, Platform::Windows, PAC).unwrap();
+        assert_eq!(os.win.as_deref(), Some(PAC));
+        assert_eq!(os.refreshed, 1);
+        disable(&mut os, &p).unwrap().unwrap();
+        assert_eq!(os.win.as_deref(), Some("http://corp/w.pac"));
+        assert_eq!(os.refreshed, 2);
     }
 
     #[test]
     fn windows_removes_the_value_when_there_was_none() {
         let (_d, p) = paths();
-        let mut f = Fake::default();
-        f.failing.push("reg query".into()); // no AutoConfigURL before
-        enable(&mut f, &p, Platform::Windows, PAC).unwrap();
-        // Now the value exists (ours).
-        f.failing.clear();
-        f.replies.insert(
-            format!("reg query {WIN_KEY} /v AutoConfigURL"),
-            format!("    AutoConfigURL    REG_SZ    {PAC}\r\n"),
-        );
-        f.calls.clear();
-        disable(&mut f, &p).unwrap().unwrap();
-        assert!(f.calls.iter().any(|c| c.starts_with("reg delete")));
+        let mut os = Os::default();
+        enable(&mut os, &p, Platform::Windows, PAC).unwrap();
+        assert_eq!(os.win.as_deref(), Some(PAC));
+        disable(&mut os, &p).unwrap().unwrap();
+        assert_eq!(os.win, None);
     }
 
     #[test]
     fn gnome_restores_a_previous_manual_mode_and_url() {
         let (_d, p) = paths();
-        let mut f = Fake::default();
-        f.replies.insert(
-            "gsettings get org.gnome.system.proxy mode".into(),
-            "'manual'\n".into(),
-        );
-        f.replies.insert(
-            "gsettings get org.gnome.system.proxy autoconfig-url".into(),
-            "'http://corp/g.pac'\n".into(),
-        );
-        enable(&mut f, &p, Platform::Linux, PAC).unwrap();
-        assert!(
-            f.calls
-                .contains(&"gsettings set org.gnome.system.proxy mode auto".to_string())
-        );
-        f.calls.clear();
-        disable(&mut f, &p).unwrap().unwrap();
+        let mut os = Os {
+            gnome: ("manual".into(), "http://corp/g.pac".into()),
+            ..Default::default()
+        };
+        enable(&mut os, &p, Platform::Linux, PAC).unwrap();
+        assert_eq!(os.gnome, ("auto".to_string(), PAC.to_string()));
+        disable(&mut os, &p).unwrap().unwrap();
         assert_eq!(
-            f.calls,
-            [
-                "gsettings set org.gnome.system.proxy autoconfig-url http://corp/g.pac",
-                "gsettings set org.gnome.system.proxy mode manual",
-            ]
+            os.gnome,
+            ("manual".to_string(), "http://corp/g.pac".to_string())
         );
+    }
+
+    #[test]
+    fn parda_pac_addresses_are_recognised() {
+        assert!(is_parda_pac(PAC, PAC));
+        assert!(is_parda_pac("http://localhost:9000/parda.pac", PAC));
+        assert!(is_parda_pac("http://[::1]:8788/parda.pac", PAC));
+        assert!(!is_parda_pac("http://corp/parda.pac", PAC));
+        assert!(!is_parda_pac("http://127.0.0.1:8788/other.pac", PAC));
     }
 }

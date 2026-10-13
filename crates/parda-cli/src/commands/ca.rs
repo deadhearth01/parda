@@ -12,7 +12,7 @@ pub fn create(force: bool) -> anyhow::Result<()> {
     let p = paths()?;
     let config = load_config(&p)?;
     if force
-        && ca_exists(&p)
+        && ca_cert_path(&p).is_file()
         && cert_trust::is_trusted(&mut SystemRunner, Platform::current(), &ca_cert_path(&p))
     {
         anyhow::bail!(
@@ -75,8 +75,16 @@ pub fn status() -> anyhow::Result<()> {
     let trusted = cert_trust::is_trusted(&mut SystemRunner, Platform::current(), &pem);
     println!("certificate: created ({})", pem.display());
     let config = load_config(&p)?;
-    if let Err(e) = load_ca(&p, config.vault.use_keyring) {
-        println!("key:         unusable — {e:#}");
+    // Never create a vault key just to report status.
+    match parda_vault::find_key(&p.data_dir, config.vault.use_keyring) {
+        Ok(Some(_)) => {
+            if let Err(e) = load_ca(&p, config.vault.use_keyring) {
+                println!("key:         unusable — {e:#}");
+            }
+        }
+        _ => println!(
+            "key:         unusable — the vault key is missing; run `parda ca uninstall`, then `parda ca create --force`"
+        ),
     }
     println!(
         "trusted:     {}",

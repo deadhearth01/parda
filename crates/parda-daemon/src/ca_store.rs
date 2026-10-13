@@ -34,7 +34,9 @@ pub fn ca_exists(paths: &Paths) -> bool {
 /// Create a new root certificate. Refuses to replace an existing one unless
 /// `force` (the old one must then be removed from the OS trust store).
 pub fn create_ca(paths: &Paths, use_keyring: bool, force: bool) -> anyhow::Result<Ca> {
-    if ca_exists(paths) && !force {
+    // Guard on the certificate alone: a lone (maybe trusted) certificate whose
+    // key is missing must not be silently replaced either.
+    if ca_cert_path(paths).is_file() && !force {
         bail!(
             "a parda root certificate already exists ({}); use --force to replace it",
             ca_cert_path(paths).display()
