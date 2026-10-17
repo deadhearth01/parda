@@ -34,18 +34,14 @@ struct Settings {
 }
 
 impl Settings {
-    /// The vault scope of `host`: `intercept:<listed host>` per site, so a
-    /// site's answers only restore tags issued for text sent to it.
+    /// The vault scope of `host`: `intercept:<host>` per exact host
+    /// (lowercased, no trailing dot), so a host's answers only restore tags
+    /// issued for text sent to that same host, never to a subdomain or a
+    /// parent of it.
     fn scope_for(&self, host: &str) -> String {
         match &self.scope {
             Some(fixed) => fixed.clone(),
-            None => {
-                let site = self.hosts.entry_for(host).map_or_else(
-                    || host.trim_end_matches('.').to_ascii_lowercase(),
-                    str::to_string,
-                );
-                format!("intercept:{site}")
-            }
+            None => format!("intercept:{}", sites::normalize(host)),
         }
     }
 
@@ -498,11 +494,12 @@ impl BodyTransform for EngineTransform {
     }
 
     /// Answers are restored only where they are the user's own (see
-    /// `sites::restore_rule`): on chatgpt.com, claude.ai and Gemini the
-    /// allowlisted send (POST) and history (GET) endpoints; on any other
-    /// listed host streamed answers to POST requests. Everything else
-    /// passes through with its tags, so a page someone else wrote never
-    /// gets the viewer's values.
+    /// `sites::restore_rule`), and only on a host a site names exactly: on
+    /// chatgpt.com, claude.ai and Gemini the allowlisted send (POST) and
+    /// history (GET) endpoints; on the other known sites streamed answers
+    /// to POST requests. Everything else (subdomains a site does not name,
+    /// hosts no site names) passes through with its tags, so a page
+    /// someone else wrote never gets the viewer's values.
     fn response_stream(
         &self,
         method: &http::Method,
@@ -1842,8 +1839,8 @@ pub(crate) mod tests {
         for host in [
             "chat.deepseek.com",
             "meta.ai",
+            "www.meta.ai",
             "perplexity.ai",
-            "example.com",
         ] {
             for path in ["/api/v0/chat/completion", "/api/graphql/", "/"] {
                 // Streamed answers to the user's sends.
@@ -1867,6 +1864,15 @@ pub(crate) mod tests {
                     for m in [Method::POST, Method::GET] {
                         assert!(!restored(&t, &m, host, path, ct), "{m} {host}{path} {ct}");
                     }
+                }
+            }
+        }
+        // A host no site names (one the user added) or a subdomain a site
+        // does not name: nothing is restored.
+        for host in ["example.com", "x.meta.ai", "x.chat.deepseek.com"] {
+            for ct in ALL_TYPES {
+                for m in [Method::POST, Method::GET] {
+                    assert!(!restored(&t, &m, host, "/", ct), "{m} {host} {ct}");
                 }
             }
         }
@@ -1937,6 +1943,54 @@ pub(crate) mod tests {
         assert!(out.contains("Ravi Kumar"), "{out}");
     }
 
+    /// Review F3: subdomains shared their site's scope and got its answers
+    /// restored. A scope is the exact host; a subdomain no site names is
+    /// filtered but never restored, whatever the scope setting.
+    #[test]
+    fn subdomains_are_filtered_but_never_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path());
+        let t = transform(&e, |_| {});
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "text/plain",
+            Bytes::from("I am Ravi Kumar"),
+        );
+        assert_eq!(out.body, "I am [NAME_1]");
+        for host in ["x.chatgpt.com", "a.b.chatgpt.com", "X.CHATGPT.COM."] {
+            assert_eq!(answer(&t, host, "hi [NAME_1]"), "hi [NAME_1]", "{host}");
+        }
+        // Requests to a subdomain are still redacted, under its own scope.
+        let out = rewrite(
+            &t,
+            "x.chatgpt.com",
+            "text/plain",
+            Bytes::from("Ravi Kumar here"),
+        );
+        assert_eq!(out.body, "[NAME_1] here");
+        assert_eq!(
+            e.restore("[NAME_1]", "intercept:x.chatgpt.com"),
+            "Ravi Kumar"
+        );
+        assert_eq!(answer(&t, "x.chatgpt.com", "hi [NAME_1]"), "hi [NAME_1]");
+        let st = t.settings();
+        assert_eq!(st.scope_for("X.ChatGPT.com."), "intercept:x.chatgpt.com");
+        assert_eq!(st.scope_for("chatgpt.com"), "intercept:chatgpt.com");
+        // A fixed scope does not open subdomains either.
+        let dir2 = tempfile::tempdir().unwrap();
+        let t2 = global(dir2.path());
+        assert_eq!(answer(&t2, "chatgpt.com", "hi [NAME_1]"), "hi Ravi Kumar");
+        assert_eq!(answer(&t2, "x.chatgpt.com", "hi [NAME_1]"), "hi [NAME_1]");
+        let out = rewrite(
+            &t2,
+            "x.chatgpt.com",
+            "text/plain",
+            Bytes::from("Ravi Kumar"),
+        );
+        assert_eq!(out.body, "[NAME_1]");
+    }
+
     #[test]
     fn scopes_are_per_site_by_default() {
         let dir = tempfile::tempdir().unwrap();
@@ -1949,10 +2003,9 @@ pub(crate) mod tests {
             Bytes::from("I am Ravi Kumar"),
         );
         assert_eq!(out.body, "I am [NAME_1]");
-        // Only the site the tag was issued for gets the value back
-        // (subdomains are the same site).
+        // Only the site the tag was issued for gets the value back.
         assert_eq!(answer(&t, "chatgpt.com", "hi [NAME_1]"), "hi Ravi Kumar");
-        assert_eq!(answer(&t, "ab.chatgpt.com", "hi [NAME_1]"), "hi Ravi Kumar");
+        assert_eq!(answer(&t, "CHATGPT.com.", "hi [NAME_1]"), "hi Ravi Kumar");
         assert_eq!(answer(&t, "claude.ai", "hi [NAME_1]"), "hi [NAME_1]");
         assert_eq!(e.restore("[NAME_1]", "intercept:chatgpt.com"), "Ravi Kumar");
         // Tags from other surfaces (the clipboard, the agent proxy) are not

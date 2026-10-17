@@ -90,9 +90,10 @@ passthrough_paths = ["/api/*"]
 Only the listed hosts and their subdomains are decrypted; everything else is tunnelled untouched.
 Tags follow `replace.style` (there is no separate style for intercept).
 
-- **Scope**: with `scope = "per-host"` (the default) each listed site gets its own vault scope,
-  `intercept:<host>` (for example `intercept:chatgpt.com`). A site's answers can only restore tags
-  that were issued for text sent to that same site — never names you sent to another site, the
+- **Scope**: with `scope = "per-host"` (the default) each host gets its own vault scope,
+  `intercept:<host>` named by the exact host (for example `intercept:chatgpt.com`; a subdomain such
+  as `x.chatgpt.com` gets a scope of its own). A site's answers can only restore tags that were
+  issued for text sent to that same host — never names you sent to another site or subdomain, the
   clipboard or the agent proxy. Any other value is a fixed scope shared by every site (`global` also
   shares tags with the clipboard and the agent proxy).
 - **Requests** to a listed site:
@@ -147,14 +148,18 @@ Tags follow `replace.style` (there is no separate style for intercept).
     | `403 parda_blocked` | a kind whose action is `block` (the message names kinds, not values) |
     | `500 parda_internal` | anything else that went wrong while filtering |
 
-- **Answers** get the real values back only where they are the user's own:
+- **Answers** get the real values back only where they are the user's own, and only on the exact
+  hosts parda knows (those named below, plus `www.meta.ai` and `www.perplexity.ai`). Requests to
+  a subdomain of a listed host (`x.chatgpt.com`) and to a host you added yourself are filtered as
+  usual, but their answers keep their tags:
   - *chatgpt.com, chat.openai.com, claude.ai, gemini.google.com:* only the answers to sending a
     message (chatgpt `/backend-api/conversation` and `/backend-api/f/conversation`; claude
     `…/chat_conversations/*/completion` and `…/retry_completion`; Gemini `StreamGenerate`), and the
     user's own history (chatgpt `GET /backend-api/conversation/*` and `/backend-api/conversations`;
     claude `GET /api/organizations/*/chat_conversations[/*]`). Gemini history comes from
     `batchexecute`, which is never restored, so **old Gemini chats show tags**.
-  - *Every other listed site:* only answers to a `POST` that stream, by their content type
+  - *copilot.microsoft.com, perplexity.ai, chat.deepseek.com, chat.mistral.ai, grok.com, meta.ai,
+    poe.com:* only answers to a `POST` that stream, by their content type
     (`text/event-stream` or an NDJSON type such as `application/x-ndjson`). Anything typed as JSON
     (a single document, or one followed by more lines, as a GraphQL answer ends in
     `{"extensions":…}`), a text body or anything a `GET` returns keeps its tags.
