@@ -1382,6 +1382,32 @@ pub(crate) mod tests {
         );
     }
 
+    /// Review M6: a look-alike delimiter cannot turn text into an
+    /// unscanned "file", and base64 text parts are redacted.
+    #[test]
+    fn multipart_look_alike_delimiters_and_base64_parts_are_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path());
+        let t = transform(&e, |c| c.unscanned = UnscannedMedia::Block);
+        let ct = "multipart/form-data; boundary=b0";
+        let body = "--b0\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nhi\r\n\
+                    --b0x\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.txt\"\r\n\r\n\
+                    I am Ravi Kumar\r\n\
+                    --b0\r\nContent-Disposition: form-data; name=\"q\"\r\n\
+                    Content-Transfer-Encoding: base64\r\n\r\nSSBhbSBSYXZpIEt1bWFy\r\n--b0--\r\n";
+        let out = rewrite(&t, "example.com", ct, Bytes::from(body));
+        assert_eq!(out.unscanned, 0);
+        assert_eq!(
+            out.body,
+            body.replace("I am Ravi Kumar", "I am [NAME_1]")
+                .replace("SSBhbSBSYXZpIEt1bWFy", "SSBhbSBbTkFNRV8xXQ==")
+        );
+        // A text part parda cannot decode is unscanned (refused in block mode).
+        let qp = "--b0\r\nContent-Disposition: form-data; name=\"q\"\r\n\
+                  Content-Transfer-Encoding: quoted-printable\r\n\r\nRavi=20Kumar\r\n--b0--\r\n";
+        assert_eq!(refusal(&t, ct, qp).status, 415);
+    }
+
     /// Fails every batch (strict mode refuses the send).
     pub(crate) struct FailingMl;
 

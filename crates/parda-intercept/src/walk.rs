@@ -562,18 +562,28 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .map(|i| i + from)
 }
 
-/// `name` and whether a `filename` is present, from a part's headers.
-fn disposition(headers: &str) -> (Option<String>, bool, Option<String>) {
-    let mut name = None;
-    let mut file = false;
-    let mut content_type = None;
+/// What a part's headers say about it.
+#[derive(Default)]
+struct PartHeaders {
+    name: Option<String>,
+    /// A `filename` is present.
+    file: bool,
+    content_type: Option<String>,
+    /// `Content-Transfer-Encoding`, lower-case.
+    encoding: Option<String>,
+}
+
+fn part_headers(headers: &str) -> PartHeaders {
+    let mut part = PartHeaders::default();
     for line in headers.split("\r\n") {
         let Some((h, v)) = line.split_once(':') else {
             continue;
         };
         let h = h.trim();
         if h.eq_ignore_ascii_case("content-type") {
-            content_type = Some(v.trim().to_ascii_lowercase());
+            part.content_type = Some(v.trim().to_ascii_lowercase());
+        } else if h.eq_ignore_ascii_case("content-transfer-encoding") {
+            part.encoding = Some(v.trim().to_ascii_lowercase());
         } else if h.eq_ignore_ascii_case("content-disposition") {
             for param in v.split(';').skip(1) {
                 let Some((pk, pv)) = param.split_once('=') else {
@@ -581,19 +591,123 @@ fn disposition(headers: &str) -> (Option<String>, bool, Option<String>) {
                 };
                 let pk = pk.trim().to_ascii_lowercase();
                 if pk == "filename" || pk == "filename*" {
-                    file = true;
+                    part.file = true;
                 } else if pk == "name" {
-                    name = Some(pv.trim().trim_matches('"').to_string());
+                    part.name = Some(pv.trim().trim_matches('"').to_string());
                 }
             }
         }
     }
-    (name, file, content_type)
+    part
+}
+
+/// What follows a `--boundary` that is a delimiter (RFC 2046).
+#[derive(Clone, Copy)]
+enum Delimiter {
+    /// `--boundary` ends a line (after optional spaces or tabs); the CRLF
+    /// is at this index.
+    Open(usize),
+    /// `--boundary--`: the last one.
+    Close,
+}
+
+/// Is `--boundary` at `at` a delimiter, and which kind? Anything else after
+/// it (`--boundaryx`, `--boundary-`) is part content.
+fn delimiter_at(body: &[u8], at: usize, delim: &[u8]) -> Option<Delimiter> {
+    let mut i = at + delim.len();
+    if body.get(at..i)? != delim {
+        return None;
+    }
+    if body[i..].starts_with(b"--") {
+        return Some(Delimiter::Close);
+    }
+    while matches!(body.get(i), Some(b' ' | b'\t')) {
+        i += 1;
+    }
+    body[i..].starts_with(b"\r\n").then_some(Delimiter::Open(i))
+}
+
+/// The first delimiter at or after `from`: a `--boundary` that starts a
+/// line (follows a CRLF at or after `from`, or starts the body when
+/// `first`). Returns where its `--` is.
+fn next_delimiter(
+    body: &[u8],
+    delim: &[u8],
+    from: usize,
+    first: bool,
+) -> Option<(usize, Delimiter)> {
+    let mut at = from;
+    loop {
+        let p = find(body, delim, at)?;
+        let line_start = (first && p == 0) || (p >= from + 2 && &body[p - 2..p] == b"\r\n");
+        if line_start && let Some(d) = delimiter_at(body, p, delim) {
+            return Some((p, d));
+        }
+        at = p + 1;
+    }
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Decode MIME base64 (line breaks and spaces ignored, padding required);
+/// `None` when it is not base64.
+fn base64_decode(text: &[u8]) -> Option<Vec<u8>> {
+    let chars: Vec<u8> = text
+        .iter()
+        .copied()
+        .filter(|c| !matches!(c, b'\r' | b'\n' | b' ' | b'\t'))
+        .collect();
+    if !chars.len().is_multiple_of(4) {
+        return None;
+    }
+    let pad = chars.iter().rev().take_while(|&&c| c == b'=').count();
+    if pad > 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(chars.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0);
+    for &c in &chars[..chars.len() - pad] {
+        let v = BASE64.iter().position(|&b| b == c)? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// Encode as MIME base64: padded, lines of 76 characters joined by CRLF.
+fn base64_encode(data: &[u8]) -> String {
+    let mut chars = Vec::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                chars.push(BASE64[(n >> (18 - 6 * i)) as usize & 63]);
+            } else {
+                chars.push(b'=');
+            }
+        }
+    }
+    chars
+        .chunks(76)
+        .map(|line| String::from_utf8_lossy(line).into_owned())
+        .collect::<Vec<_>>()
+        .join("\r\n")
 }
 
 /// Visit the text fields of a `multipart/form-data` body: fields without a
-/// filename whose type is text or JSON. Files are forwarded unchanged and
-/// counted as unscanned.
+/// filename whose type is text or JSON, as they are or base64-encoded.
+/// Files, and fields parda cannot decode, are forwarded unchanged and
+/// counted as unscanned. Delimiters are found as RFC 2046 defines them.
 pub(crate) fn walk_multipart(
     body: &[u8],
     boundary: &str,
@@ -602,51 +716,66 @@ pub(crate) fn walk_multipart(
 ) -> Result<MultipartWalk, Malformed> {
     let delim = format!("--{boundary}");
     let delim = delim.as_bytes();
-    let next_delim = [b"\r\n".as_slice(), delim].concat();
-    let mut pos = find(body, delim, 0).ok_or(Malformed)?;
     // A preamble must end in CRLF before the first delimiter.
-    if pos != 0 && !(pos >= 2 && &body[pos - 2..pos] == b"\r\n") {
+    let (mut pos, mut kind) = next_delimiter(body, delim, 0, true).ok_or(Malformed)?;
+    // Servers skip the preamble and the epilogue; one that holds a
+    // look-alike delimiter could be read as a part by a lenient parser.
+    if find(&body[..pos], delim, 0).is_some() {
         return Err(Malformed);
     }
     let mut out = Vec::with_capacity(body.len());
     out.extend_from_slice(&body[..pos]);
     let mut walk = MultipartWalk::default();
     let mut changed = false;
-    loop {
-        let after = pos + delim.len();
-        if body[after..].starts_with(b"--") {
-            out.extend_from_slice(&body[pos..]);
-            break;
-        }
-        let line_end = find(body, b"\r\n", after).ok_or(Malformed)?;
+    while let Delimiter::Open(line_end) = kind {
+        let (next, next_kind) = next_delimiter(body, delim, line_end, false).ok_or(Malformed)?;
+        // The CRLF before the next delimiter belongs to the delimiter.
+        let content_end = next - 2;
         let headers_end = find(body, b"\r\n\r\n", line_end).ok_or(Malformed)?;
-        let headers = String::from_utf8_lossy(&body[line_end + 2..headers_end.max(line_end + 2)]);
         let content_start = headers_end + 4;
-        let content_end = find(body, &next_delim, content_start).ok_or(Malformed)?;
+        if content_start > content_end {
+            // No blank line before the next delimiter.
+            return Err(Malformed);
+        }
+        let headers = String::from_utf8_lossy(&body[line_end + 2..headers_end.max(line_end + 2)]);
         let content = &body[content_start..content_end];
         out.extend_from_slice(&body[pos..content_start]);
-        let (name, file, content_type) = disposition(&headers);
-        let texty = content_type.as_deref().is_none_or(|t| {
+        let part = part_headers(&headers);
+        let texty = part.content_type.as_deref().is_none_or(|t| {
             t.starts_with("text/") || t.starts_with("application/json") || t.contains("+json")
         });
+        let base64 = part.encoding.as_deref() == Some("base64");
+        let identity = part
+            .encoding
+            .as_deref()
+            .is_none_or(|e| matches!(e, "7bit" | "8bit" | "binary"));
         let mut new = None;
-        if file || !texty {
-            walk.unscanned += 1;
+        let text = if part.file || !texty || !(identity || base64) {
+            None
+        } else if base64 {
+            base64_decode(content).and_then(|d| String::from_utf8(d).ok())
         } else {
-            match std::str::from_utf8(content) {
-                Ok(text) => {
-                    let mut value = text.to_string();
-                    visit_text(&mut value, name.as_deref(), rules, f)?;
-                    if value != text {
-                        new = Some(value);
-                    }
+            std::str::from_utf8(content).ok().map(str::to_string)
+        };
+        match text {
+            Some(text) => {
+                let mut value = text.clone();
+                visit_text(&mut value, part.name.as_deref(), rules, f)?;
+                if value != text {
+                    new = Some(if base64 {
+                        base64_encode(value.as_bytes())
+                    } else {
+                        value
+                    });
                 }
-                Err(_) => walk.unscanned += 1,
             }
+            None => walk.unscanned += 1,
         }
         match new {
             Some(value) => {
-                if find(value.as_bytes(), delim, 0).is_some() {
+                // The new text must not end the part early.
+                let framed = [b"\r\n", value.as_bytes(), b"\r\n"].concat();
+                if next_delimiter(&framed, delim, 0, false).is_some() {
                     return Err(Malformed);
                 }
                 changed = true;
@@ -654,10 +783,13 @@ pub(crate) fn walk_multipart(
             }
             None => out.extend_from_slice(content),
         }
-        // The CRLF before the next delimiter belongs to the delimiter.
         out.extend_from_slice(b"\r\n");
-        pos = content_end + 2;
+        (pos, kind) = (next, next_kind);
     }
+    if find(body, delim, pos + delim.len() + 2).is_some() {
+        return Err(Malformed);
+    }
+    out.extend_from_slice(&body[pos..]);
     if changed {
         walk.body = Some(out);
     }
@@ -1085,5 +1217,154 @@ mod tests {
         let mut pre = b"preamble\r\n".to_vec();
         pre.extend_from_slice(&body);
         assert!(walk_multipart(&pre, "XyZ", &r, &mut upper).is_ok());
+    }
+
+    fn tag_name(s: &mut String, _: Tier) {
+        *s = s.replace("Ravi Kumar", "[NAME_1]");
+    }
+
+    /// Review M6: a delimiter is `--boundary` followed by `--`, or by
+    /// optional spaces or tabs and CRLF (RFC 2046). Anything else after
+    /// `--boundary` is part content.
+    #[test]
+    fn multipart_delimiters_follow_rfc_2046() {
+        let h = hosts();
+        let r = rules(&h, &[], "chatgpt.com");
+        // A text field holding `--XyZx` and fake part headers is one field.
+        let field = "hi\r\n--XyZx\r\nContent-Disposition: form-data; name=\"f\"; \
+                     filename=\"a.txt\"\r\n\r\nRavi Kumar";
+        let body = format!(
+            "--XyZ\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{field}\r\n--XyZ--\r\n"
+        );
+        let mut seen = Vec::new();
+        let w = walk_multipart(body.as_bytes(), "XyZ", &r, &mut |s: &mut String, t| {
+            seen.push(mark(s, t))
+        })
+        .unwrap();
+        assert_eq!(seen, [field]);
+        assert_eq!(w.unscanned, 0);
+        let w = walk_multipart(body.as_bytes(), "XyZ", &r, &mut tag_name).unwrap();
+        assert_eq!(
+            String::from_utf8(w.body.unwrap()).unwrap(),
+            body.replace("Ravi Kumar", "[NAME_1]")
+        );
+        // Padding before the CRLF is allowed.
+        let body = "preamble\r\n--XyZ \t\r\nContent-Disposition: form-data; \
+                    name=\"a\"\r\n\r\nRavi Kumar\r\n--XyZ\t\r\nContent-Disposition: form-data; \
+                    name=\"b\"\r\n\r\nx\r\n--XyZ--\r\nepilogue";
+        let mut seen = Vec::new();
+        walk_multipart(body.as_bytes(), "XyZ", &r, &mut |s: &mut String, t| {
+            seen.push(mark(s, t))
+        })
+        .unwrap();
+        assert_eq!(seen, ["Ravi Kumar", "x"]);
+        // A body whose only `--XyZ` lines are look-alikes does not split,
+        // and a preamble or epilogue holding one (a part to a lenient
+        // parser, never scanned) is refused.
+        for bad in [
+            "--XyZx\r\n\r\nRavi Kumar\r\n--XyZ--",
+            "--XyZjunk\r\n\r\nRavi Kumar\r\n--XyZ\r\n\r\nx\r\n--XyZ--",
+            "--XyZ\r\n\r\nx\r\n--XyZ--\r\n--XyZ\r\n\r\nRavi Kumar\r\n--XyZ--",
+            "--XyZ\r\n\r\nx\r\n--XyZ----XyZ",
+            "--XyZ\r\n\r\nRavi Kumar\r\n--XyZ-",
+            "--XyZ\r\n\r\nRavi Kumar\r\n--XyZ x\r\n",
+        ] {
+            assert_eq!(
+                walk_multipart(bad.as_bytes(), "XyZ", &r, &mut upper),
+                Err(Malformed),
+                "{bad:?}"
+            );
+        }
+    }
+
+    fn base64_part(encoding: &str, content: &str) -> String {
+        format!(
+            "--XyZ\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Transfer-Encoding: {encoding}\r\n\r\n{content}\r\n--XyZ--\r\n"
+        )
+    }
+
+    /// Base64 lines of at most 76 characters, CRLF between them.
+    fn wrapped(b64: &str) -> String {
+        let lines: Vec<&str> = b64
+            .as_bytes()
+            .chunks(76)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        lines.join("\r\n")
+    }
+
+    /// Review M6: base64 text parts are decoded, scanned and re-encoded;
+    /// parts parda cannot decode are counted as unscanned.
+    #[test]
+    fn base64_text_parts_are_decoded_and_scanned() {
+        let h = hosts();
+        let r = rules(&h, &[], "chatgpt.com");
+        let body = base64_part("base64", "UmF2aSBLdW1hciBhc2tz");
+        let mut seen = Vec::new();
+        let w = walk_multipart(body.as_bytes(), "XyZ", &r, &mut |s: &mut String, t| {
+            seen.push(mark(s, t))
+        })
+        .unwrap();
+        assert_eq!(seen, ["Ravi Kumar asks"]);
+        assert_eq!(w, MultipartWalk::default());
+        let w = walk_multipart(body.as_bytes(), "XyZ", &r, &mut upper).unwrap();
+        assert_eq!(
+            String::from_utf8(w.body.unwrap()).unwrap(),
+            base64_part("base64", "UkFWSSBLVU1BUiBBU0tT")
+        );
+        // Long values come in (and go out) as 76-character lines.
+        let long = wrapped(
+            "UmF2aSBLdW1hciBhc2tzIGFib3V0IGNhZsOpIFJhdmkgS3VtYXIgYXNrcyBhYm91dCBjYWbDqSBSYXZpIEt1\
+             bWFyIGFza3MgYWJvdXQgY2Fmw6kgUmF2aSBLdW1hciBhc2tzIGFib3V0IGNhZsOpIA==",
+        );
+        let upper_long = wrapped(
+            "UkFWSSBLVU1BUiBBU0tTIEFCT1VUIENBRsOJIFJBVkkgS1VNQVIgQVNLUyBBQk9VVCBDQUbDiSBSQVZJIEtV\
+             TUFSIEFTS1MgQUJPVVQgQ0FGw4kgUkFWSSBLVU1BUiBBU0tTIEFCT1VUIENBRsOJIA==",
+        );
+        let w = walk_multipart(
+            base64_part("BASE64", &long).as_bytes(),
+            "XyZ",
+            &r,
+            &mut upper,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(w.body.unwrap()).unwrap(),
+            base64_part("BASE64", &upper_long)
+        );
+        // Unchanged text keeps its exact bytes.
+        let w = walk_multipart(body.as_bytes(), "XyZ", &r, &mut |_: &mut String, _| {}).unwrap();
+        assert_eq!(w.body, None);
+        // Not base64, not UTF-8 once decoded, or an encoding parda does not
+        // decode: unscanned, never visited.
+        for (encoding, content) in [
+            ("base64", "not base64!"),
+            ("base64", "UmF2a"),
+            ("base64", "//5SYQ=="),
+            ("quoted-printable", "Ravi=20Kumar"),
+            ("x-uuencode", "Ravi Kumar"),
+        ] {
+            let body = base64_part(encoding, content);
+            let mut seen = Vec::new();
+            let w = walk_multipart(body.as_bytes(), "XyZ", &r, &mut |s: &mut String, t| {
+                seen.push(mark(s, t))
+            })
+            .unwrap();
+            assert!(seen.is_empty(), "{encoding} {content}: {seen:?}");
+            assert_eq!(w.unscanned, 1, "{encoding} {content}");
+            assert_eq!(w.body, None);
+        }
+        // Identity encodings are read as they are.
+        for encoding in ["7bit", "8bit", "binary"] {
+            let body = base64_part(encoding, "Ravi Kumar");
+            let w = walk_multipart(body.as_bytes(), "XyZ", &r, &mut tag_name).unwrap();
+            assert_eq!(w.unscanned, 0);
+            assert_eq!(
+                String::from_utf8(w.body.unwrap()).unwrap(),
+                base64_part(encoding, "[NAME_1]")
+            );
+        }
     }
 }
