@@ -198,7 +198,12 @@ enum InterceptCmd {
     /// Start filtering AI sites (needs a trusted `parda ca`); prints how to undo.
     On,
     /// Put the previous proxy settings back and stop filtering AI sites.
-    Off,
+    Off {
+        /// The saved settings cannot be read: switch off parda's automatic
+        /// proxy setting wherever it is set and move the saved file aside.
+        #[arg(long)]
+        forget: bool,
+    },
     /// Certificate, listener, system proxy and site list (changes nothing).
     Status,
 }
@@ -261,10 +266,10 @@ fn main() {
             CaCmd::Uninstall { force } => commands::ca::uninstall(force),
             CaCmd::Status => commands::ca::status(),
         },
-        Command::Intercept(i) => commands::intercept::with_system(match i {
-            InterceptCmd::On => commands::intercept::on,
-            InterceptCmd::Off => commands::intercept::off,
-            InterceptCmd::Status => commands::intercept::status,
+        Command::Intercept(i) => commands::intercept::with_system(|cx| match i {
+            InterceptCmd::On => commands::intercept::on(cx),
+            InterceptCmd::Off { forget } => commands::intercept::off_with(cx, forget),
+            InterceptCmd::Status => commands::intercept::status(cx),
         }),
         Command::Env { agent } => commands::env::run(&agent),
     };

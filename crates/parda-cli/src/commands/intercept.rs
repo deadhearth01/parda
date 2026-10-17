@@ -140,11 +140,41 @@ fn describe(url: Option<&str>, active: bool) -> String {
     }
 }
 
+/// Where to switch the automatic proxy setting off by hand.
+fn manual_steps(platform: Platform) -> &'static str {
+    match platform {
+        Platform::MacOs => {
+            "System Settings → Network → each service → Details → Proxies → Automatic proxy \
+             configuration"
+        }
+        Platform::Windows => {
+            "Settings → Network & internet → Proxy → Use setup script (Automatic proxy \
+             configuration)"
+        }
+        Platform::Linux => "Settings → Network → Network Proxy (Automatic proxy configuration)",
+    }
+}
+
+/// intercept-state.json cannot be read: say how to get out.
+fn damaged_state(paths: &Paths, platform: Platform, e: &anyhow::Error) -> anyhow::Error {
+    anyhow!(
+        "{} is damaged or unreadable ({e:#}), so parda cannot put your previous proxy settings \
+         back. Run `parda intercept off --forget`: it switches off parda's automatic proxy \
+         configuration wherever it is set and moves the file aside; then check your previous \
+         setting by hand ({})",
+        sysproxy::state_file(paths).display(),
+        manual_steps(platform)
+    )
+}
+
 const START_DAEMON: &str = "`parda daemon` (or `parda service install` to start it at login)";
 
 /// `parda intercept on`: check the certificate, start the listener, then
 /// point the system's automatic proxy setting at it.
 pub fn on(cx: &mut Ctx) -> anyhow::Result<()> {
+    if let Err(e) = sysproxy::load_state(cx.paths) {
+        return Err(damaged_state(cx.paths, cx.platform, &e));
+    }
     if !ca_exists(cx.paths) {
         bail!(
             "parda has no root certificate yet — run `parda ca create` first, then \
@@ -252,7 +282,24 @@ pub fn on(cx: &mut Ctx) -> anyhow::Result<()> {
 /// listener. Works with the daemon down and after a crash (the saved state
 /// is on disk). If a setting cannot be put back, the listener keeps running
 /// so the sites still sent to parda keep loading, and the command fails.
-pub fn off(cx: &mut Ctx) -> anyhow::Result<()> {
+///
+/// `forget` (`parda intercept off --forget`) first moves the saved settings
+/// aside — for a state file that cannot be read — so every parda PAC found
+/// is switched off instead of restored.
+pub fn off_with(cx: &mut Ctx, forget: bool) -> anyhow::Result<()> {
+    if forget {
+        if let Some(aside) = sysproxy::set_aside_state(cx.paths)? {
+            writeln!(
+                cx.out,
+                "· saved        settings moved aside to {} — check your previous proxy settings \
+                 by hand ({})",
+                aside.display(),
+                manual_steps(cx.platform)
+            )?;
+        }
+    } else if let Err(e) = sysproxy::load_state(cx.paths) {
+        return Err(damaged_state(cx.paths, cx.platform, &e));
+    }
     let restored = sysproxy::disable(cx.runner, cx.paths).context(
         "could not put the previous proxy settings back (intercept stays on so AI sites keep \
          loading)",
@@ -521,8 +568,8 @@ pub fn status(cx: &mut Ctx) -> anyhow::Result<()> {
         }
         Err(e) => writeln!(cx.out, "system proxy: could not be read ({e:#})")?,
     }
-    if let Ok(Some(state)) = sysproxy::load_state(cx.paths) {
-        writeln!(
+    match sysproxy::load_state(cx.paths) {
+        Ok(Some(state)) => writeln!(
             cx.out,
             "saved:        previous settings of {} kept for `parda intercept off`",
             state
@@ -531,7 +578,14 @@ pub fn status(cx: &mut Ctx) -> anyhow::Result<()> {
                 .map(|s| target_label(cx.platform, &s.target))
                 .collect::<Vec<_>>()
                 .join(", ")
-        )?;
+        )?,
+        Ok(None) => {}
+        Err(e) => writeln!(
+            cx.out,
+            "saved:        DAMAGED — {} ({e:#}); `parda intercept off --forget` switches off \
+             parda's PAC and moves it aside",
+            sysproxy::state_file(cx.paths).display()
+        )?,
     }
     writeln!(
         cx.out,
@@ -669,6 +723,17 @@ pub fn doctor_checks(
         ),
         Ok(_) => {}
     }
+    if let Err(e) = sysproxy::load_state(paths) {
+        add(
+            Level::Warn,
+            "saved settings",
+            format!(
+                "{} is damaged ({e:#}); `parda intercept off` cannot restore from it — run \
+                 `parda intercept off --forget`",
+                sysproxy::state_file(paths).display()
+            ),
+        );
+    }
     out
 }
 
@@ -681,6 +746,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn off(cx: &mut Ctx) -> anyhow::Result<()> {
+        off_with(cx, false)
+    }
 
     const PAC: &str = "http://127.0.0.1:8788/parda.pac";
 
@@ -1124,6 +1193,56 @@ mod tests {
         exec(&p, &mut os, Some(&mut daemon), off).0.unwrap();
         assert!(!daemon.config.intercept.enabled);
         assert!(os.services.values().all(|(_, on)| !on));
+    }
+
+    #[test]
+    fn a_damaged_state_file_says_how_to_recover_and_off_forget_recovers() {
+        let (_d, p) = home_with_ca();
+        let mut os = Mac::new(true);
+        let mut daemon = FakeDaemon::new(load_config(&p).unwrap());
+        exec(&p, &mut os, Some(&mut daemon), on).0.unwrap();
+        let file = p.data_dir.join("intercept-state.json");
+        std::fs::write(&file, "{").unwrap();
+
+        for (what, r) in [
+            ("off", exec(&p, &mut os, Some(&mut daemon), off).0),
+            ("on", exec(&p, &mut os, Some(&mut daemon), on).0),
+        ] {
+            let e = format!("{:#}", r.unwrap_err());
+            assert!(
+                e.contains("damaged")
+                    && e.contains("parda intercept off --forget")
+                    && e.contains(&file.display().to_string()),
+                "{what}: {e}"
+            );
+            assert!(e.contains("Automatic proxy configuration"), "{what}: {e}");
+        }
+        os.calls.clear();
+        let (r, out) = exec(&p, &mut os, Some(&mut daemon), status);
+        r.unwrap();
+        assert!(out.contains("damaged") && out.contains("--forget"), "{out}");
+        assert!(os.writes().is_empty(), "{:?}", os.calls);
+        let c = checks(&p, &mut os, None);
+        assert!(
+            c.iter()
+                .any(|c| c.level == Level::Warn && c.detail.contains("--forget")),
+            "{c:?}"
+        );
+
+        let (r, out) = exec(&p, &mut os, Some(&mut daemon), |cx| off_with(cx, true));
+        r.unwrap();
+        assert!(
+            os.services.values().all(|(_, on)| !on),
+            "parda's PAC switched off everywhere: {:?}",
+            os.services
+        );
+        assert!(!file.exists());
+        assert!(p.data_dir.join("intercept-state.json.damaged").exists());
+        assert!(!daemon.config.intercept.enabled);
+        assert!(
+            out.contains("intercept-state.json.damaged") && out.contains("by hand"),
+            "{out}"
+        );
     }
 
     /// Every file under the home folder with its contents.

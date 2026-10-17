@@ -51,6 +51,24 @@ fn state_path(paths: &Paths) -> PathBuf {
     paths.data_dir.join(STATE_FILE)
 }
 
+/// Where the saved settings live (`intercept-state.json` in the data folder).
+pub fn state_file(paths: &Paths) -> PathBuf {
+    state_path(paths)
+}
+
+/// Move the state file aside (to `intercept-state.json.damaged`), for
+/// `parda intercept off --forget` when it cannot be read. Returns where it
+/// went, `None` when there was none.
+pub fn set_aside_state(paths: &Paths) -> anyhow::Result<Option<PathBuf>> {
+    let from = state_path(paths);
+    let to = from.with_extension("json.damaged");
+    match std::fs::rename(&from, &to) {
+        Ok(()) => Ok(Some(to)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("moving {} aside", from.display())),
+    }
+}
+
 pub fn load_state(paths: &Paths) -> anyhow::Result<Option<State>> {
     match std::fs::read_to_string(state_path(paths)) {
         Ok(s) => Ok(Some(
