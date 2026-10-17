@@ -369,34 +369,30 @@ impl BodyTransform for EngineTransform {
         self.rewrite(host, path, headers, body).map(|o| o.body)
     }
 
-    /// As for the answer to a POST (see
-    /// [`BodyTransform::response_stream_for`]).
+    /// Answers are restored only where they are the user's own (see
+    /// `sites::restore_rule`): on chatgpt.com, claude.ai and Gemini the
+    /// allowlisted send (POST) and history (GET) endpoints; on any other
+    /// listed host streamed answers to POST requests. Everything else
+    /// passes through with its tags, so a page someone else wrote never
+    /// gets the viewer's values.
     fn response_stream(
-        &self,
-        host: &str,
-        path: &str,
-        content_type: &str,
-    ) -> Box<dyn StreamTransform> {
-        self.response_stream_for(&http::Method::POST, host, path, content_type)
-    }
-
-    /// Answers are restored only for the user's own sends (POST) and own
-    /// history (allowlisted GET endpoints per site); everything else passes
-    /// through, so a page someone else wrote never gets the viewer's values.
-    fn response_stream_for(
         &self,
         method: &http::Method,
         host: &str,
         path: &str,
         content_type: &str,
     ) -> Box<dyn StreamTransform> {
-        let own = *method == http::Method::POST
-            || (*method == http::Method::GET && sites::restores_get(host, path));
-        if !own {
-            return crate::restore::passthrough();
+        let rule = sites::restore_rule(host, method, path);
+        let scope = || self.settings().scope_for(host);
+        match rule {
+            sites::Restore::Never => crate::restore::passthrough(),
+            sites::Restore::Answer => {
+                crate::restore::for_content_type(&self.engine, &scope(), content_type)
+            }
+            sites::Restore::Streamed => {
+                crate::restore::for_stream_only(&self.engine, &scope(), content_type)
+            }
         }
-        let scope = self.settings().scope_for(host);
-        crate::restore::for_content_type(&self.engine, &scope, content_type)
     }
 
     fn request_outcome(
@@ -768,85 +764,227 @@ pub(crate) mod tests {
 
     /// Restore `body` as the answer of `host`.
     fn answer(t: &EngineTransform, host: &str, body: &str) -> String {
-        let mut r = t.response_stream(host, "/", "text/plain");
+        let path = if host.ends_with("claude.ai") {
+            "/api/organizations/o1/chat_conversations/c1/completion"
+        } else {
+            "/backend-api/conversation"
+        };
+        let mut r = t.response_stream(&http::Method::POST, host, path, "text/plain");
         let mut out = r.push(body.as_bytes()).to_vec();
         out.extend_from_slice(&r.finish());
         String::from_utf8(out).unwrap()
     }
 
-    #[test]
-    fn only_post_answers_and_own_history_are_restored() {
-        let dir = tempfile::tempdir().unwrap();
-        let t = transform(&engine(dir.path()), |_| {});
-        let restores = |method: http::Method, host: &str, path: &str| {
-            !t.response_stream_for(&method, host, path, "application/json")
-                .is_passthrough()
+    /// Is a `[NAME_1]` in an answer of `content_type` to `method host path`
+    /// restored? (One scope for every site, so only the endpoint rule
+    /// decides.)
+    fn restored(
+        t: &EngineTransform,
+        method: &http::Method,
+        host: &str,
+        path: &str,
+        content_type: &str,
+    ) -> bool {
+        let body = match content_type {
+            "text/event-stream" => "data: {\"t\":\"hi [NAME_1]\"}\n\n",
+            "application/x-ndjson" | "application/json; lines" => {
+                "{\"t\":\"a [NAME_1]\"}\n{\"t\":\"b\"}\n"
+            }
+            "application/json" => "{\"t\":\"hi [NAME_1]\"}",
+            _ => "hi [NAME_1]",
         };
+        let ct = content_type.trim_end_matches("; lines");
+        let mut r = t.response_stream(method, host, path, ct);
+        let mut out = Vec::new();
+        for b in body.as_bytes().chunks(5) {
+            out.extend_from_slice(&r.push(b));
+        }
+        out.extend_from_slice(&r.finish());
+        let out = String::from_utf8(out).unwrap();
+        if out.contains("Ravi Kumar") {
+            return true;
+        }
+        assert_eq!(out, body, "{method} {host}{path} {content_type}");
+        false
+    }
+
+    fn global(dir: &std::path::Path) -> EngineTransform {
+        let e = engine(dir);
+        assert_eq!(e.redact("Ravi Kumar", "global").unwrap().text, "[NAME_1]");
+        transform(&e, |c| c.scope = "global".into())
+    }
+
+    const ALL_TYPES: [&str; 5] = [
+        "text/event-stream",
+        "application/x-ndjson",
+        "application/json; lines",
+        "application/json",
+        "text/plain",
+    ];
+
+    #[test]
+    fn known_sites_restore_only_their_send_and_history_endpoints() {
         use http::Method;
-        // The user's own sends.
-        assert!(restores(
-            Method::POST,
+        let dir = tempfile::tempdir().unwrap();
+        let t = global(dir.path());
+        let sends = [
+            ("chatgpt.com", "/backend-api/conversation"),
+            ("chatgpt.com", "/backend-api/f/conversation"),
+            ("chat.openai.com", "/backend-api/conversation"),
+            ("chatgpt.com", "/Backend-API/Conversation"),
+            ("chatgpt.com", "/backend-api/conversation?x=1"),
+            (
+                "claude.ai",
+                "/api/organizations/o1/chat_conversations/c1/completion",
+            ),
+            (
+                "claude.ai",
+                "/api/organizations/o1/chat_conversations/c1/retry_completion",
+            ),
+            (
+                "gemini.google.com",
+                "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate",
+            ),
+        ];
+        let history = [
+            ("chatgpt.com", "/backend-api/conversation/6f1c2a9e"),
+            ("chatgpt.com", "/backend-api/conversations"),
+            ("claude.ai", "/api/organizations/o1/chat_conversations"),
+            ("claude.ai", "/api/organizations/o1/chat_conversations/c1"),
+        ];
+        for ct in ALL_TYPES {
+            for (host, path) in sends {
+                assert!(
+                    restored(&t, &Method::POST, host, path, ct),
+                    "{host}{path} {ct}"
+                );
+                assert!(
+                    !restored(&t, &Method::GET, host, path, ct),
+                    "{host}{path} {ct}"
+                );
+            }
+            for (host, path) in history {
+                assert!(
+                    restored(&t, &Method::GET, host, path, ct),
+                    "{host}{path} {ct}"
+                );
+                assert!(
+                    !restored(&t, &Method::POST, host, path, ct),
+                    "{host}{path} {ct}"
+                );
+                assert!(
+                    !restored(&t, &Method::PUT, host, path, ct),
+                    "{host}{path} {ct}"
+                );
+                assert!(
+                    !restored(&t, &Method::PATCH, host, path, ct),
+                    "{host}{path} {ct}"
+                );
+            }
+            // Shared pages, GPTs, snapshots, Gemini's batchexecute, any
+            // other endpoint of these sites: tags stay, whatever the
+            // method or format.
+            for (host, path) in [
+                ("chatgpt.com", "/backend-api/share/x"),
+                ("chatgpt.com", "/backend-api/gizmos/x"),
+                ("chatgpt.com", "/backend-api/conversation/a/b"),
+                ("chatgpt.com", "/echo"),
+                ("claude.ai", "/api/chat_snapshots/s1"),
+                ("claude.ai", "/api/organizations/o1/chat_conversations/c1/x"),
+                ("gemini.google.com", "/_/BardChatUi/data/batchexecute"),
+            ] {
+                for m in [Method::GET, Method::POST] {
+                    assert!(!restored(&t, &m, host, path, ct), "{m} {host}{path} {ct}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn path_tricks_never_reach_an_allowlisted_endpoint() {
+        use http::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let t = global(dir.path());
+        let ct = "application/json";
+        for (m, path) in [
+            (Method::GET, "/backend-api/conversation/.."),
+            (Method::GET, "/backend-api/conversation/%2e%2e"),
+            (Method::GET, "/backend-api/conversation/%2E%2E"),
+            (Method::GET, "/backend-api/conversation/."),
+            (Method::GET, "/backend-api/conversation/%2e"),
+            (Method::GET, "//backend-api/conversation/x"),
+            (Method::GET, "/backend-api//conversation/x"),
+            (Method::GET, "/backend-api/conversation/x/"),
+            (Method::GET, "/backend-api/conversation/%252e%252e"),
+            (Method::GET, "/backend-api/conversation/%zz"),
+            (Method::GET, "/backend-api/conversation/a%2F..%2Fshare"),
+            (Method::GET, "/backend-api/conversation/x;.."),
+            (Method::GET, "/backend-api/conversation/x\\..\\..\\share"),
+            (Method::GET, "backend-api/conversation/x"),
+            (Method::POST, "/backend-api/conversation/.."),
+            (Method::POST, "/backend-api/conversation/x/.."),
+            (Method::POST, "/backend-api/share/../conversation"),
+            (Method::POST, "/backend-api/share/%2e%2e/conversation"),
+            (Method::POST, "//backend-api/conversation"),
+            (Method::POST, "/backend-api/conversation/"),
+        ] {
+            assert!(!restored(&t, &m, "chatgpt.com", path, ct), "{m} {path}");
+        }
+        // Percent-encoded literals are decoded once and still match.
+        assert!(restored(
+            &t,
+            &Method::POST,
             "chatgpt.com",
-            "/backend-api/conversation"
+            "/backend-api/%63onversation",
+            ct
         ));
-        assert!(restores(
-            Method::POST,
-            "gemini.google.com",
-            "/_/BardChatUi/data/batchexecute"
-        ));
-        // The user's own history.
-        assert!(restores(
-            Method::GET,
-            "chatgpt.com",
-            "/backend-api/conversation/6f1c2a9e"
-        ));
-        assert!(restores(
-            Method::GET,
-            "chatgpt.com",
-            "/backend-api/conversations"
-        ));
-        assert!(restores(
-            Method::GET,
-            "claude.ai",
-            "/api/organizations/o1/chat_conversations/c1"
-        ));
-        assert!(restores(
-            Method::GET,
-            "claude.ai",
-            "/api/organizations/o1/chat_conversations"
-        ));
-        // Everything else: shared pages, GPTs, snapshots, other methods.
-        assert!(!restores(
-            Method::GET,
-            "chatgpt.com",
-            "/backend-api/share/abc"
-        ));
-        assert!(!restores(
-            Method::GET,
-            "chatgpt.com",
-            "/backend-api/gizmos/g-1"
-        ));
-        assert!(!restores(
-            Method::GET,
-            "chatgpt.com",
-            "/backend-api/conversation/a/b"
-        ));
-        assert!(!restores(
-            Method::GET,
-            "claude.ai",
-            "/api/chat_snapshots/s1"
-        ));
-        assert!(!restores(Method::GET, "perplexity.ai", "/rest/thread/x"));
-        assert!(!restores(
-            Method::PUT,
-            "chatgpt.com",
-            "/backend-api/conversation"
-        ));
-        assert!(!restores(
-            Method::PATCH,
-            "chatgpt.com",
-            "/backend-api/conversation/x"
-        ));
+    }
+
+    #[test]
+    fn other_sites_restore_only_streamed_answers_to_posts() {
+        use http::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let t = global(dir.path());
+        for host in [
+            "chat.deepseek.com",
+            "meta.ai",
+            "perplexity.ai",
+            "example.com",
+        ] {
+            for path in ["/api/v0/chat/completion", "/api/graphql/", "/"] {
+                // Streamed answers to the user's sends.
+                for ct in [
+                    "text/event-stream",
+                    "application/x-ndjson",
+                    "application/json; lines",
+                ] {
+                    assert!(
+                        restored(&t, &Method::POST, host, path, ct),
+                        "{host}{path} {ct}"
+                    );
+                    assert!(
+                        !restored(&t, &Method::GET, host, path, ct),
+                        "{host}{path} {ct}"
+                    );
+                    assert!(
+                        !restored(&t, &Method::PUT, host, path, ct),
+                        "{host}{path} {ct}"
+                    );
+                }
+                // A single document (a GraphQL answer, a page) never.
+                for ct in ["application/json", "text/plain"] {
+                    for m in [Method::POST, Method::GET] {
+                        assert!(!restored(&t, &m, host, path, ct), "{m} {host}{path} {ct}");
+                    }
+                }
+            }
+        }
+        // Google-framed JSON on another site is a document too.
+        let mut r = t.response_stream(&Method::POST, "meta.ai", "/x", "application/json");
+        let framed = ")]}'\n\n23\n[[\"a\",\"hi [NAME_1]\"]]\n";
+        let mut out = r.push(framed.as_bytes()).to_vec();
+        out.extend_from_slice(&r.finish());
+        assert_eq!(out, framed.as_bytes());
     }
 
     #[test]

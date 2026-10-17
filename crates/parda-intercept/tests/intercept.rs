@@ -275,6 +275,7 @@ impl BodyTransform for Upper {
 
     fn response_stream(
         &self,
+        _method: &http::Method,
         _host: &str,
         _path: &str,
         _content_type: &str,

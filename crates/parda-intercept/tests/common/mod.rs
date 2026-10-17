@@ -31,10 +31,12 @@ use tokio::sync::broadcast;
 pub const T: Duration = Duration::from_secs(10);
 
 /// The names the fake site answers for.
-pub const SITES: [&str; 4] = [
+pub const SITES: [&str; 6] = [
     "chatgpt.com",
     "claude.ai",
     "gemini.google.com",
+    "chat.deepseek.com",
+    "meta.ai",
     "example.com",
 ];
 
