@@ -183,8 +183,12 @@ enum CaCmd {
     Path,
     /// Trust the certificate for your user (the OS asks you to confirm).
     Install,
-    /// Remove it from your trust store.
-    Uninstall,
+    /// Remove it from your trust store (refused while intercept is in use).
+    Uninstall {
+        /// Remove it even though AI sites sent to parda will then fail to load.
+        #[arg(long)]
+        force: bool,
+    },
     /// Show whether it exists and is trusted.
     Status,
 }
@@ -254,7 +258,7 @@ fn main() {
             CaCmd::Create { force } => commands::ca::create(force),
             CaCmd::Path => commands::ca::path(),
             CaCmd::Install => commands::ca::install(),
-            CaCmd::Uninstall => commands::ca::uninstall(),
+            CaCmd::Uninstall { force } => commands::ca::uninstall(force),
             CaCmd::Status => commands::ca::status(),
         },
         Command::Intercept(i) => commands::intercept::with_system(match i {

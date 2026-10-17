@@ -417,3 +417,40 @@ async fn a_replaced_ca_restarts_the_listener_on_reload() {
     );
     stop(&paths, daemon).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replaced_ca_is_picked_up_without_a_reload() {
+    // `parda ca uninstall` + `parda ca create --force` + `parda ca install`
+    // send no config change: the daemon notices the new file by itself.
+    let (_home, paths) = home_with(&config(
+        "enabled = true\nlisten = \"127.0.0.1:0\"\nhosts = [\"chat.test\"]\n",
+    ));
+    ca_store::create_ca(&paths, false, false).unwrap();
+    let daemon = tokio::spawn(run(paths.clone(), ALL));
+    let first = listening(&status(&paths).await).expect("listening");
+    ca_store::create_ca(&paths, false, true).unwrap();
+
+    // On its own, within a few seconds (no IPC call at all).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while addr_file(&paths).as_deref() == Some(first.to_string().as_str()) {
+        assert!(Instant::now() < deadline, "listener never restarted");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let second = listening(&status(&paths).await).expect("listening again");
+    assert_ne!(second, first);
+    assert_eq!(
+        refused_request(&paths, second, "application/json", "{").await,
+        400,
+        "the new CA signs"
+    );
+
+    // A status call checks too, at once.
+    ca_store::create_ca(&paths, false, true).unwrap();
+    let third = listening(&status(&paths).await).expect("listening");
+    assert_ne!(third, second);
+    assert_eq!(
+        refused_request(&paths, third, "application/json", "{").await,
+        400
+    );
+    stop(&paths, daemon).await;
+}

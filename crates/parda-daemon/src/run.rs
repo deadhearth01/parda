@@ -50,6 +50,9 @@ const STOP_WITHIN: Duration = Duration::from_secs(5);
 /// How long a restarted intercept listener waits for its old address to be
 /// released.
 const REBIND_WITHIN: Duration = Duration::from_secs(2);
+/// How often the daemon checks whether the root certificate on disk was
+/// replaced (`parda ca create --force`) while the listener runs.
+const CA_CHECK_EVERY: Duration = Duration::from_secs(2);
 
 /// Why intercept is on but not listening, when no root certificate exists.
 const NO_CA: &str = "intercept: no CA — run `parda ca create` (then `parda ca install`); \
@@ -362,6 +365,20 @@ impl Daemon {
                 }
             }
         };
+        // A replaced certificate sends no config change: notice it here, or
+        // the listener keeps signing with a CA the system no longer trusts.
+        let ca_watch = {
+            let shared = shared.clone();
+            async move {
+                let mut tick = tokio::time::interval(CA_CHECK_EVERY);
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let s = shared.clone();
+                    let _ = tokio::task::spawn_blocking(move || s.check_ca()).await;
+                }
+            }
+        };
         let mut stop_rx = shared.shutdown.subscribe();
         let _ = shared
             .events
@@ -377,6 +394,7 @@ impl Daemon {
             _ = stop_rx.wait_for(|stop| *stop) => Ok(()),
             _ = terminate_signal() => Ok(()),
             _ = prune => Ok(()),
+            _ = ca_watch => Ok(()),
         };
         let _ = shared.shutdown.send(true);
         // Both get the same 5 s to finish requests in progress.
@@ -488,6 +506,31 @@ impl Shared {
                 }
             }
         }
+    }
+
+    /// Whether the running listener signs with a root certificate other
+    /// than the one on disk (replaced or removed since it started).
+    fn ca_replaced(&self) -> bool {
+        lock(&self.intercept).as_ref().is_some_and(|run| {
+            std::fs::read_to_string(ca_store::ca_cert_path(&self.paths))
+                .map_or(true, |pem| pem != run.ca_pem)
+        })
+    }
+
+    /// Restart the listener with the certificate on disk when it was
+    /// replaced (on a timer and before every status answer). Blocking.
+    fn check_ca(&self) {
+        if !self.ca_replaced() {
+            return;
+        }
+        let _serial = lock(&self.config_lock);
+        let config = self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        tracing::info!("the root certificate changed; restarting the intercept listener");
+        self.sync_intercept(&config, false);
     }
 
     /// The system proxy still points AI sites at parda while nothing
@@ -702,6 +745,9 @@ impl DaemonHandle {
 
     fn status(&self) -> Response {
         let s = &self.shared;
+        // Never report a listener as healthy while it signs with a
+        // certificate that was replaced.
+        s.check_ca();
         let config = self.config();
         let proxy = *s.proxy_addr.read().unwrap_or_else(|e| e.into_inner());
         Response::ok(json!({
