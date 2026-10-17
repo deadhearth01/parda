@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use bytes::Bytes;
 use http::HeaderMap;
 use http::header::CONTENT_TYPE;
-use parda_core::{INTERCEPT_SCOPE_PER_HOST, InterceptConfig, UnscannedMedia};
+use parda_core::{InterceptConfig, InterceptScope, UnscannedMedia};
 use parda_engine::{Engine, EngineError};
 use parda_wire::body::{self, BodyError};
 use parda_wire::walk::preserve_numbers;
@@ -26,7 +26,7 @@ use crate::{BodyTransform, Refusal, StreamTransform};
 
 /// The settings one request uses (a snapshot of `[intercept]`).
 struct Settings {
-    /// A fixed vault scope, or `None` for one scope per site.
+    /// A fixed vault scope, or `None` for one scope per host.
     scope: Option<String>,
     unscanned: UnscannedMedia,
     skip_keys: Vec<String>,
@@ -47,7 +47,12 @@ impl Settings {
 
     fn from_config(cfg: &InterceptConfig) -> Self {
         Settings {
-            scope: (cfg.scope != INTERCEPT_SCOPE_PER_HOST).then(|| cfg.scope.clone()),
+            // A value the config loader would refuse (only possible when
+            // built in code) gets the narrowest scopes: one per host.
+            scope: match InterceptScope::parse(&cfg.scope) {
+                Ok(InterceptScope::Fixed(name)) => Some(name),
+                Ok(InterceptScope::PerHost) | Err(_) => None,
+            },
             unscanned: cfg.unscanned,
             skip_keys: cfg.skip_keys.clone(),
             hosts: HostList::new(&cfg.hosts),
@@ -2015,7 +2020,21 @@ pub(crate) mod tests {
         assert_eq!(e2.redact("Ravi Kumar", "global").unwrap().text, "[NAME_1]");
         let t2 = transform(&e2, |_| {});
         assert_eq!(answer(&t2, "claude.ai", "hi [NAME_1]"), "hi [NAME_1]");
-        // A fixed scope name is shared by every site.
+        // A fixed scope name is shared by every site: `global`, or
+        // `fixed:<name>` for the scope `<name>`; a value the config loader
+        // refuses gets one scope per host.
+        for (scope, want) in [
+            ("per-host", "intercept:claude.ai"),
+            ("global", "global"),
+            ("fixed:web", "web"),
+            ("fixed:global", "global"),
+            ("per_host", "intercept:claude.ai"),
+            ("web", "intercept:claude.ai"),
+            ("fixed:", "intercept:claude.ai"),
+        ] {
+            let t = transform(&e2, |c| c.scope = scope.into());
+            assert_eq!(t.settings().scope_for("claude.ai"), want, "{scope}");
+        }
         let t3 = transform(&e2, |c| c.scope = "global".into());
         assert_eq!(answer(&t3, "claude.ai", "hi [NAME_1]"), "hi Ravi Kumar");
         let out = rewrite(&t3, "claude.ai", "text/plain", Bytes::from("Ravi Kumar"));

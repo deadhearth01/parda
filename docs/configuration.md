@@ -49,7 +49,7 @@ enabled = false
 listen = "127.0.0.1:8788"
 hosts = ["chatgpt.com", "chat.openai.com", "claude.ai", "gemini.google.com", "copilot.microsoft.com",
          "perplexity.ai", "chat.deepseek.com", "chat.mistral.ai", "grok.com", "meta.ai", "poe.com"]
-scope = "per-host"                 # each site its own scope; or a fixed name, e.g. "global"
+scope = "per-host"                 # per-host (each host its own scope) | global | fixed:<name>
 unscanned = "allow"                # allow | block — file uploads and binary bodies
 skip_keys = []                     # extra identifier keys, e.g. ["trace_tag"]: identifier-shaped
                                    # values under them skip only the name model (rules still apply)
@@ -94,8 +94,10 @@ Tags follow `replace.style` (there is no separate style for intercept).
   `intercept:<host>` named by the exact host (for example `intercept:chatgpt.com`; a subdomain such
   as `x.chatgpt.com` gets a scope of its own). A site's answers can only restore tags that were
   issued for text sent to that same host — never names you sent to another site or subdomain, the
-  clipboard or the agent proxy. Any other value is a fixed scope shared by every site (`global` also
-  shares tags with the clipboard and the agent proxy).
+  clipboard or the agent proxy. `scope = "global"` shares one scope, `global`, across every site, the
+  clipboard and the agent proxy; `scope = "fixed:<name>"` shares the scope `<name>` across every site
+  (a name is 1 to 64 of `A-Z a-z 0-9 _ . : -`). Any other value (`per_host`, `web`) is an error when
+  the config loads, naming these three forms, so a typo never quietly shares one scope.
 - **Requests** to a listed site:
   - *What is read.* Every JSON string value and every JSON object key, at any depth (a key that holds
     a name is renamed where it stands). Form and query-string values, keys and value-less pieces
