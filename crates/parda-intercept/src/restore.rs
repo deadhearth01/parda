@@ -2234,6 +2234,11 @@ mod tests {
                 vec!["{".into(), " is a brace: \"C:\\x\" [NAME_1]".into()],
                 "{ is a brace: \"C:\\x\" Ravi Kumar".into(),
             ),
+            // JSON text that turns into prose goes on as it came.
+            (
+                vec!["[\"a\"".into(), "] and \"C:\\Users\" [NAME_1]".into()],
+                "[\"a\"] and \"C:\\Users\" [NAME_1]".into(),
+            ),
         ];
         for (deltas, want) in &cases {
             let refs: Vec<&str> = deltas.iter().map(String::as_str).collect();
