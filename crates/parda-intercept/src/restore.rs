@@ -1656,6 +1656,10 @@ impl Events {
         };
         if is_stop(&item, json.as_ref()) {
             self.flush_all(seq);
+        } else if looks_json && item.sse.is_some() && self.pending.contains(TEXT_KEY) {
+            // Not text, but it comes after the text held back: that text
+            // goes out first, into the event it came in.
+            self.flush_key(TEXT_KEY, seq);
         }
         let mut changed = false;
         match json.as_mut() {
@@ -2649,6 +2653,36 @@ mod tests {
         // it came (JSON lines are restored line by line).
         for ct in ["application/json", "text/plain"] {
             assert_eq!(run(&e, ct, broken.as_bytes(), 3), broken.as_bytes(), "{ct}");
+        }
+    }
+
+    /// Review finding: in a plain-text event stream, data that looks like
+    /// JSON is not text to restore, but the text held back before it must
+    /// go out before it, not after.
+    #[test]
+    fn plain_text_streams_keep_their_order_around_json_looking_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        for (deltas, want) in [
+            (vec!["say [", "\"hi\"", " ok"], "say [\"hi\" ok"),
+            (vec!["Hi [NA", "[1] see", " ME_1]"], "Hi [NA[1] see ME_1]"),
+            (
+                vec!["Hi [NA", "{\"x\": 1", " ME_1]"],
+                "Hi [NA{\"x\": 1 ME_1]",
+            ),
+            (
+                vec!["Hi [NA", "ME_1] said", "\"yes\"", " end"],
+                "Hi Ravi Kumar said\"yes\" end",
+            ),
+        ] {
+            let mut body = String::new();
+            for d in &deltas {
+                body.push_str(&format!("data: {d}\n\n"));
+            }
+            for n in [1, 5, 1000] {
+                let out = run(&e, "text/event-stream", body.as_bytes(), n);
+                assert_eq!(datas(&out).concat(), want, "{deltas:?} {n}");
+            }
         }
     }
 
