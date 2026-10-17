@@ -2803,6 +2803,7 @@ dependencies = [
  "parda-ml",
  "parda-proxy",
  "parda-vault",
+ "reqwest",
  "serde",
  "serde_json",
  "sha1",
