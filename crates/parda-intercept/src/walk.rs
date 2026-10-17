@@ -246,7 +246,7 @@ fn walk_value(
             let mut renamed = Vec::new();
             for (k, x) in map.iter_mut() {
                 let mut new_key = k.clone();
-                visit_key(&mut new_key, f);
+                visit_key(&mut new_key, rules, f);
                 walk_value(x, Some(k), rules.skip_key(k), depth, rules, f)?;
                 if new_key != *k {
                     renamed.push((k.clone(), new_key));
@@ -291,13 +291,17 @@ pub(crate) fn visit_body_text(
     visit_at(s, true, false, 0, rules, f)
 }
 
-/// Visit a key (a JSON object key, a form or query key): an
-/// identifier-shaped key skips only the ML model, anything else is text.
-fn visit_key(k: &mut String, f: Visit<'_>) {
+/// Visit a key (a JSON object key, a form or query key) by the rule values
+/// follow: it skips only the ML model when it is identifier-shaped and
+/// either looks like an identifier itself or is a known protocol key (the
+/// built-in identifier and content keys, the site's and `skip_keys`).
+/// Anything else is text, so a name used as a key reaches the model.
+fn visit_key(k: &mut String, rules: &Rules<'_>, f: Visit<'_>) {
     if k.trim().is_empty() {
         return;
     }
-    let tier = if id_shaped(k) {
+    let known = rules.skip_key(k) || is_content_key(k) || rules.is_identifier(k);
+    let tier = if id_shaped(k) && known {
         Tier::Identifier
     } else {
         Tier::Text
@@ -515,7 +519,7 @@ fn walk_form_at(
         };
         let key = decode_component(k_raw);
         let mut new_key = key.clone();
-        visit_key(&mut new_key, f);
+        visit_key(&mut new_key, rules, f);
         let mut value = decode_component(v_raw);
         let before = value.clone();
         visit_at(
@@ -986,18 +990,19 @@ mod tests {
             // Every string and every key is visited. Identifier-shaped
             // values under identifier keys (or looking like ids) skip only
             // the model; a value with a space or an `@` is text under any
-            // key; content keys (`parts`) are always text. Keys skip the
-            // model when identifier-shaped.
+            // key; content keys (`parts`) are always text. Keys follow the
+            // same rule: only known protocol keys (or id-looking ones) skip
+            // the model.
             [
                 "#action",
                 "#next",
-                "#messages",
+                "messages",
                 "#id",
                 "#aaa2b8c1-55f4-4bd2-9a1c-0123456789ab",
                 "#author",
                 "#role",
                 "#user",
-                "#name",
+                "name",
                 "Ravi Kumar",
                 "#content",
                 "#content_type",
@@ -1005,8 +1010,8 @@ mod tests {
                 "#parts",
                 "Email Ravi Kumar",
                 key,
-                "#metadata",
-                "#note",
+                "metadata",
+                "note",
                 "#deadbeef00112233deadbeef",
                 "#parent_message_id",
                 "#client-created-root",
@@ -1014,13 +1019,13 @@ mod tests {
                 "ravi.k@gmail.com",
                 "#type",
                 "Ravi Kumar",
-                "#timezone_offset_min",
+                "timezone_offset_min",
                 "#client_contextual_info",
-                "#page_title",
+                "page_title",
                 "x",
-                "#tags",
+                "tags",
                 "a",
-                "#ids",
+                "ids",
                 "#aaa2b8c1-55f4-4bd2-9a1c-0123456789ab",
             ]
         );
@@ -1128,14 +1133,14 @@ mod tests {
         assert_eq!(
             seen,
             [
-                "#f.req",
+                "f.req",
                 "Ravi Kumar",
                 "#at",
                 "#AJvLN6M:1697000000000",
                 "#q",
                 "Ravi Kumar",
                 "flag",
-                "#e",
+                "e",
                 "✓"
             ]
         );

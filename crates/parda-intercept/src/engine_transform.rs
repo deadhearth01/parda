@@ -1433,6 +1433,83 @@ pub(crate) mod tests {
         }
     }
 
+    /// Flags every "Priya" as a person (a name only the ML model knows) and
+    /// records each text it was shown.
+    pub(crate) struct NameMl(pub(crate) Mutex<Vec<String>>);
+
+    impl MlDetector for NameMl {
+        fn name(&self) -> &str {
+            "names"
+        }
+        fn detect_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<Detection>>> {
+            let mut seen = self.0.lock().unwrap();
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    seen.push(t.to_string());
+                    t.match_indices("Priya")
+                        .map(|(i, m)| Detection {
+                            span: parda_core::Span::new(i, i + m.len()),
+                            kind: parda_core::EntityKind::Person,
+                            score: 0.99,
+                            source: parda_core::Source::Ml,
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+    }
+
+    fn with_names(dir: &std::path::Path) -> (Arc<NameMl>, EngineTransform) {
+        let ml = Arc::new(NameMl(Mutex::new(Vec::new())));
+        let e = engine_with(dir, Some(ml.clone()), |c| c.detect.model = "names".into());
+        (ml, transform(&e, |_| {}))
+    }
+
+    /// Scan R5.1: a key skips the name model only when a value would (it is
+    /// identifier-shaped and looks like an id, or it is a known protocol
+    /// key); a one-word name used as a key is found like any text.
+    #[test]
+    fn name_like_keys_reach_the_name_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ml, t) = with_names(dir.path());
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            Bytes::from(r#"{"prompt":"hi","Priya":"x","m":{"PriyaSharma":1}}"#),
+        );
+        assert_eq!(
+            body_text(&out),
+            r#"{"prompt":"hi","[NAME_1]":"x","m":{"[NAME_1]Sharma":1}}"#
+        );
+        let form = "application/x-www-form-urlencoded";
+        let out = rewrite(&t, "chatgpt.com", form, Bytes::from("Priya_Sharma=1&q=hi"));
+        assert_eq!(body_text(&out), "%5BNAME_1%5D_Sharma=1&q=hi");
+        let out = t
+            .rewrite_request(
+                "chatgpt.com",
+                "/x?PriyaSharma=1",
+                &HeaderMap::new(),
+                Bytes::new(),
+            )
+            .unwrap();
+        assert_eq!(out.target.as_deref(), Some("/x?%5BNAME_1%5DSharma=1"));
+        // Known protocol keys (built-in, site and `skip_keys` lists) and
+        // id-looking keys still skip only the model.
+        ml.0.lock().unwrap().clear();
+        let ids = format!(r#"{{"conversation_id":"{UUID}","model":"auto","{UUID}":1}}"#);
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            Bytes::from(ids.clone()),
+        );
+        assert_eq!(body_text(&out), ids);
+        let seen = ml.0.lock().unwrap().clone();
+        assert!(seen.is_empty(), "{seen:?}");
+    }
+
     #[test]
     fn engine_failures_refuse_without_values() {
         let dir = tempfile::tempdir().unwrap();
