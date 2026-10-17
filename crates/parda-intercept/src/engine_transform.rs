@@ -18,7 +18,7 @@ use crate::hosts::HostList;
 use crate::server::MAX_REQUEST_BODY;
 use crate::sites;
 use crate::transform::RequestOutcome;
-use crate::walk::{Rules, Tier, Visit, walk_form, walk_json, walk_multipart};
+use crate::walk::{Rules, Tier, Visit, visit_body_text, walk_form, walk_json, walk_multipart};
 use crate::{BodyTransform, Refusal, StreamTransform};
 
 /// The settings one request uses (a snapshot of `[intercept]`).
@@ -114,7 +114,7 @@ impl EngineTransform {
             rules_only.push(tier == Tier::Identifier);
         };
         if let Some(q) = query {
-            walk_form(q, &rules, &mut collect);
+            walk_form(q, &rules, &mut collect).map_err(|_| unparseable())?;
         }
         let (_, unscanned) = body.walk(&rules, &mut collect)?;
         if unscanned > 0 && st.unscanned == UnscannedMedia::Block {
@@ -154,9 +154,12 @@ impl EngineTransform {
                 *s = t;
             }
         };
-        let target = query
-            .and_then(|q| walk_form(q, &rules, &mut assign))
-            .map(|q| format!("{path}?{q}"));
+        let target = match query {
+            Some(q) => walk_form(q, &rules, &mut assign)
+                .map_err(|_| unparseable())?
+                .map(|q| format!("{path}?{q}")),
+            None => None,
+        };
         let (new_body, _) = body.walk(&rules, &mut assign)?;
         Ok(RequestOutcome {
             body: new_body.unwrap_or_else(|| body.into_bytes()),
@@ -207,30 +210,44 @@ impl ReqBody {
             return Ok(ReqBody::Empty);
         }
         let (media, boundary) = media_type(headers);
-        let text = || String::from_utf8(raw.to_vec()).ok();
-        Ok(match media.as_str() {
-            m if is_json(m) => {
-                let value = body::parse_json(&raw).map_err(|_| unparseable())?;
-                ReqBody::Json { raw, value }
+        if is_json(&media) {
+            let value = body::parse_json_unique(&raw).map_err(|_| unparseable())?;
+            return Ok(ReqBody::Json { raw, value });
+        }
+        if media == "multipart/form-data" {
+            return match boundary {
+                Some(boundary) => Ok(ReqBody::Multipart { raw, boundary }),
+                None => Err(unparseable()),
+            };
+        }
+        // Whatever the type says, a JSON object or array is walked as JSON:
+        // sites post JSON as text/plain to skip CORS preflights, jQuery
+        // labels it as a form, others as octet-stream.
+        if let Some(value) = json_container(&raw)? {
+            return Ok(ReqBody::Json { raw, value });
+        }
+        let form = media == "application/x-www-form-urlencoded";
+        let typed_text = media.starts_with("text/");
+        if !(form || typed_text || media.is_empty()) {
+            return Ok(ReqBody::Opaque(raw));
+        }
+        let Ok(text) = String::from_utf8(raw.to_vec()) else {
+            // A form or text in another charset cannot be filtered; an
+            // untyped body that is not UTF-8 is binary data.
+            if form || typed_text {
+                return Err(refusal(
+                    400,
+                    "parda_not_utf8",
+                    "the request body is not UTF-8 text, so parda could not filter it; it was \
+                     not sent",
+                ));
             }
-            "application/x-www-form-urlencoded" => match text() {
-                Some(t) => ReqBody::Form(t),
-                None => ReqBody::Opaque(raw),
-            },
-            "multipart/form-data" => match boundary {
-                Some(boundary) => ReqBody::Multipart { raw, boundary },
-                None => return Err(unparseable()),
-            },
-            // No type, or text: JSON is walked by the JSON rules (sites post
-            // JSON as text/plain to avoid CORS preflights), other text whole.
-            m if m.is_empty() || m.starts_with("text/") => match json_container(&raw) {
-                Some(value) => ReqBody::Json { raw, value },
-                None => match text() {
-                    Some(t) => ReqBody::Text(t),
-                    None => ReqBody::Opaque(raw),
-                },
-            },
-            _ => ReqBody::Opaque(raw),
+            return Ok(ReqBody::Opaque(raw));
+        };
+        Ok(if form || form_encoded(&text) {
+            ReqBody::Form(text)
+        } else {
+            ReqBody::Text(text)
         })
     }
 
@@ -245,20 +262,23 @@ impl ReqBody {
                     let before = t.clone();
                     f(t, tier);
                     changed |= *t != before;
-                });
+                })
+                .map_err(|_| unparseable())?;
                 let out = changed.then(|| {
                     let json = serde_json::to_vec(value).unwrap_or_default();
                     Bytes::from(preserve_numbers(raw, json))
                 });
                 (out, 0)
             }
-            ReqBody::Form(text) => (walk_form(text, rules, f).map(Bytes::from), 0),
+            ReqBody::Form(text) => (
+                walk_form(text, rules, f)
+                    .map_err(|_| unparseable())?
+                    .map(Bytes::from),
+                0,
+            ),
             ReqBody::Text(text) => {
-                if text.trim().is_empty() {
-                    return Ok((None, 0));
-                }
                 let mut t = text.clone();
-                f(&mut t, Tier::Text);
+                visit_body_text(&mut t, rules, f).map_err(|_| unparseable())?;
                 ((t != *text).then(|| Bytes::from(t)), 0)
             }
             ReqBody::Multipart { raw, boundary } => {
@@ -285,13 +305,37 @@ fn is_json(media: &str) -> bool {
     media == "application/json" || media == "text/json" || media.ends_with("+json")
 }
 
-/// A JSON object or array, if `raw` is one.
-fn json_container(raw: &[u8]) -> Option<Value> {
-    let start = raw.iter().find(|b| !b.is_ascii_whitespace())?;
-    if !matches!(start, b'{' | b'[') {
-        return None;
+/// A JSON object or array, if `raw` is one (after a BOM and whitespace).
+/// JSON that names a key twice is refused.
+fn json_container(raw: &[u8]) -> Result<Option<Value>, Refusal> {
+    let start = raw
+        .strip_prefix(b"\xEF\xBB\xBF")
+        .unwrap_or(raw)
+        .iter()
+        .find(|b| !b.is_ascii_whitespace());
+    if !matches!(start, Some(b'{' | b'[')) {
+        return Ok(None);
     }
-    body::parse_json(raw).ok()
+    match body::parse_json_unique(raw) {
+        Ok(v) => Ok(Some(v)),
+        Err(body::JsonError::Invalid) => Ok(None),
+        Err(body::JsonError::DuplicateKey) => Err(unparseable()),
+    }
+}
+
+/// Text that reads as `application/x-www-form-urlencoded`: only characters a
+/// form encoder leaves as they are (no whitespace), with at least one `=`,
+/// `+` or `%XX` escape. Such a body is walked as a form so that `+` and
+/// `%40` do not hide a name or an e-mail from the rules.
+fn form_encoded(text: &str) -> bool {
+    let b = text.as_bytes();
+    let charset = b
+        .iter()
+        .all(|c| c.is_ascii_alphanumeric() || b"-._~!$'()*,;:@/?=&+%".contains(c));
+    let escaped = b
+        .windows(3)
+        .any(|w| w[0] == b'%' && w[1].is_ascii_hexdigit() && w[2].is_ascii_hexdigit());
+    !b.is_empty() && charset && (escaped || b.contains(&b'=') || b.contains(&b'+'))
 }
 
 /// The media type (lower-case, without parameters) and the multipart
@@ -760,6 +804,274 @@ pub(crate) mod tests {
             Bytes::from(mp),
         );
         assert_eq!(out.body, mp.replace("Ravi Kumar", "[NAME_1]"));
+    }
+
+    fn body_text(out: &RequestOutcome) -> String {
+        String::from_utf8(out.body.to_vec()).unwrap()
+    }
+
+    fn assert_unparseable(r: &Refusal) {
+        assert_eq!(r.status, 400, "{}", r.message);
+        assert!(
+            r.message.starts_with("parda_unparseable_body"),
+            "{}",
+            r.message
+        );
+        assert!(!r.message.contains("Ravi") && !r.message.contains("ravi"));
+    }
+
+    /// Reviewer probes (I3): keys and value-less pieces of forms and query
+    /// strings, and JSON object keys, are text like any value.
+    #[test]
+    fn keys_and_bare_pieces_are_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        let form = "application/x-www-form-urlencoded";
+        let out = rewrite(&t, "chatgpt.com", form, Bytes::from("q=hi&Ravi%20Kumar"));
+        assert_eq!(body_text(&out), "q=hi&%5BNAME_1%5D");
+        assert_eq!(out.counts.get("Person"), Some(&1));
+        let out = rewrite(&t, "chatgpt.com", form, Bytes::from("Ravi+Kumar=1&n=2"));
+        assert_eq!(body_text(&out), "%5BNAME_1%5D=1&n=2");
+        let out = t
+            .rewrite_request(
+                "chatgpt.com",
+                "/search?Ravi%20Kumar",
+                &HeaderMap::new(),
+                Bytes::new(),
+            )
+            .unwrap();
+        assert_eq!(out.target.as_deref(), Some("/search?%5BNAME_1%5D"));
+        let out = t
+            .rewrite_request(
+                "chatgpt.com",
+                "/s?Ravi+Kumar=x&ravi%40example.com",
+                &HeaderMap::new(),
+                Bytes::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            out.target.as_deref(),
+            Some("/s?%5BNAME_1%5D=x&%5BEMAIL_1%5D")
+        );
+        // JSON object keys, at any depth and inside JSON-in-strings; the
+        // order of the keys is kept.
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            Bytes::from(r#"{"a":1,"Ravi Kumar":"x","m":{"ravi@example.com":[1]},"z":2}"#),
+        );
+        assert_eq!(
+            body_text(&out),
+            r#"{"a":1,"[NAME_1]":"x","m":{"[EMAIL_1]":[1]},"z":2}"#
+        );
+        let inner = r#"{"Ravi Kumar":0}"#;
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            json_body(&json!({ "blob": inner })),
+        );
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["blob"], r#"{"[NAME_1]":0}"#);
+        // Identifier keys and values stay byte-identical.
+        let ids =
+            format!(r#"{{"conversation_id":"{UUID}","parent_message_id":"client-created-root"}}"#);
+        assert_eq!(
+            body_text(&rewrite(
+                &t,
+                "chatgpt.com",
+                "application/json",
+                Bytes::from(ids.clone())
+            )),
+            ids
+        );
+        let plain = "f.req=x&at=AJvLN6M%3A1697000000000&flag&e=%E2%9C%93";
+        assert_eq!(
+            body_text(&rewrite(&t, "chatgpt.com", form, Bytes::from(plain))),
+            plain
+        );
+    }
+
+    /// Reviewer probes (I3, M5): a JSON object or array is walked as JSON
+    /// whatever the request says its type is.
+    #[test]
+    fn json_bodies_are_sniffed_under_any_content_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        let body =
+            format!(r#"{{"prompt":"Ravi Kumar, mail ravi@example.com","id":"{UUID}","n":1.50}}"#);
+        let want = body.replace(
+            "Ravi Kumar, mail ravi@example.com",
+            "[NAME_1], mail [EMAIL_1]",
+        );
+        for ct in [
+            "application/x-www-form-urlencoded",
+            "application/x-www-form-urlencoded; charset=UTF-8",
+            "application/octet-stream",
+            "application/x-json",
+            "application/javascript",
+            "image/png",
+            "text/plain",
+            "",
+        ] {
+            let out = rewrite(&t, "chatgpt.com", ct, Bytes::from(body.clone()));
+            assert_eq!(body_text(&out), want, "{ct}");
+            assert_eq!(out.unscanned, 0, "{ct}");
+        }
+        let arr = "\u{feff}[\"Ravi Kumar\"]";
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/octet-stream",
+            Bytes::from(arr),
+        );
+        assert_eq!(body_text(&out), "[\"[NAME_1]\"]");
+        // Anything else of an opaque type is still forwarded unscanned.
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/octet-stream",
+            Bytes::from("{x"),
+        );
+        assert_eq!((body_text(&out).as_str(), out.unscanned), ("{x", 1));
+    }
+
+    /// Reviewer probes (I3, M4): a form or text body that is not UTF-8
+    /// cannot be filtered, so it is refused.
+    #[test]
+    fn non_utf8_form_and_text_bodies_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        for (ct, body) in [
+            (
+                "application/x-www-form-urlencoded",
+                &b"q=Ravi+Kumar&x=\xff"[..],
+            ),
+            ("text/plain; charset=iso-8859-1", b"Ravi Kumar caf\xe9"),
+            ("text/plain", b"Ravi Kumar \xc3"),
+        ] {
+            let r = refusal(&t, ct, Bytes::copy_from_slice(body));
+            assert_eq!(r.status, 400, "{ct}: {}", r.message);
+            assert!(r.message.starts_with("parda_not_utf8"), "{}", r.message);
+            assert!(!r.message.contains("Ravi"));
+        }
+        // An untyped binary body is not text: forwarded, counted unscanned.
+        let out = rewrite(&t, "chatgpt.com", "", Bytes::from_static(b"\x89PNG\xff"));
+        assert_eq!(out.unscanned, 1);
+    }
+
+    /// Reviewer probe (M1): serde keeps the last of two equal keys, so the
+    /// first would go out unvisited. Such JSON is refused, also inside
+    /// strings and forms.
+    #[test]
+    fn duplicate_json_keys_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        let dup = r#"{"prompt":"Ravi Kumar","prompt":"hello"}"#;
+        for (ct, body) in [
+            ("application/json", dup.to_string()),
+            ("text/plain", dup.to_string()),
+            ("application/octet-stream", dup.to_string()),
+            ("application/json", r#"{"m":[{"a":1,"a":2}]}"#.to_string()),
+            ("application/json", json!({ "blob": dup }).to_string()),
+            (
+                "application/json",
+                json!([[null, json!([dup]).to_string()]]).to_string(),
+            ),
+            (
+                "application/x-www-form-urlencoded",
+                format!(
+                    "f.req={}",
+                    form_urlencoded::byte_serialize(json!([null, dup]).to_string().as_bytes())
+                        .collect::<String>()
+                ),
+            ),
+            (
+                "application/json",
+                json!({"u": format!("https://x.example/?d={}",
+                    form_urlencoded::byte_serialize(dup.as_bytes()).collect::<String>())})
+                .to_string(),
+            ),
+        ] {
+            assert_unparseable(&refusal(&t, ct, Bytes::from(body)));
+        }
+        // Typed into a message, JSON is text: redacted as written.
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            json_body(&json!({ "prompt": dup })),
+        );
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["prompt"], dup.replace("Ravi Kumar", "[NAME_1]"));
+    }
+
+    /// Reviewer probes (I4, M4): percent-encoding hides an e-mail from the
+    /// rules, so URL queries inside bodies are decoded and redacted like
+    /// the request target, and form-encoded text bodies are walked as forms.
+    #[test]
+    fn url_queries_and_form_encoded_text_are_decoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            Bytes::from(
+                r#"{"href":"https://www.perplexity.ai/search?q=mail%20jdoe%40corp.example%20about%20it#x","id":"https://chatgpt.com/c/1?r=2"}"#,
+            ),
+        );
+        assert_eq!(
+            body_text(&out),
+            r#"{"href":"https://www.perplexity.ai/search?q=mail+%5BEMAIL_1%5D+about+it#x","id":"https://chatgpt.com/c/1?r=2"}"#
+        );
+        // A URL inside prose, in a JSON string or a text body.
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "text/plain",
+            Bytes::from("see https://x.example/p?n=Ravi+Kumar&m=ravi%40example.com#top now"),
+        );
+        assert_eq!(
+            body_text(&out),
+            "see https://x.example/p?n=%5BNAME_1%5D&m=%5BEMAIL_2%5D#top now"
+        );
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            json_body(&json!({"prompt": "read HTTPS://x.example/?q=ravi%40example.com please"})),
+        );
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(
+            v["prompt"],
+            "read HTTPS://x.example/?q=%5BEMAIL_2%5D please"
+        );
+        // Form-encoded text, with or without a content type.
+        for ct in ["text/plain", "text/plain;charset=UTF-8", ""] {
+            let out = rewrite(
+                &t,
+                "chatgpt.com",
+                ct,
+                Bytes::from("prompt=Ravi+Kumar&mail=ravi%40example.com"),
+            );
+            assert_eq!(
+                body_text(&out),
+                "prompt=%5BNAME_1%5D&mail=%5BEMAIL_2%5D",
+                "{ct}"
+            );
+            let out = rewrite(&t, "chatgpt.com", ct, Bytes::from("ravi%40example.com"));
+            assert_eq!(body_text(&out), "%5BEMAIL_2%5D", "{ct}");
+        }
+        // Prose stays prose.
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "text/plain",
+            Bytes::from("1+1=2, Ravi Kumar"),
+        );
+        assert_eq!(body_text(&out), "1+1=2, [NAME_1]");
     }
 
     /// Restore `body` as the answer of `host`.

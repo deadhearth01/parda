@@ -4,12 +4,13 @@
 //! Redaction walks a request twice in the same order: once to collect the
 //! texts (one engine batch), once to write the results back.
 //!
-//! Nothing is skipped: every string is visited. Identifiers a site needs
+//! Nothing is skipped: every string and every key is visited. Identifiers a site needs
 //! verbatim (values under identifier keys, or identifier-looking values) are
 //! visited as [`Tier::Identifier`] — the engine's dictionary and rule tiers
 //! still see them, only the ML model does not — and only when they are
 //! identifier-shaped ([`id_shaped`]); anything else is text.
 
+use parda_wire::body::JsonError;
 use serde_json::Value;
 
 use crate::hosts::HostList;
@@ -213,9 +214,15 @@ impl Rules<'_> {
     }
 }
 
-/// Visit every text in a JSON document.
-pub(crate) fn walk_json(v: &mut Value, rules: &Rules<'_>, f: Visit<'_>) {
-    walk_value(v, None, false, 0, rules, f);
+/// A request parda cannot filter safely: a multipart body it cannot split,
+/// JSON that names a key twice (here or inside a string), or two JSON keys
+/// that would become the same tag.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Malformed;
+
+/// Visit every text in a JSON document: its strings and its object keys.
+pub(crate) fn walk_json(v: &mut Value, rules: &Rules<'_>, f: Visit<'_>) -> Result<(), Malformed> {
+    walk_value(v, None, false, 0, rules, f)
 }
 
 /// `skipped`: the value sits under an identifier key (its strings and arrays
@@ -227,45 +234,108 @@ fn walk_value(
     depth: usize,
     rules: &Rules<'_>,
     f: Visit<'_>,
-) {
+) -> Result<(), Malformed> {
     match v {
-        Value::String(s) => visit_at(s, key, skipped, depth, rules, f),
-        Value::Array(items) => {
-            for x in items {
-                walk_value(x, key, skipped, depth, rules, f);
-            }
-        }
+        Value::String(s) => visit_at(s, key.is_some_and(is_content_key), skipped, depth, rules, f),
+        Value::Array(items) => items
+            .iter_mut()
+            .try_for_each(|x| walk_value(x, key, skipped, depth, rules, f)),
         Value::Object(map) => {
+            // Keys are text too (`{"Ravi Kumar": …}`). A changed key is
+            // renamed after the walk, so both passes see the same order.
+            let mut renamed = Vec::new();
             for (k, x) in map.iter_mut() {
-                let skip = rules.skip_key(k);
-                walk_value(x, Some(k), skip, depth, rules, f);
+                let mut new_key = k.clone();
+                visit_key(&mut new_key, f);
+                walk_value(x, Some(k), rules.skip_key(k), depth, rules, f)?;
+                if new_key != *k {
+                    renamed.push((k.clone(), new_key));
+                }
             }
+            if !renamed.is_empty() {
+                let old = std::mem::take(map);
+                let mut renamed: std::collections::HashMap<_, _> = renamed.into_iter().collect();
+                for (k, x) in old {
+                    let k = renamed.remove(&k).unwrap_or(k);
+                    if map.contains_key(&k) {
+                        return Err(Malformed);
+                    }
+                    map.insert(k, x);
+                }
+            }
+            Ok(())
         }
-        _ => {}
+        _ => Ok(()),
     }
 }
 
 /// Visit one string value found under `key`.
-pub(crate) fn visit_text(s: &mut String, key: Option<&str>, rules: &Rules<'_>, f: Visit<'_>) {
-    let skipped = key.is_some_and(|k| rules.skip_key(k));
-    visit_at(s, key, skipped, 0, rules, f);
-}
-
-fn visit_at(
+pub(crate) fn visit_text(
     s: &mut String,
     key: Option<&str>,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<(), Malformed> {
+    let content = key.is_some_and(is_content_key);
+    let skipped = key.is_some_and(|k| rules.skip_key(k));
+    visit_at(s, content, skipped, 0, rules, f)
+}
+
+/// Visit a text body: what the user typed, never an identifier, but JSON
+/// and URLs in it are opened like anywhere else.
+pub(crate) fn visit_body_text(
+    s: &mut String,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<(), Malformed> {
+    visit_at(s, true, false, 0, rules, f)
+}
+
+/// Visit a key (a JSON object key, a form or query key): an
+/// identifier-shaped key skips only the ML model, anything else is text.
+fn visit_key(k: &mut String, f: Visit<'_>) {
+    if k.trim().is_empty() {
+        return;
+    }
+    let tier = if id_shaped(k) {
+        Tier::Identifier
+    } else {
+        Tier::Text
+    };
+    f(k, tier);
+}
+
+/// `content`: what the user typed (a content key, a text body); `depth`:
+/// how many JSON-in-string or URL-query levels this string sits in.
+fn visit_at(
+    s: &mut String,
+    content: bool,
     skipped: bool,
     depth: usize,
     rules: &Rules<'_>,
     f: Visit<'_>,
-) {
+) -> Result<(), Malformed> {
     if s.trim().is_empty() {
-        return;
+        return Ok(());
     }
-    let content = key.is_some_and(is_content_key);
     // JSON inside a string is opened; past the depth limit (or when it does
-    // not parse) the string is text like any other.
-    if !content && depth < MAX_NESTED_JSON && nested_json(s, depth, rules, f) {
+    // not parse) the string is text like any other. JSON typed into a
+    // message is text.
+    if !content && depth < MAX_NESTED_JSON && nested_json(s, depth, rules, f)? {
+        return Ok(());
+    }
+    // So are the queries of URLs in it: percent-encoding hides an e-mail
+    // from the rules.
+    if depth < MAX_NESTED_JSON && url_queries(s, content, skipped, depth, rules, f)? {
+        return Ok(());
+    }
+    visit_plain(s, content, skipped, rules, f);
+    Ok(())
+}
+
+/// Visit `s` as one text (no JSON or URL opened).
+fn visit_plain(s: &mut String, content: bool, skipped: bool, rules: &Rules<'_>, f: Visit<'_>) {
+    if s.trim().is_empty() {
         return;
     }
     let tier = if !content && id_shaped(s) && (skipped || rules.is_identifier(s)) {
@@ -277,16 +347,24 @@ fn visit_at(
 }
 
 /// If `s` holds a JSON object or array, walk it and re-serialise it when a
-/// text inside changed. Returns false when `s` is not JSON.
-fn nested_json(s: &mut String, depth: usize, rules: &Rules<'_>, f: Visit<'_>) -> bool {
+/// text inside changed. Returns false when `s` is not JSON; JSON with a
+/// repeated key is refused.
+fn nested_json(
+    s: &mut String,
+    depth: usize,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<bool, Malformed> {
     let t = s.trim();
     let bracketed =
         (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']'));
     if !bracketed {
-        return false;
+        return Ok(false);
     }
-    let Ok(mut inner) = serde_json::from_str::<Value>(s) else {
-        return false;
+    let mut inner = match parda_wire::body::parse_json_unique(s.as_bytes()) {
+        Ok(v) => v,
+        Err(JsonError::Invalid) => return Ok(false),
+        Err(JsonError::DuplicateKey) => return Err(Malformed),
     };
     let mut changed = false;
     walk_value(
@@ -300,13 +378,91 @@ fn nested_json(s: &mut String, depth: usize, rules: &Rules<'_>, f: Visit<'_>) ->
             f(t, tier);
             changed |= *t != before;
         },
-    );
+    )?;
     if changed {
         let out = parda_wire::walk::preserve_numbers(s.as_bytes(), inner.to_string().into_bytes());
         *s = String::from_utf8(out)
             .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
     }
-    true
+    Ok(true)
+}
+
+/// The byte ranges of the queries (after `?`, before `#`) of the `http://`
+/// and `https://` URLs in `s`. A URL runs to whitespace, a quote or `<`/`>`.
+fn url_query_spans(s: &str) -> Vec<(usize, usize)> {
+    let b = s.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let rest = &b[i..];
+        let scheme = if rest.len() >= 8 && rest[..8].eq_ignore_ascii_case(b"https://") {
+            8
+        } else if rest.len() >= 7 && rest[..7].eq_ignore_ascii_case(b"http://") {
+            7
+        } else {
+            0
+        };
+        let starts_word = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+        if scheme == 0 || !starts_word {
+            i += 1;
+            continue;
+        }
+        // The URL's end, by characters (whitespace may be non-ASCII).
+        let end = s[i..]
+            .char_indices()
+            .find(|&(_, c)| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`'))
+            .map_or(s.len(), |(j, _)| i + j);
+        let url = &b[i + scheme..end];
+        if let Some(q) = url.iter().position(|&c| c == b'?') {
+            let start = i + scheme + q + 1;
+            let stop = b[start..end]
+                .iter()
+                .position(|&c| c == b'#')
+                .map_or(end, |h| start + h);
+            if stop > start {
+                spans.push((start, stop));
+            }
+        }
+        i = end.max(i + 1);
+    }
+    spans
+}
+
+/// If `s` holds URLs with queries, visit the text around them as usual and
+/// each query as a form (decoded keys and values, re-encoded when changed).
+/// Returns false when there is no such URL.
+fn url_queries(
+    s: &mut String,
+    content: bool,
+    skipped: bool,
+    depth: usize,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<bool, Malformed> {
+    let spans = url_query_spans(s);
+    if spans.is_empty() {
+        return Ok(false);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0;
+    for (start, stop) in spans {
+        // The text before the query, without its `?`.
+        let mut text = s[last..start - 1].to_string();
+        visit_plain(&mut text, content, skipped, rules, f);
+        out.push_str(&text);
+        out.push('?');
+        let query = &s[start..stop];
+        match walk_form_at(query, depth + 1, rules, f)? {
+            Some(new) => out.push_str(&new),
+            None => out.push_str(query),
+        }
+        last = stop;
+    }
+    let mut text = s[last..].to_string();
+    visit_plain(&mut text, content, skipped, rules, f);
+    out.push_str(&text);
+    *s = out;
+    Ok(true)
 }
 
 /// One form-encoded component: `+` is a space, `%XX` a byte.
@@ -317,10 +473,28 @@ fn decode_component(s: &str) -> String {
         .into_owned()
 }
 
-/// Visit the values of a form-encoded string (a body or a query). Returns
-/// the rewritten string when a value changed; pairs that did not change keep
+fn encode_component(s: &str) -> String {
+    form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+/// Visit the keys and values of a form-encoded string (a body or a query);
+/// a piece without `=` is a text of its own. Returns the rewritten string
+/// when something changed; keys, values and pieces that did not change keep
 /// their exact bytes.
-pub(crate) fn walk_form(raw: &str, rules: &Rules<'_>, f: Visit<'_>) -> Option<String> {
+pub(crate) fn walk_form(
+    raw: &str,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<Option<String>, Malformed> {
+    walk_form_at(raw, 0, rules, f)
+}
+
+fn walk_form_at(
+    raw: &str,
+    depth: usize,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<Option<String>, Malformed> {
     let mut out = String::with_capacity(raw.len());
     let mut changed = false;
     for (i, piece) in raw.split('&').enumerate() {
@@ -328,28 +502,46 @@ pub(crate) fn walk_form(raw: &str, rules: &Rules<'_>, f: Visit<'_>) -> Option<St
             out.push('&');
         }
         let Some((k_raw, v_raw)) = piece.split_once('=') else {
-            out.push_str(piece);
+            let mut text = decode_component(piece);
+            let before = text.clone();
+            visit_at(&mut text, false, false, depth, rules, f)?;
+            if text == before {
+                out.push_str(piece);
+            } else {
+                changed = true;
+                out.push_str(&encode_component(&text));
+            }
             continue;
         };
         let key = decode_component(k_raw);
+        let mut new_key = key.clone();
+        visit_key(&mut new_key, f);
         let mut value = decode_component(v_raw);
         let before = value.clone();
-        visit_text(&mut value, Some(&key), rules, f);
-        if value == before {
-            out.push_str(piece);
+        visit_at(
+            &mut value,
+            is_content_key(&key),
+            rules.skip_key(&key),
+            depth,
+            rules,
+            f,
+        )?;
+        if new_key == key {
+            out.push_str(k_raw);
         } else {
             changed = true;
-            out.push_str(k_raw);
-            out.push('=');
-            out.extend(form_urlencoded::byte_serialize(value.as_bytes()));
+            out.push_str(&encode_component(&new_key));
+        }
+        out.push('=');
+        if value == before {
+            out.push_str(v_raw);
+        } else {
+            changed = true;
+            out.push_str(&encode_component(&value));
         }
     }
-    changed.then_some(out)
+    Ok(changed.then_some(out))
 }
-
-/// A multipart body parda cannot split into parts.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Malformed;
 
 /// What a multipart walk did.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -444,7 +636,7 @@ pub(crate) fn walk_multipart(
             match std::str::from_utf8(content) {
                 Ok(text) => {
                     let mut value = text.to_string();
-                    visit_text(&mut value, name.as_deref(), rules, f);
+                    visit_text(&mut value, name.as_deref(), rules, f)?;
                     if value != text {
                         new = Some(value);
                     }
@@ -492,7 +684,7 @@ mod tests {
     /// The texts visited, identifiers marked with a leading `#`.
     fn collect_json(v: &mut Value, r: &Rules<'_>) -> Vec<String> {
         let mut out = Vec::new();
-        walk_json(v, r, &mut |s: &mut String, tier| out.push(mark(s, tier)));
+        walk_json(v, r, &mut |s: &mut String, tier| out.push(mark(s, tier))).unwrap();
         out
     }
 
@@ -659,24 +851,44 @@ mod tests {
         });
         assert_eq!(
             collect_json(&mut v, &r),
-            // Every string is visited. Identifier-shaped values under
-            // identifier keys (or looking like ids) skip only the model; a
-            // value with a space or an `@` is text under any key; content
-            // keys (`parts`) are always text.
+            // Every string and every key is visited. Identifier-shaped
+            // values under identifier keys (or looking like ids) skip only
+            // the model; a value with a space or an `@` is text under any
+            // key; content keys (`parts`) are always text. Keys skip the
+            // model when identifier-shaped.
             [
+                "#action",
                 "#next",
+                "#messages",
+                "#id",
                 "#aaa2b8c1-55f4-4bd2-9a1c-0123456789ab",
+                "#author",
+                "#role",
                 "#user",
+                "#name",
                 "Ravi Kumar",
+                "#content",
+                "#content_type",
                 "#text",
+                "#parts",
                 "Email Ravi Kumar",
                 key,
+                "#metadata",
+                "#note",
                 "#deadbeef00112233deadbeef",
+                "#parent_message_id",
                 "#client-created-root",
+                "#model",
                 "ravi.k@gmail.com",
+                "#type",
                 "Ravi Kumar",
+                "#timezone_offset_min",
+                "#client_contextual_info",
+                "#page_title",
                 "x",
+                "#tags",
                 "a",
+                "#ids",
                 "#aaa2b8c1-55f4-4bd2-9a1c-0123456789ab",
             ]
         );
@@ -696,7 +908,8 @@ mod tests {
             if s.starts_with("Ravi") {
                 upper(s, t)
             }
-        });
+        })
+        .unwrap();
         assert_eq!(
             v[1],
             r#"[["RAVI KUMAR HERE",0,null,1e2],["en"],["c_1a2b3c","r_9f8e7d"]]"#
@@ -704,11 +917,14 @@ mod tests {
         // Unchanged JSON-in-string keeps its exact text.
         let spaced = r#"{ "a" : "x" }"#;
         let mut v = json!({"blob": spaced});
-        walk_json(&mut v, &r, &mut |_, _| {});
+        walk_json(&mut v, &r, &mut |_, _| {}).unwrap();
         assert_eq!(v["blob"], spaced);
         // JSON typed into a content field is text: its keys get no say.
         let mut v = json!({"prompt": r#"{"id": "Ravi Kumar"}"#});
-        assert_eq!(collect_json(&mut v, &r), [r#"{"id": "Ravi Kumar"}"#]);
+        assert_eq!(
+            collect_json(&mut v, &r),
+            ["#prompt", r#"{"id": "Ravi Kumar"}"#]
+        );
         // Nesting beyond the limit is visited as text, never skipped.
         let mut s = String::from("\"deep Ravi\"");
         for _ in 0..6 {
@@ -721,6 +937,50 @@ mod tests {
     }
 
     #[test]
+    fn renamed_keys_keep_their_place_and_never_merge() {
+        let h = hosts();
+        let r = rules(&h, &[], "chatgpt.com");
+        let tag = |s: &mut String, _: Tier| {
+            if s.starts_with("Ravi") || s.starts_with("ravi") {
+                *s = "[NAME_1]".into();
+            }
+        };
+        let mut v = json!({"a": 1, "Ravi Kumar": {"ravi k": 2}, "z": 3});
+        walk_json(&mut v, &r, &mut { tag }).unwrap();
+        assert_eq!(v.to_string(), r#"{"a":1,"[NAME_1]":{"[NAME_1]":2},"z":3}"#);
+        // Two keys that would become the same text: one value would be
+        // lost, so the body is refused.
+        for mut v in [
+            json!({"Ravi Kumar": 1, "ravi kumar": 2}),
+            json!({"Ravi Kumar": 1, "[NAME_1]": 2}),
+            json!([{"x": {"[NAME_1]": 1, "Ravi": 2}}]),
+        ] {
+            assert_eq!(walk_json(&mut v, &r, &mut { tag }), Err(Malformed));
+        }
+        // JSON repeating a key inside a string is refused too.
+        let mut v = json!({"blob": r#"{"a":"x","a":"Ravi"}"#});
+        assert_eq!(walk_json(&mut v, &r, &mut { tag }), Err(Malformed));
+    }
+
+    #[test]
+    fn url_queries_in_strings_are_found() {
+        fn spans(s: &str) -> Vec<&str> {
+            url_query_spans(s)
+                .into_iter()
+                .map(|(a, b)| &s[a..b])
+                .collect()
+        }
+        assert_eq!(spans("https://a.example/p?q=1#f"), ["q=1"]);
+        assert_eq!(
+            spans("x HTTP://a/?b=c d \"https://e/?f\" https://g/h #?i"),
+            ["b=c", "f"]
+        );
+        assert_eq!(spans("https://a/b\u{a0}?c https://a/?"), Vec::<&str>::new());
+        assert_eq!(spans("xhttps://a/?b ftp://a/?b https://é/?ü=1"), ["ü=1"]);
+        assert!(spans("no url ?q=1").is_empty());
+    }
+
+    #[test]
     fn form_values_are_rewritten_exactly() {
         let h = hosts();
         let r = rules(&h, &[], "gemini.google.com");
@@ -730,17 +990,29 @@ mod tests {
         let mut seen = Vec::new();
         assert_eq!(
             walk_form(&raw, &r, &mut |s: &mut String, t| seen.push(mark(s, t))),
-            None
+            Ok(None)
         );
+        // Keys too; a piece without `=` is a text of its own.
         assert_eq!(
             seen,
-            ["Ravi Kumar", "#AJvLN6M:1697000000000", "Ravi Kumar", "✓"]
+            [
+                "#f.req",
+                "Ravi Kumar",
+                "#at",
+                "#AJvLN6M:1697000000000",
+                "#q",
+                "Ravi Kumar",
+                "flag",
+                "#e",
+                "✓"
+            ]
         );
         let out = walk_form(&raw, &r, &mut |s: &mut String, t| {
             if s.starts_with("Ravi") {
                 upper(s, t)
             }
         })
+        .unwrap()
         .unwrap();
         let pairs: Vec<(String, String)> = form_urlencoded::parse(out.as_bytes())
             .into_owned()
