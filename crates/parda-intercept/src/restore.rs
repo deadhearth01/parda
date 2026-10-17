@@ -174,7 +174,7 @@ impl StreamTransform for Passthrough {
 
 /// Plain text, or JSON text (real values are JSON-escaped); tags inside
 /// URLs are left alone either way. A text that may be either is held back
-/// until its start tells ([`sniff_text`]).
+/// until its start tells ([`sniff_after`]).
 enum TextRestorer {
     Plain(Guarded<StreamRestorer>),
     Json(JsonFragRestorer),
@@ -203,12 +203,6 @@ struct Lead {
 }
 
 impl Lead {
-    fn of(text: &str) -> Self {
-        let mut lead = Lead::default();
-        lead.advance(text);
-        lead
-    }
-
     /// Read on into `text`, whose first `self.len` bytes were read before.
     fn advance(&mut self, text: &str) {
         if !self.past_bom {
@@ -236,18 +230,14 @@ enum TextKind {
 }
 
 /// Decide what a streamed text is from its start `text` (all of it when
-/// `end`), or `None` to wait. JSON text is one that reads as JSON up to a
+/// `end`), whose leading BOM and whitespace `lead` measured (read once, as
+/// the text grows), or `None` to wait. JSON text is one that reads as JSON up to a
 /// string or an object (`{"`, `["`, `[{`, and then however it goes on), or
 /// a value followed by another on a later line; a text that stops being
 /// JSON before that (`[NAME_1]`, `[1] see`, `{ is`) is plain. Only the
 /// first [`SNIFF_MAX`] bytes are read, so the answer never depends on how
 /// the text was split. More than [`SNIFF_MAX`] bytes of BOM and whitespace
 /// first is plain text (whitespace alone would otherwise never decide).
-fn sniff_text(text: &str, end: bool) -> Option<TextKind> {
-    sniff_after(text, Lead::of(text), end)
-}
-
-/// [`sniff_text`] with the leading BOM and whitespace already measured.
 fn sniff_after(text: &str, lead: Lead, end: bool) -> Option<TextKind> {
     if lead.len > SNIFF_MAX {
         return Some(TextKind::Plain);
@@ -820,7 +810,7 @@ enum JsonIn {
     Container(Value),
     /// The start of JSON that has not ended (`{"q": "x`): more may follow.
     Incomplete,
-    /// Clearly JSON (it reached a string or an object, see [`sniff_text`])
+    /// Clearly JSON (it reached a string or an object, see [`sniff_after`])
     /// that cannot become one valid document (`{"a": 1,}`, a value followed
     /// by another).
     Invalid,
@@ -2224,6 +2214,13 @@ mod tests {
 
     const SCOPE: &str = "global";
 
+    /// [`sniff_after`] on a whole text.
+    fn sniff_text(text: &str, end: bool) -> Option<TextKind> {
+        let mut lead = Lead::default();
+        lead.advance(text);
+        sniff_after(text, lead, end)
+    }
+
     /// An engine with `[NAME_1]` = Ravi Kumar and `[EMAIL_1]` =
     /// ravi@example.com in the global scope.
     fn tagged(dir: &std::path::Path) -> Engine {
@@ -3181,7 +3178,7 @@ mod tests {
                 let delta = unit.repeat(16);
                 sent.push_str(&delta);
                 out.push_str(&r.push(&delta));
-                if i % 1000 == 0 {
+                if i.is_multiple_of(1000) {
                     // A forced flush (64 held events or 1 MiB).
                     out.push_str(&r.finish());
                 }
@@ -3198,7 +3195,7 @@ mod tests {
                         s.seen.len()
                     );
                 }
-                if i % 4096 == 0 {
+                if i.is_multiple_of(4096) {
                     assert!(started.elapsed() < limit, "{unit:?}: {} bytes", sent.len());
                 }
                 i += 1;
