@@ -289,18 +289,6 @@ pub(crate) fn walk_json(v: &mut Value, rules: &Rules<'_>, f: Visit<'_>) -> Resul
     walk_value(v, None, false, 0, Reading::Nested, rules, f)
 }
 
-/// [`walk_json`] for JSON in a body not declared as JSON (a JSON line of a
-/// text body): its strings and keys may also be read as a server reads the
-/// whole body, decoded as a form (see [`Reading::Body`]). JSON inside its
-/// strings is read as nested JSON.
-pub(crate) fn walk_json_body(
-    v: &mut Value,
-    rules: &Rules<'_>,
-    f: Visit<'_>,
-) -> Result<(), Malformed> {
-    walk_value(v, None, false, 0, Reading::Body, rules, f)
-}
-
 /// `skipped`: the value sits under an identifier key (its strings and arrays
 /// of strings; objects inside it have their own keys).
 fn walk_value(
@@ -887,6 +875,253 @@ fn walk_form_at(
         }
     }
     Ok(changed.then_some(out))
+}
+
+/// Whitespace between JSON tokens.
+const JSON_WS: [char; 4] = [' ', '\t', '\n', '\r'];
+
+/// One JSON value of a text read as JSON lines: byte ranges into the text
+/// (the whole line with its line break, and the JSON value in it, without
+/// surrounding whitespace). `value` is the parsed value when it holds text
+/// (a string, an object or an array); a number or literal is `None`, read
+/// as text. Blank lines have an empty `json` range and `None`.
+pub(crate) struct JsonLine {
+    start: usize,
+    json: std::ops::Range<usize>,
+    end: usize,
+    value: Option<Value>,
+}
+
+/// `text` as JSON documents: one object or array (over any number of
+/// lines), else JSON values one per line ([`json_lines`]). A key given
+/// twice is refused.
+pub(crate) fn json_docs(text: &str) -> Result<Option<Vec<JsonLine>>, Malformed> {
+    let rest = text.trim_start_matches('\u{feff}');
+    let body = rest.trim_matches(JSON_WS);
+    if body.starts_with(['{', '[']) {
+        let lead = text.len() - rest.trim_start_matches(JSON_WS).len();
+        match parda_wire::body::parse_json_unique(body.as_bytes()) {
+            Ok(value) => {
+                return Ok(Some(vec![JsonLine {
+                    start: 0,
+                    json: lead..lead + body.len(),
+                    end: text.len(),
+                    value: Some(value),
+                }]));
+            }
+            Err(JsonError::DuplicateKey) => return Err(Malformed),
+            Err(JsonError::Invalid) => {}
+        }
+    }
+    json_lines(text)
+}
+
+/// The lines of `text` when every one that is not blank is a JSON value
+/// (and at least one is), else `None`. A key given twice is refused.
+pub(crate) fn json_lines(text: &str) -> Result<Option<Vec<JsonLine>>, Malformed> {
+    let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut any = false;
+    while start < text.len() {
+        let end = text[start..]
+            .find('\n')
+            .map_or(text.len(), |i| start + i + 1);
+        let from = if start == 0 { bom } else { start };
+        let line = &text[from..end];
+        let lead = line.len() - line.trim_start_matches(JSON_WS).len();
+        let body = line.trim_matches(JSON_WS);
+        let json = from + lead..from + lead + body.len();
+        let value = if body.is_empty() {
+            None
+        } else {
+            any = true;
+            match parda_wire::body::parse_json_unique(body.as_bytes()) {
+                Ok(v @ (Value::String(_) | Value::Array(_) | Value::Object(_))) => Some(v),
+                Ok(_) => None,
+                Err(JsonError::Invalid) => return Ok(None),
+                Err(JsonError::DuplicateKey) => return Err(Malformed),
+            }
+        };
+        lines.push(JsonLine {
+            start,
+            json,
+            end,
+            value,
+        });
+        start = end;
+    }
+    Ok(any.then_some(lines))
+}
+
+/// Walk `text` read as JSON lines (from [`json_lines`]), as the text of a
+/// body not declared as JSON: each line as a server that parses it reads
+/// it, and as the whole text reads to a server that takes it literally or
+/// decoded as a form (R8.2: strings and keys get [`Reading::Body`], number
+/// literals are read as text). A lone string is a document of its own (see
+/// [`visit_document_string`]). `content` and `skipped` are the text's own
+/// role, for strings and number lines. Returns the new text when something
+/// changed; lines that did not change keep their bytes.
+pub(crate) fn walk_json_lines(
+    text: &str,
+    lines: &mut [JsonLine],
+    content: bool,
+    skipped: bool,
+    depth: usize,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<Option<String>, Malformed> {
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    for line in lines.iter_mut() {
+        out.push_str(&text[line.start..line.json.start]);
+        let raw = &text[line.json.clone()];
+        let new = match &mut line.value {
+            Some(Value::String(t)) => {
+                let before = t.clone();
+                visit_document_string(t, content, skipped, depth, rules, f)?;
+                (*t != before).then(|| Value::String(t.clone()).to_string())
+            }
+            Some(value) => walk_json_line(raw, value, depth, rules, f)?,
+            // A number or literal reads the same as text.
+            None => {
+                let mut t = raw.to_string();
+                visit_at(&mut t, content, skipped, depth, Reading::Body, rules, f)?;
+                (t != raw).then_some(t)
+            }
+        };
+        match new {
+            Some(new) => {
+                changed = true;
+                out.push_str(&new);
+            }
+            None => out.push_str(raw),
+        }
+        out.push_str(&text[line.json.end..line.end]);
+    }
+    Ok(changed.then_some(out))
+}
+
+/// A lone JSON string that is a whole document (a line of a body, a
+/// field): a server may parse its text again (`JSON.stringify` twice), so
+/// JSON in it is read as JSON documents of their own, and escaped JSON-looking
+/// text in it that is not JSON is refused, never read with its escapes
+/// taken literally. Anything else is text.
+fn visit_document_string(
+    t: &mut String,
+    content: bool,
+    skipped: bool,
+    depth: usize,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<(), Malformed> {
+    if depth < MAX_NESTED_JSON
+        && let Some(mut lines) = json_docs(t)?
+        && lines.iter().any(|l| l.value.is_some())
+    {
+        if let Some(new) = walk_json_lines(t, &mut lines, content, skipped, depth + 1, rules, f)? {
+            *t = new;
+        }
+        return Ok(());
+    }
+    if escaped_like_json(t) {
+        return Err(Malformed);
+    }
+    visit_at(t, content, skipped, depth, Reading::Body, rules, f)
+}
+
+/// One JSON object or array of a text read as JSON lines (`raw`, parsed as
+/// `value`): its strings and keys with [`Reading::Body`], then its number
+/// literals as text. Returns the new JSON text when something changed.
+fn walk_json_line(
+    raw: &str,
+    value: &mut Value,
+    depth: usize,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<Option<String>, Malformed> {
+    let mut track = Tracking {
+        inner: f,
+        changed: false,
+    };
+    walk_value(value, None, false, depth, Reading::Body, rules, &mut track)?;
+    // Read literally, the body's numbers are text.
+    let numbers = visit_numbers(raw, depth, rules, &mut *track.inner)?;
+    if !track.changed && numbers.is_empty() {
+        return Ok(None);
+    }
+    let json = if track.changed {
+        let json = serde_json::to_vec(value).map_err(|_| Malformed)?;
+        parda_wire::walk::preserve_numbers(raw.as_bytes(), json)
+    } else {
+        raw.as_bytes().to_vec()
+    };
+    let json = replace_numbers(json, &numbers)?;
+    String::from_utf8(json).map(Some).map_err(|_| Malformed)
+}
+
+/// Visit the number literals of the JSON text `raw` as text (as a server
+/// that reads the body literally sees them); returns the changed ones: the
+/// index among the literals and the new text.
+fn visit_numbers(
+    raw: &str,
+    depth: usize,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<Vec<(usize, String)>, Malformed> {
+    let mut changed = Vec::new();
+    for (i, (a, b)) in parda_wire::walk::number_tokens(raw.as_bytes())
+        .into_iter()
+        .enumerate()
+    {
+        let mut t = raw[a..b].to_string();
+        visit_at(&mut t, true, false, depth, Reading::Body, rules, f)?;
+        if t != raw[a..b] {
+            changed.push((i, t));
+        }
+    }
+    Ok(changed)
+}
+
+/// Put the changed number literals of [`visit_numbers`] into `json` (the
+/// same document, its numbers in the same order): bare when the new text is
+/// a JSON number, else as a JSON string (a tag), so the line still parses.
+fn replace_numbers(json: Vec<u8>, changed: &[(usize, String)]) -> Result<Vec<u8>, Malformed> {
+    if changed.is_empty() {
+        return Ok(json);
+    }
+    let tokens = parda_wire::walk::number_tokens(&json);
+    let mut out = Vec::with_capacity(json.len());
+    let mut last = 0;
+    for (i, text) in changed {
+        // Never: redaction rewrites only strings, and numbers keep their order.
+        let &(a, b) = tokens.get(*i).ok_or(Malformed)?;
+        out.extend_from_slice(&json[last..a]);
+        match serde_json::from_str::<Value>(text) {
+            Ok(Value::Number(_)) => out.extend_from_slice(text.as_bytes()),
+            _ => out.extend_from_slice(Value::String(text.clone()).to_string().as_bytes()),
+        }
+        last = b;
+    }
+    out.extend_from_slice(&json[last..]);
+    Ok(out)
+}
+
+/// Text (not JSON, not JSON lines) that starts like JSON (`{`, `[` or
+/// `"`, after a BOM and whitespace) and holds a backslash, or that has a
+/// line like that (R8.1): a lenient reader would decode escapes that glue
+/// a letter to the value (`\n9876543210`) when read literally, so it
+/// cannot be filtered safely. A line that parses on its own counts too: the
+/// text is read literally, never with that line's escapes decoded.
+pub(crate) fn escaped_like_json(text: &str) -> bool {
+    let looks = |t: &str| {
+        t.trim_start_matches(|c: char| c == '\u{feff}' || JSON_WS.contains(&c))
+            .starts_with(['{', '[', '"'])
+    };
+    (looks(text) && text.contains('\\'))
+        || text
+            .split(['\n', '\r'])
+            .any(|line| line.contains('\\') && looks(line))
 }
 
 /// What a multipart walk did.
