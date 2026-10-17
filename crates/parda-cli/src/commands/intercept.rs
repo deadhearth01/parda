@@ -112,6 +112,15 @@ fn target_label(platform: Platform, target: &str) -> String {
     }
 }
 
+/// Targets in words, comma-separated.
+fn labels(platform: Platform, targets: &[String]) -> String {
+    targets
+        .iter()
+        .map(|t| target_label(platform, t))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// A saved (previous) setting in words.
 fn describe_saved(platform: Platform, s: &Saved) -> String {
     match platform {
@@ -248,19 +257,10 @@ pub fn off(cx: &mut Ctx) -> anyhow::Result<()> {
         "could not put the previous proxy settings back (intercept stays on so AI sites keep \
          loading)",
     )?;
-    let mut failed = Vec::new();
-    match restored {
-        None => writeln!(
-            cx.out,
-            "· system proxy parda had not changed it — nothing to restore"
-        )?,
+    let failed = match restored {
+        None => switch_off_found(cx)?,
         Some(r) => {
-            let list = |v: &[String]| {
-                v.iter()
-                    .map(|t| target_label(cx.platform, t))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
+            let list = |v: &[String]| labels(cx.platform, v);
             if !r.restored.is_empty() {
                 writeln!(cx.out, "✓ restored     {}", list(&r.restored))?;
             }
@@ -286,9 +286,9 @@ pub fn off(cx: &mut Ctx) -> anyhow::Result<()> {
                     list(&r.failed)
                 )?;
             }
-            failed = r.failed;
+            r.failed
         }
-    }
+    };
     if !failed.is_empty() {
         bail!(
             "{} setting(s) could not be put back; parda keeps filtering so those AI sites still \
@@ -312,6 +312,51 @@ pub fn off(cx: &mut Ctx) -> anyhow::Result<()> {
         writeln!(cx.out, "· intercept    already off")?;
     }
     Ok(())
+}
+
+/// `off` with no saved settings: the system may still point at parda (the
+/// state file was deleted, or `on` ran under another PARDA_HOME). Switch off
+/// any parda PAC found, so AI sites do not fail to load once the listener
+/// stops. Returns the settings that could not be switched off.
+fn switch_off_found(cx: &mut Ctx) -> anyhow::Result<Vec<String>> {
+    let config = read_config(cx)?;
+    let pac = known_pac(cx.paths, &config);
+    let label = |v: &[String]| labels(cx.platform, v);
+    match sysproxy::switch_off_parda(cx.runner, cx.platform, &pac) {
+        Err(e) => {
+            writeln!(
+                cx.out,
+                "· system proxy no saved settings to restore, and the current setting could not \
+                 be read ({e:#})"
+            )?;
+            Ok(Vec::new())
+        }
+        Ok(r) if r.restored.is_empty() && r.failed.is_empty() => {
+            writeln!(
+                cx.out,
+                "· system proxy parda had not changed it — nothing to restore"
+            )?;
+            Ok(Vec::new())
+        }
+        Ok(r) => {
+            if !r.restored.is_empty() {
+                writeln!(
+                    cx.out,
+                    "✓ switched off {} (no saved settings; switched off parda's PAC — automatic \
+                     proxy configuration is off there now)",
+                    label(&r.restored)
+                )?;
+            }
+            if !r.failed.is_empty() {
+                writeln!(
+                    cx.out,
+                    "✗ failed       {} (still sends AI sites to parda)",
+                    label(&r.failed)
+                )?;
+            }
+            Ok(r.failed)
+        }
+    }
 }
 
 /// The daemon's `"intercept"` status, `None` when no daemon runs.
@@ -975,8 +1020,56 @@ mod tests {
         let (r, out) = exec(&p, &mut os, None, off);
         r.unwrap();
         assert!(out.contains("nothing to restore"), "{out}");
-        assert!(os.calls.is_empty(), "{:?}", os.calls);
+        assert!(os.writes().is_empty(), "{:?}", os.calls);
         assert!(!enabled_in_file(&p));
+    }
+
+    /// The system points at parda but intercept-state.json is gone (data
+    /// folder cleaned, another PARDA_HOME, deleted by hand).
+    fn pointed_without_state(p: &Paths) -> (Mac, FakeDaemon) {
+        let mut os = Mac::new(true);
+        for v in os.services.values_mut() {
+            *v = (Some(PAC.into()), true);
+        }
+        let mut cfg = load_config(p).unwrap();
+        cfg.intercept.enabled = true;
+        (os, FakeDaemon::new(cfg))
+    }
+
+    #[test]
+    fn off_without_saved_settings_switches_off_the_parda_pac_it_finds() {
+        let (_d, p) = home_with_ca();
+        let (mut os, mut daemon) = pointed_without_state(&p);
+        let (r, out) = exec(&p, &mut os, Some(&mut daemon), off);
+        r.unwrap();
+        for svc in ["Wi-Fi", "Ethernet"] {
+            assert!(!os.services[svc].1, "{svc} auto-proxy off: {out}");
+        }
+        assert!(
+            out.contains("no saved settings") && out.contains("Ethernet"),
+            "{out}"
+        );
+        assert!(!daemon.config.intercept.enabled, "listener stopped");
+        // Nothing points at parda now: doctor is content.
+        let c = checks(&p, &mut os, None);
+        assert!(c.iter().all(|c| c.level != Level::Warn), "{c:?}");
+    }
+
+    #[test]
+    fn off_without_saved_settings_that_cannot_switch_off_keeps_the_listener() {
+        let (_d, p) = home_with_ca();
+        let (mut os, mut daemon) = pointed_without_state(&p);
+        os.failing
+            .push("networksetup -setautoproxystate Ethernet".into());
+        let (r, out) = exec(&p, &mut os, Some(&mut daemon), off);
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.contains("parda intercept off"), "{e}");
+        assert!(out.contains("Ethernet") && out.contains("failed"), "{out}");
+        assert!(daemon.config.intercept.enabled, "listener kept");
+        os.failing.clear();
+        exec(&p, &mut os, Some(&mut daemon), off).0.unwrap();
+        assert!(!daemon.config.intercept.enabled);
+        assert!(os.services.values().all(|(_, on)| !on));
     }
 
     /// Every file under the home folder with its contents.

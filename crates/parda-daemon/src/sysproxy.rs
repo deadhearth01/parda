@@ -388,6 +388,45 @@ pub fn inspect(
     })
 }
 
+/// Switch off every automatic proxy setting that uses a parda PAC, without
+/// saved state: for `parda intercept off` when intercept-state.json is
+/// missing or damaged but the system still sends AI sites to parda. macOS:
+/// auto-proxy off for that service; Windows: AutoConfigURL removed; GNOME:
+/// mode `none`. Other settings are never touched. `restored` lists what was
+/// switched off, `failed` what could not be.
+pub fn switch_off_parda(
+    r: &mut dyn Runner,
+    platform: Platform,
+    pac_url: &str,
+) -> anyhow::Result<Restored> {
+    let mut out = Restored::default();
+    for c in inspect(r, platform, pac_url)?
+        .into_iter()
+        .filter(|c| c.parda)
+    {
+        let done = match platform {
+            Platform::MacOs => r
+                .run("networksetup", &["-setautoproxystate", &c.target, "off"])
+                .map(drop),
+            Platform::Windows => win_set(r, None),
+            Platform::Linux => r
+                .run(
+                    "gsettings",
+                    &["set", "org.gnome.system.proxy", "mode", "none"],
+                )
+                .map(drop),
+        };
+        match done {
+            Ok(()) => out.restored.push(c.target),
+            Err(e) => {
+                tracing::warn!(target = %c.target, error = %e, "could not switch off parda's PAC");
+                out.failed.push(c.target);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Whether the current setting of `s.target` still points at parda.
 fn still_ours(
     r: &mut dyn Runner,
@@ -903,6 +942,75 @@ mod tests {
         assert!(!w[0].active && w[0].url.is_none());
         assert!(writes(&os).is_empty(), "{:?}", os.calls);
         assert_eq!(os.refreshed, 0);
+    }
+
+    #[test]
+    fn switch_off_parda_turns_off_every_parda_pac_without_saved_state() {
+        let mut os = mac();
+        os.mac.get_mut("Wi-Fi").unwrap().0 = Some(PAC.into());
+        os.mac.get_mut("Wi-Fi").unwrap().1 = true;
+        // An older run on another port.
+        os.mac.get_mut("iPhone USB").unwrap().0 = Some("http://127.0.0.1:9999/parda.pac".into());
+        os.mac.get_mut("iPhone USB").unwrap().1 = true;
+        let before = snapshot(&os);
+        let r = switch_off_parda(&mut os, Platform::MacOs, PAC).unwrap();
+        assert_eq!(r.restored, ["Wi-Fi", "iPhone USB"]);
+        assert!(r.failed.is_empty());
+        assert!(!os.mac["Wi-Fi"].1 && !os.mac["iPhone USB"].1);
+        assert_eq!(
+            os.mac["Thunderbolt Bridge"], before["Thunderbolt Bridge"],
+            "someone else's PAC is left alone"
+        );
+        // Nothing of parda's left: nothing to do.
+        os.calls.clear();
+        let r = switch_off_parda(&mut os, Platform::MacOs, PAC).unwrap();
+        assert_eq!(r, Restored::default());
+        assert!(writes(&os).is_empty(), "{:?}", os.calls);
+
+        os.mac.get_mut("Wi-Fi").unwrap().1 = true;
+        os.failing
+            .push("networksetup -setautoproxystate Wi-Fi".into());
+        let r = switch_off_parda(&mut os, Platform::MacOs, PAC).unwrap();
+        assert_eq!(r.failed, ["Wi-Fi"]);
+
+        let mut os = Os {
+            win: Some(PAC.into()),
+            gnome: ("auto".into(), PAC.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            switch_off_parda(&mut os, Platform::Windows, PAC)
+                .unwrap()
+                .restored,
+            ["user"]
+        );
+        assert_eq!(os.win, None);
+        assert_eq!(
+            switch_off_parda(&mut os, Platform::Linux, PAC)
+                .unwrap()
+                .restored,
+            ["GNOME"]
+        );
+        assert_eq!(os.gnome.0, "none");
+        // Not parda's: left alone.
+        let mut os = Os {
+            win: Some("http://corp/w.pac".into()),
+            gnome: ("auto".into(), "http://corp/g.pac".into()),
+            ..Default::default()
+        };
+        assert!(
+            switch_off_parda(&mut os, Platform::Windows, PAC)
+                .unwrap()
+                .restored
+                .is_empty()
+        );
+        assert!(
+            switch_off_parda(&mut os, Platform::Linux, PAC)
+                .unwrap()
+                .restored
+                .is_empty()
+        );
+        assert!(writes(&os).is_empty(), "{:?}", os.calls);
     }
 
     #[test]
