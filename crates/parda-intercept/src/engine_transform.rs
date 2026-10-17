@@ -18,7 +18,10 @@ use crate::hosts::HostList;
 use crate::server::MAX_REQUEST_BODY;
 use crate::sites;
 use crate::transform::RequestOutcome;
-use crate::walk::{Rules, Tier, Visit, visit_body_text, walk_form, walk_json, walk_multipart};
+use crate::walk::{
+    Found, Rules, Sink, Tier, Tracking, Visit, visit_body_text, walk_form, walk_json,
+    walk_multipart,
+};
 use crate::{BodyTransform, Refusal, StreamTransform};
 
 /// The settings one request uses (a snapshot of `[intercept]`).
@@ -107,12 +110,7 @@ impl EngineTransform {
         let mut body = ReqBody::prepare(headers, body)?;
 
         // Pass 1: collect the texts (identifiers skip only the ML model).
-        let mut texts = Vec::new();
-        let mut rules_only = Vec::new();
-        let mut collect = |s: &mut String, tier: Tier| {
-            texts.push(s.clone());
-            rules_only.push(tier == Tier::Identifier);
-        };
+        let mut collect = Collect::default();
         if let Some(q) = query {
             walk_form(q, &rules, &mut collect).map_err(|_| unparseable())?;
         }
@@ -127,6 +125,7 @@ impl EngineTransform {
                 ),
             ));
         }
+        let Collect { texts, rules_only } = collect;
         if texts.is_empty() {
             return Ok(RequestOutcome {
                 body: body.into_bytes(),
@@ -140,19 +139,12 @@ impl EngineTransform {
             .engine
             .redact_many_tiered(&refs, &rules_only, &st.scope_for(host))
             .map_err(engine_refusal)?;
-        let mut counts = BTreeMap::new();
-        for r in &reds {
-            for (k, n) in r.counts() {
-                *counts.entry(k).or_insert(0) += n;
-            }
-        }
 
         // Pass 2: write the results back, in the same order.
-        let mut results = reds.into_iter().map(|r| r.text);
-        let mut assign = |s: &mut String, _: Tier| {
-            if let Some(t) = results.next() {
-                *s = t;
-            }
+        let mut assign = Assign {
+            results: reds.into_iter(),
+            found: Vec::new(),
+            counts: BTreeMap::new(),
         };
         let target = match query {
             Some(q) => walk_form(q, &rules, &mut assign)
@@ -163,10 +155,68 @@ impl EngineTransform {
         let (new_body, _) = body.walk(&rules, &mut assign)?;
         Ok(RequestOutcome {
             body: new_body.unwrap_or_else(|| body.into_bytes()),
-            counts,
+            counts: assign.counts,
             unscanned,
             target,
         })
+    }
+}
+
+/// Pass 1: the texts of a request, and which skip the ML model.
+#[derive(Default)]
+struct Collect {
+    texts: Vec<String>,
+    rules_only: Vec<bool>,
+}
+
+impl Sink for Collect {
+    fn visit(&mut self, s: &mut String, tier: Tier) {
+        self.texts.push(s.clone());
+        self.rules_only.push(tier == Tier::Identifier);
+    }
+
+    fn found(&self) -> Option<&[Found]> {
+        Some(&[])
+    }
+}
+
+/// Pass 2: the engine's results written back in the same order, with what
+/// each replaced and the counts by kind.
+struct Assign {
+    results: std::vec::IntoIter<parda_engine::Redaction>,
+    found: Vec<Found>,
+    counts: BTreeMap<String, u32>,
+}
+
+impl Sink for Assign {
+    fn visit(&mut self, s: &mut String, _: Tier) {
+        self.found.clear();
+        let Some(r) = self.results.next() else {
+            return;
+        };
+        for x in &r.replaced {
+            *self.counts.entry(x.kind.to_string()).or_insert(0) += 1;
+            self.found.push(Found {
+                start: x.original_span.start,
+                end: x.original_span.end,
+                surrogate: x.surrogate.clone(),
+                kind: x.kind.to_string(),
+            });
+        }
+        *s = r.text;
+    }
+
+    fn found(&self) -> Option<&[Found]> {
+        Some(&self.found)
+    }
+
+    fn forget(&mut self, kind: &str) {
+        if let Some(n) = self.counts.get_mut(kind) {
+            *n -= 1;
+            if *n == 0 {
+                self.counts.remove(kind);
+            }
+        }
     }
 }
 
@@ -177,8 +227,10 @@ enum ReqBody {
         raw: Bytes,
         value: Value,
     },
-    /// `application/x-www-form-urlencoded`.
+    /// Declared `application/x-www-form-urlencoded`.
     Form(String),
+    /// Any other text: redacted as it reads literally and as it reads
+    /// decoded as a form.
     Text(String),
     Multipart {
         raw: Bytes,
@@ -244,7 +296,7 @@ impl ReqBody {
             }
             return Ok(ReqBody::Opaque(raw));
         };
-        Ok(if form || form_encoded(&text) {
+        Ok(if form {
             ReqBody::Form(text)
         } else {
             ReqBody::Text(text)
@@ -257,14 +309,12 @@ impl ReqBody {
         Ok(match self {
             ReqBody::Empty => (None, 0),
             ReqBody::Json { raw, value } => {
-                let mut changed = false;
-                walk_json(value, rules, &mut |t: &mut String, tier| {
-                    let before = t.clone();
-                    f(t, tier);
-                    changed |= *t != before;
-                })
-                .map_err(|_| unparseable())?;
-                let out = changed.then(|| {
+                let mut track = Tracking {
+                    inner: f,
+                    changed: false,
+                };
+                walk_json(value, rules, &mut track).map_err(|_| unparseable())?;
+                let out = track.changed.then(|| {
                     let json = serde_json::to_vec(value).unwrap_or_default();
                     Bytes::from(preserve_numbers(raw, json))
                 });
@@ -321,21 +371,6 @@ fn json_container(raw: &[u8]) -> Result<Option<Value>, Refusal> {
         Err(body::JsonError::Invalid) => Ok(None),
         Err(body::JsonError::DuplicateKey) => Err(unparseable()),
     }
-}
-
-/// Text that reads as `application/x-www-form-urlencoded`: only characters a
-/// form encoder leaves as they are (no whitespace), with at least one `=`,
-/// `+` or `%XX` escape. Such a body is walked as a form so that `+` and
-/// `%40` do not hide a name or an e-mail from the rules.
-fn form_encoded(text: &str) -> bool {
-    let b = text.as_bytes();
-    let charset = b
-        .iter()
-        .all(|c| c.is_ascii_alphanumeric() || b"-._~!$'()*,;:@/?=&+%".contains(c));
-    let escaped = b
-        .windows(3)
-        .any(|w| w[0] == b'%' && w[1].is_ascii_hexdigit() && w[2].is_ascii_hexdigit());
-    !b.is_empty() && charset && (escaped || b.contains(&b'=') || b.contains(&b'+'))
 }
 
 /// The media type (lower-case, without parameters) and the multipart
@@ -1072,6 +1107,140 @@ pub(crate) mod tests {
             Bytes::from("1+1=2, Ravi Kumar"),
         );
         assert_eq!(body_text(&out), "1+1=2, [NAME_1]");
+    }
+
+    /// `s` read literally and read as form/URL-encoded (`+` a space, `%XX`
+    /// a byte): a value must survive in neither.
+    fn readings(s: &str) -> [String; 2] {
+        let spaced = s.replace('+', " ");
+        let decoded = percent_encoding::percent_decode_str(&spaced)
+            .decode_utf8_lossy()
+            .into_owned();
+        [s.to_string(), decoded]
+    }
+
+    #[track_caller]
+    fn assert_gone(sent: &str, out: &str, values: &[&str]) {
+        for reading in readings(out) {
+            for v in values {
+                assert!(
+                    !reading.contains(v),
+                    "{sent:?} -> {out:?}: {v:?} survives in {reading:?}"
+                );
+            }
+        }
+    }
+
+    /// Scan R5.2: percent-encoding anywhere in a URL hides an e-mail or a
+    /// name from the rules: fragments, path segments, relative and
+    /// scheme-relative URLs and bare query strings are decoded too.
+    #[test]
+    fn url_fragments_paths_and_relative_urls_are_decoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        for url in [
+            "https://www.perplexity.ai/search#q=jdoe%40corp.example",
+            "https://www.perplexity.ai/search#jdoe%40corp.example",
+            "https://x.example/u/jdoe%40corp.example/",
+            "https://x.example/u/jdoe%40corp.example/?n=1#top",
+            "/search?q=mail%20jdoe%40corp.example",
+            "//x.example/?q=mail%20jdoe%40corp.example",
+            "?q=mail%20jdoe%40corp.example",
+            "email=jdoe%40corp.example&n=1",
+            "see /u/jdoe%40corp.example/ today",
+        ] {
+            let body = json!({ "href": url }).to_string();
+            let out = rewrite(&t, "chatgpt.com", "application/json", Bytes::from(body));
+            let v: Value = serde_json::from_slice(&out.body).unwrap();
+            let href = v["href"].as_str().unwrap();
+            assert_gone(url, href, &["jdoe", "corp.example"]);
+            assert_eq!(out.counts.get("Email"), Some(&1), "{url} -> {href}");
+        }
+        for url in [
+            "https://www.perplexity.ai/search#q=Ravi%20Kumar",
+            "https://www.perplexity.ai/search#Ravi%20Kumar",
+            "https://x.example/u/Ravi%20Kumar/",
+            "/u/Ravi+Kumar?x=1",
+        ] {
+            let body = json!({ "href": url }).to_string();
+            let out = rewrite(&t, "chatgpt.com", "application/json", Bytes::from(body));
+            let v: Value = serde_json::from_slice(&out.body).unwrap();
+            let href = v["href"].as_str().unwrap();
+            assert_gone(url, href, &["Ravi", "Kumar"]);
+            assert_eq!(out.counts.get("Person"), Some(&1), "{url} -> {href}");
+        }
+        // Re-encoded where it changed; untouched URLs keep their bytes.
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            Bytes::from(
+                r#"{"a":"https://x.example/u/ravi%40example.com/","b":"https://x.example/a%20b/#c%20d"}"#,
+            ),
+        );
+        assert_eq!(
+            body_text(&out),
+            r#"{"a":"https://x.example/u/%5BEMAIL_2%5D/","b":"https://x.example/a%20b/#c%20d"}"#
+        );
+    }
+
+    /// Scan R5.3 and the form-sniff finding: a body not declared as a form
+    /// is read literally by some servers and decoded by others, so both
+    /// readings are redacted, whatever else the text holds (a trailing
+    /// newline, brackets, non-ASCII).
+    #[test]
+    fn text_bodies_are_redacted_in_both_readings() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        let name = ["Ravi", "Kumar"];
+        let mail = ["jdoe", "corp.example"];
+        for (body, values) in [
+            ("a=Ravi+Kumar", &name[..]),
+            ("a=b Ravi Kumar", &name),
+            ("x%20Ravi%20Kumar", &name),
+            ("prompt=Ravi%20Kumar&n=1\n", &name),
+            ("prompt=Ravi%20Kumar&tags[]=x", &name),
+            ("x.y+tag@corp.example", &["x.y", "tag@", "corp.example"]),
+            ("jdoe.smith+work@corp.example", &mail),
+            ("prompt=hi&mail=jdoe%40corp.example\n", &mail),
+            ("prompt=hi&mail=jdoe%40corp.example\r\n", &mail),
+            ("prompt=hi&mail=jdoe%40corp.example&tags[]=x", &mail),
+            ("prompt=café&mail=jdoe%40corp.example", &mail),
+            ("{x}&m=jdoe%40corp.example", &mail),
+        ] {
+            for ct in ["text/plain", "text/plain;charset=UTF-8", ""] {
+                let out = rewrite(&t, "chatgpt.com", ct, Bytes::from(body));
+                let text = body_text(&out);
+                assert_gone(body, &text, values);
+                assert_eq!(out.unscanned, 0, "{ct} {body:?}");
+                assert_eq!(
+                    out.counts.values().sum::<u32>(),
+                    1,
+                    "{ct} {body:?} -> {text:?}"
+                );
+            }
+        }
+        // Multipart text fields are bodies of their own.
+        let mp = "--b\r\nContent-Disposition: form-data; name=\"payload\"\r\n\r\n\
+                  m=jdoe%40corp.example&n=Ravi+Kumar\r\n--b--\r\n";
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "multipart/form-data; boundary=b",
+            Bytes::from(mp),
+        );
+        let text = body_text(&out);
+        assert_gone(mp, &text, &["jdoe", "Ravi", "Kumar"]);
+        // A name only the model knows, under form keys that would skip it
+        // in a declared form, is found in a text body.
+        let dir = tempfile::tempdir().unwrap();
+        let (_ml, t) = with_names(dir.path());
+        for body in ["id=Priya", "token=Priya&q=hi", "x%20Priya"] {
+            for ct in ["text/plain", ""] {
+                let out = rewrite(&t, "chatgpt.com", ct, Bytes::from(body));
+                assert_gone(body, &body_text(&out), &["Priya"]);
+            }
+        }
     }
 
     /// Restore `body` as the answer of `host`.

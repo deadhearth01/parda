@@ -8,7 +8,15 @@
 //! verbatim (values under identifier keys, or identifier-looking values) are
 //! visited as [`Tier::Identifier`] — the engine's dictionary and rule tiers
 //! still see them, only the ML model does not — and only when they are
-//! identifier-shaped ([`id_shaped`]); anything else is text.
+//! identifier-shaped ([`id_shaped`]); anything else is text. Keys follow the
+//! same rule.
+//!
+//! A string that reads differently once form/URL-decoded (`%XX`, `+`) is
+//! visited in both readings: as it is, and component by component decoded
+//! (form keys and values, URL path segments, query and fragment). What
+//! either finds is replaced in the raw text, so a value survives in neither.
+//! Whole text bodies and multipart fields get both readings whenever they
+//! hold `%XX`, `+` or `=`.
 
 use parda_wire::body::JsonError;
 use serde_json::Value;
@@ -27,8 +35,64 @@ pub(crate) enum Tier {
     Identifier,
 }
 
+/// One value the engine replaced in a visited string: its byte range in the
+/// string as it was visited, and what took its place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Found {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) surrogate: String,
+    pub(crate) kind: String,
+}
+
+/// Receives the strings of a request to redact (collects them, or writes
+/// the engine's results back).
+pub(crate) trait Sink {
+    /// Visit one string; may replace it.
+    fn visit(&mut self, s: &mut String, tier: Tier);
+    /// What the last [`Sink::visit`] replaced, in the string as it was
+    /// visited; `None` when this sink cannot say.
+    fn found(&self) -> Option<&[Found]> {
+        None
+    }
+    /// One replacement of the visits so far was not used (the same value
+    /// was found again in another reading of the same text): do not count
+    /// it.
+    fn forget(&mut self, kind: &str) {
+        let _ = kind;
+    }
+}
+
+impl<F: FnMut(&mut String, Tier)> Sink for F {
+    fn visit(&mut self, s: &mut String, tier: Tier) {
+        self(s, tier);
+    }
+}
+
+/// Passes visits on to a sink, noting whether one changed its string.
+pub(crate) struct Tracking<'a, 'b> {
+    pub(crate) inner: &'a mut (dyn Sink + 'b),
+    pub(crate) changed: bool,
+}
+
+impl Sink for Tracking<'_, '_> {
+    fn visit(&mut self, s: &mut String, tier: Tier) {
+        let before = s.clone();
+        self.inner.visit(s, tier);
+        self.changed |= *s != before;
+    }
+
+    fn found(&self) -> Option<&[Found]> {
+        self.inner.found()
+    }
+
+    fn forget(&mut self, kind: &str) {
+        self.inner.forget(kind);
+    }
+}
+
 /// Visits one string to redact; may replace it.
-pub(crate) type Visit<'a> = &'a mut dyn FnMut(&mut String, Tier);
+pub(crate) type Visit<'a> = &'a mut dyn Sink;
 
 /// Longest value that may be treated as an identifier.
 const MAX_ID_LEN: usize = 64;
@@ -236,7 +300,15 @@ fn walk_value(
     f: Visit<'_>,
 ) -> Result<(), Malformed> {
     match v {
-        Value::String(s) => visit_at(s, key.is_some_and(is_content_key), skipped, depth, rules, f),
+        Value::String(s) => visit_at(
+            s,
+            key.is_some_and(is_content_key),
+            skipped,
+            depth,
+            Reading::Nested,
+            rules,
+            f,
+        ),
         Value::Array(items) => items
             .iter_mut()
             .try_for_each(|x| walk_value(x, key, skipped, depth, rules, f)),
@@ -269,8 +341,9 @@ fn walk_value(
     }
 }
 
-/// Visit one string value found under `key`.
-pub(crate) fn visit_text(
+/// Visit a multipart field named `key`: a body of its own, read literally
+/// or decoded as a form by the server (see [`Reading::Body`]).
+pub(crate) fn visit_field(
     s: &mut String,
     key: Option<&str>,
     rules: &Rules<'_>,
@@ -278,17 +351,18 @@ pub(crate) fn visit_text(
 ) -> Result<(), Malformed> {
     let content = key.is_some_and(is_content_key);
     let skipped = key.is_some_and(|k| rules.skip_key(k));
-    visit_at(s, content, skipped, 0, rules, f)
+    visit_at(s, content, skipped, 0, Reading::Body, rules, f)
 }
 
-/// Visit a text body: what the user typed, never an identifier, but JSON
-/// and URLs in it are opened like anywhere else.
+/// Visit a text body (any body not declared as a form or JSON): what the
+/// user typed, never an identifier, redacted as it reads literally and as
+/// it reads decoded as a form.
 pub(crate) fn visit_body_text(
     s: &mut String,
     rules: &Rules<'_>,
     f: Visit<'_>,
 ) -> Result<(), Malformed> {
-    visit_at(s, true, false, 0, rules, f)
+    visit_at(s, true, false, 0, Reading::Body, rules, f)
 }
 
 /// Visit a key (a JSON object key, a form or query key) by the rule values
@@ -306,7 +380,39 @@ fn visit_key(k: &mut String, rules: &Rules<'_>, f: Visit<'_>) {
     } else {
         Tier::Text
     };
-    f(k, tier);
+    visit_views(k, tier, Reading::Nested, f);
+}
+
+/// How a string may be read by whoever receives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// A whole body or multipart field not declared as a form: some servers
+    /// read it literally, others decode it as a form. Any `%XX`, `+` or `=`
+    /// gives it a decoded reading.
+    Body,
+    /// A string inside a document. A `%XX` escape gives it a decoded
+    /// reading (a URL's path, query or fragment, a bare query string), and
+    /// so does a `+` or `=` in a string without whitespace.
+    Nested,
+}
+
+/// A valid `%XX` escape is in `s`.
+fn has_escape(s: &str) -> bool {
+    s.as_bytes()
+        .windows(3)
+        .any(|w| w[0] == b'%' && w[1].is_ascii_hexdigit() && w[2].is_ascii_hexdigit())
+}
+
+/// Does `s` have a decoded reading besides its literal one?
+fn decodes(s: &str, reading: Reading) -> bool {
+    if has_escape(s) {
+        return true;
+    }
+    let form_like = s.contains(['+', '=']);
+    match reading {
+        Reading::Body => form_like,
+        Reading::Nested => form_like && !s.contains(char::is_whitespace),
+    }
 }
 
 /// `content`: what the user typed (a content key, a text body); `depth`:
@@ -316,6 +422,7 @@ fn visit_at(
     content: bool,
     skipped: bool,
     depth: usize,
+    reading: Reading,
     rules: &Rules<'_>,
     f: Visit<'_>,
 ) -> Result<(), Malformed> {
@@ -328,26 +435,245 @@ fn visit_at(
     if !content && depth < MAX_NESTED_JSON && nested_json(s, depth, rules, f)? {
         return Ok(());
     }
-    // So are the queries of URLs in it: percent-encoding hides an e-mail
-    // from the rules.
+    let tier = plain_tier(s, content, skipped, rules);
+    // A body is one text in both of its readings.
+    if reading == Reading::Body && decodes(s, reading) {
+        visit_views(s, tier, reading, f);
+        return Ok(());
+    }
+    // The queries of URLs in it are walked as forms, with the key rules:
+    // percent-encoding hides an e-mail from the rules.
     if depth < MAX_NESTED_JSON && url_queries(s, content, skipped, depth, rules, f)? {
         return Ok(());
     }
-    visit_plain(s, content, skipped, rules, f);
+    visit_views(s, tier, Reading::Nested, f);
     Ok(())
 }
 
-/// Visit `s` as one text (no JSON or URL opened).
-fn visit_plain(s: &mut String, content: bool, skipped: bool, rules: &Rules<'_>, f: Visit<'_>) {
-    if s.trim().is_empty() {
-        return;
-    }
-    let tier = if !content && id_shaped(s) && (skipped || rules.is_identifier(s)) {
+/// The tier of `s` as one text: identifier-shaped values under identifier
+/// keys, or that look like identifiers, skip the ML model.
+fn plain_tier(s: &str, content: bool, skipped: bool, rules: &Rules<'_>) -> Tier {
+    if !content && id_shaped(s) && (skipped || rules.is_identifier(s)) {
         Tier::Identifier
     } else {
         Tier::Text
+    }
+}
+
+/// Visit `s` (no JSON opened) as it reads literally and, when it reads
+/// differently decoded, as it reads decoded: each component (form keys,
+/// values and pieces, URL path segments, queries and fragments) that holds
+/// a `%XX` escape or a `+`, decoded on its own. What either reading finds
+/// is replaced in the raw text (re-encoded where the raw text was encoded),
+/// so a value survives in neither.
+fn visit_views(s: &mut String, tier: Tier, reading: Reading, f: Visit<'_>) {
+    if s.trim().is_empty() {
+        return;
+    }
+    if !decodes(s, reading) {
+        f.visit(s, tier);
+        return;
+    }
+    let orig = s.clone();
+    // Decoded components first: a value's canonical spelling gets its tag
+    // before the fragments the literal reading may see.
+    let mut hits: Option<Vec<Hit>> = Some(Vec::new());
+    let mut decoded_changed = Vec::new();
+    for (n, (a, b)) in components(&orig).into_iter().enumerate() {
+        let (d, map) = decode_mapped(&orig[a..b]);
+        if d == orig[a..b] || d.trim().is_empty() {
+            continue;
+        }
+        let mut dd = d.clone();
+        f.visit(&mut dd, tier);
+        match (f.found(), hits.as_mut()) {
+            (Some(found), Some(hits)) => {
+                for x in found {
+                    let (start, end) = (a + map[x.start].0, a + map[x.end - 1].1);
+                    hits.push(Hit {
+                        start,
+                        end,
+                        surrogate: x.surrogate.clone(),
+                        kind: x.kind.clone(),
+                        visit: n + 1,
+                        encoded: orig[start..end] != d[x.start..x.end],
+                    });
+                }
+            }
+            _ => hits = None,
+        }
+        if dd != d {
+            decoded_changed.push((a, b, dd));
+        }
+    }
+    let mut raw = orig.clone();
+    f.visit(&mut raw, tier);
+    match (f.found(), hits.as_mut()) {
+        (Some(found), Some(hits)) => hits.extend(found.iter().map(|x| Hit {
+            start: x.start,
+            end: x.end,
+            surrogate: x.surrogate.clone(),
+            kind: x.kind.clone(),
+            visit: 0,
+            encoded: false,
+        })),
+        _ => hits = None,
+    }
+    *s = match hits {
+        Some(hits) => merge_hits(&orig, hits, f),
+        // A sink that cannot say what it replaced: the decoded reading's
+        // changes, re-encoded, else the literal one's.
+        None if !decoded_changed.is_empty() => {
+            let mut out = String::with_capacity(orig.len());
+            let mut last = 0;
+            for (a, b, dd) in decoded_changed {
+                out.push_str(&orig[last..a]);
+                out.push_str(&encode_all(&dd));
+                last = b;
+            }
+            out.push_str(&orig[last..]);
+            out
+        }
+        None => raw,
     };
-    f(s, tier);
+}
+
+/// A replacement found in one reading of a text, in raw coordinates.
+struct Hit {
+    start: usize,
+    end: usize,
+    surrogate: String,
+    kind: String,
+    /// Which visit found it (0: the literal reading).
+    visit: usize,
+    /// The raw text it covers is encoded (`%XX` or `+`).
+    encoded: bool,
+}
+
+/// Replace every hit in `orig`. Overlapping hits are one replacement: the
+/// surrogates of those not inside another, in order (re-encoded when one
+/// covers encoded text; of two over the same text, the decoded reading's).
+/// A hit inside one found by another reading is the same value found
+/// twice: not counted.
+fn merge_hits(orig: &str, mut hits: Vec<Hit>, f: Visit<'_>) -> String {
+    hits.sort_by_key(|h| (h.start, std::cmp::Reverse(h.end), !h.encoded, h.visit));
+    let mut out = String::with_capacity(orig.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i < hits.len() {
+        // One cluster of overlapping hits.
+        let mut end = hits[i].end;
+        let mut j = i + 1;
+        while j < hits.len() && hits[j].start < end {
+            end = end.max(hits[j].end);
+            j += 1;
+        }
+        let cluster = &hits[i..j];
+        let mut outer: Vec<&Hit> = Vec::new();
+        for h in cluster {
+            match outer.iter().find(|o| o.start <= h.start && h.end <= o.end) {
+                Some(o) if o.visit != h.visit => f.forget(&h.kind),
+                Some(_) => {}
+                None => outer.push(h),
+            }
+        }
+        let mut sur = String::new();
+        let mut prev: Option<&str> = None;
+        for o in &outer {
+            if prev != Some(o.surrogate.as_str()) {
+                sur.push_str(&o.surrogate);
+            }
+            prev = Some(o.surrogate.as_str());
+        }
+        if cluster.iter().any(|h| h.encoded) {
+            sur = encode_all(&sur);
+        }
+        out.push_str(&orig[last..hits[i].start]);
+        out.push_str(&sur);
+        last = end;
+        i = j;
+    }
+    out.push_str(&orig[last..]);
+    out
+}
+
+/// The byte ranges of the components of `s` that are decoded on their own:
+/// split at `&` and `=` (form keys, values and pieces) and at `/`, `?` and
+/// `#` (URL path segments, query, fragment).
+fn components(s: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, c) in s.bytes().enumerate() {
+        if matches!(c, b'&' | b'=' | b'/' | b'?' | b'#') {
+            if i > start {
+                out.push((start, i));
+            }
+            start = i + 1;
+        }
+    }
+    if s.len() > start {
+        out.push((start, s.len()));
+    }
+    out
+}
+
+/// Decode a form component (`+` a space, `%XX` a byte; anything else as it
+/// is), with, for each byte of the result, the raw range it came from. Bytes
+/// that are not UTF-8 once decoded become U+FFFD.
+fn decode_mapped(raw: &str) -> (String, Vec<(usize, usize)>) {
+    let b = raw.as_bytes();
+    let mut bytes = Vec::with_capacity(b.len());
+    let mut from = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match b[i] {
+            b'+' => {
+                bytes.push(b' ');
+                from.push((i, i + 1));
+                i += 1;
+            }
+            b'%' if i + 2 < b.len() && hex(b[i + 1]).is_some() && hex(b[i + 2]).is_some() => {
+                let v = hex(b[i + 1]).unwrap_or(0) * 16 + hex(b[i + 2]).unwrap_or(0);
+                bytes.push(v as u8);
+                from.push((i, i + 3));
+                i += 3;
+            }
+            c => {
+                bytes.push(c);
+                from.push((i, i + 1));
+                i += 1;
+            }
+        }
+    }
+    let mut text = String::with_capacity(bytes.len());
+    let mut map = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    for chunk in bytes.utf8_chunks() {
+        let valid = chunk.valid();
+        text.push_str(valid);
+        map.extend_from_slice(&from[at..at + valid.len()]);
+        at += valid.len();
+        let bad = chunk.invalid().len();
+        if bad > 0 {
+            let range = (from[at].0, from[at + bad - 1].1);
+            text.push('\u{fffd}');
+            map.extend_from_slice(&[range; 3]);
+            at += bad;
+        }
+    }
+    (text, map)
+}
+
+/// Percent-encode everything but unreserved characters (`%20` for a space:
+/// right in a path, a query and a form alike).
+fn encode_all(s: &str) -> String {
+    const SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    percent_encoding::utf8_percent_encode(s, SET).to_string()
 }
 
 /// If `s` holds a JSON object or array, walk it and re-serialise it when a
@@ -370,20 +696,12 @@ fn nested_json(
         Err(JsonError::Invalid) => return Ok(false),
         Err(JsonError::DuplicateKey) => return Err(Malformed),
     };
-    let mut changed = false;
-    walk_value(
-        &mut inner,
-        None,
-        false,
-        depth + 1,
-        rules,
-        &mut |t: &mut String, tier| {
-            let before = t.clone();
-            f(t, tier);
-            changed |= *t != before;
-        },
-    )?;
-    if changed {
+    let mut track = Tracking {
+        inner: f,
+        changed: false,
+    };
+    walk_value(&mut inner, None, false, depth + 1, rules, &mut track)?;
+    if track.changed {
         let out = parda_wire::walk::preserve_numbers(s.as_bytes(), inner.to_string().into_bytes());
         *s = String::from_utf8(out)
             .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
@@ -452,7 +770,8 @@ fn url_queries(
     for (start, stop) in spans {
         // The text before the query, without its `?`.
         let mut text = s[last..start - 1].to_string();
-        visit_plain(&mut text, content, skipped, rules, f);
+        let tier = plain_tier(&text, content, skipped, rules);
+        visit_views(&mut text, tier, Reading::Nested, f);
         out.push_str(&text);
         out.push('?');
         let query = &s[start..stop];
@@ -463,7 +782,8 @@ fn url_queries(
         last = stop;
     }
     let mut text = s[last..].to_string();
-    visit_plain(&mut text, content, skipped, rules, f);
+    let tier = plain_tier(&text, content, skipped, rules);
+    visit_views(&mut text, tier, Reading::Nested, f);
     out.push_str(&text);
     *s = out;
     Ok(true)
@@ -508,7 +828,7 @@ fn walk_form_at(
         let Some((k_raw, v_raw)) = piece.split_once('=') else {
             let mut text = decode_component(piece);
             let before = text.clone();
-            visit_at(&mut text, false, false, depth, rules, f)?;
+            visit_at(&mut text, false, false, depth, Reading::Nested, rules, f)?;
             if text == before {
                 out.push_str(piece);
             } else {
@@ -527,6 +847,7 @@ fn walk_form_at(
             is_content_key(&key),
             rules.skip_key(&key),
             depth,
+            Reading::Nested,
             rules,
             f,
         )?;
@@ -764,7 +1085,7 @@ pub(crate) fn walk_multipart(
         match text {
             Some(text) => {
                 let mut value = text.clone();
-                visit_text(&mut value, part.name.as_deref(), rules, f)?;
+                visit_field(&mut value, part.name.as_deref(), rules, f)?;
                 if value != text {
                     new = Some(if base64 {
                         base64_encode(value.as_bytes())
@@ -1054,7 +1375,7 @@ mod tests {
         // Unchanged JSON-in-string keeps its exact text.
         let spaced = r#"{ "a" : "x" }"#;
         let mut v = json!({"blob": spaced});
-        walk_json(&mut v, &r, &mut |_, _| {}).unwrap();
+        walk_json(&mut v, &r, &mut |_: &mut String, _: Tier| {}).unwrap();
         assert_eq!(v["blob"], spaced);
         // JSON typed into a content field is text: its keys get no say.
         let mut v = json!({"prompt": r#"{"id": "Ravi Kumar"}"#});
@@ -1115,6 +1436,65 @@ mod tests {
         assert_eq!(spans("https://a/b\u{a0}?c https://a/?"), Vec::<&str>::new());
         assert_eq!(spans("xhttps://a/?b ftp://a/?b https://é/?ü=1"), ["ü=1"]);
         assert!(spans("no url ?q=1").is_empty());
+    }
+
+    /// Scan R5.2/R5.3: the decoded reading maps every byte back to the raw
+    /// text it came from, so a value found decoded is replaced in the raw
+    /// text exactly.
+    #[test]
+    fn decoded_readings_map_back_to_raw_bytes() {
+        let (d, map) = decode_mapped("a+%C3%A9%zz%FF%40b");
+        assert_eq!(d, "a é%zz\u{fffd}@b");
+        assert_eq!(map.len(), d.len());
+        assert_eq!(map[1], (1, 2)); // `+`
+        assert_eq!((map[2], map[3]), ((2, 5), (5, 8))); // `é` from two escapes
+        assert_eq!(&map[7..10], &[(11, 14); 3]); // U+FFFD for `%FF`
+        assert_eq!(map[10], (14, 17)); // `@`
+        assert_eq!(
+            components("https://x.example/u/a%40b/?q=1&r#f=g"),
+            [
+                (0, 6),
+                (8, 17),
+                (18, 19),
+                (20, 25),
+                (27, 28),
+                (29, 30),
+                (31, 32),
+                (33, 34),
+                (35, 36)
+            ]
+        );
+        // Two readings of one text: one replacement where they overlap,
+        // re-encoded where the raw text was encoded, counted once.
+        struct Forget(Vec<String>);
+        impl Sink for Forget {
+            fn visit(&mut self, _: &mut String, _: Tier) {}
+            fn forget(&mut self, kind: &str) {
+                self.0.push(kind.to_string());
+            }
+        }
+        let hit = |start, end, s: &str, visit, encoded| Hit {
+            start,
+            end,
+            surrogate: s.into(),
+            kind: "Person".into(),
+            visit,
+            encoded,
+        };
+        let orig = "n=Ravi%20Kumar&m=x.y+z@e.example";
+        let mut sink = Forget(Vec::new());
+        let out = merge_hits(
+            orig,
+            vec![
+                hit(2, 6, "[NAME_2]", 0, false),
+                hit(2, 14, "[NAME_1]", 1, true),
+                hit(17, 32, "[EMAIL_1]", 0, false),
+                hit(21, 32, "[EMAIL_2]", 2, false),
+            ],
+            &mut sink,
+        );
+        assert_eq!(out, "n=%5BNAME_1%5D&m=[EMAIL_1]");
+        assert_eq!(sink.0.len(), 2);
     }
 
     #[test]
