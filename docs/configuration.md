@@ -154,9 +154,10 @@ Tags follow `replace.style` (there is no separate style for intercept).
     user's own history (chatgpt `GET /backend-api/conversation/*` and `/backend-api/conversations`;
     claude `GET /api/organizations/*/chat_conversations[/*]`). Gemini history comes from
     `batchexecute`, which is never restored, so **old Gemini chats show tags**.
-  - *Every other listed site:* only answers to a `POST` that stream (server-sent events, NDJSON, or
-    several JSON values in a row). A single JSON document, a text body or anything a `GET` returns
-    keeps its tags.
+  - *Every other listed site:* only answers to a `POST` that stream, by their content type
+    (`text/event-stream` or an NDJSON type such as `application/x-ndjson`). Anything typed as JSON
+    (a single document, or one followed by more lines, as a GraphQL answer ends in
+    `{"extensions":…}`), a text body or anything a `GET` returns keeps its tags.
   - Shared conversations, GPT or bot descriptions and public pages therefore keep their tags: a
     page someone else wrote cannot make your browser show (or send on) your real values. Paths are
     matched decoded once, case-insensitively, without the query; a path with an empty, `.` or `..`

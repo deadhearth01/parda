@@ -43,10 +43,11 @@ pub(crate) enum Restore {
     Never,
     /// Every format parda reads.
     Answer,
-    /// Only a stream (`text/event-stream`, NDJSON, or several JSON values
-    /// under a JSON type). A single JSON document or a text body passes
-    /// through: an AI answer to a send streams, while a document may be
-    /// anybody's content (a GraphQL query for a public page, a bot card).
+    /// Only a stream by its content type (`text/event-stream` or an NDJSON
+    /// type). Any JSON-typed body (one document, or one followed by more
+    /// lines, as a GraphQL answer ends in `{"extensions":…}`) or text body
+    /// passes through: an AI answer to a send streams, while a document may
+    /// be anybody's content (a GraphQL query for a public page, a bot card).
     Streamed,
 }
 

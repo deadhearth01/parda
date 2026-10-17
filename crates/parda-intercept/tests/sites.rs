@@ -62,9 +62,14 @@ fn site() -> Responder {
             ]),
         ),
         // Meta AI GraphQL: one JSON document, or several values (one per
-        // line) when the query asks for a stream.
+        // line) when the query asks for a stream, typed as NDJSON when it
+        // asks for that too, else as JSON.
         "/api/graphql/" if seen.text().contains("\"stream\":true") => Reply::new(
-            "application/json",
+            if seen.text().contains("\"ndjson\":true") {
+                "application/x-ndjson"
+            } else {
+                "application/json"
+            },
             vec![
                 format!("{}\n", json!({"seq": 1, "delta": "Hi [NAME_1]"})),
                 format!("{}\n", json!({"seq": 2, "delta": " bye"})),
@@ -689,11 +694,27 @@ async fn other_sites_get_back_streamed_answers_to_sends_only() {
         .unwrap();
     let v: Value = res.json().await.unwrap();
     assert_eq!(v["data"]["node"]["text"], "Hi [NAME_1]");
-    // ...while values streamed one per line under a JSON type are an
-    // answer being written: restored.
+    // ...and so do values one per line under a JSON type (a GraphQL
+    // document followed by `{"extensions":…}` looks just like that)...
     let res = c
         .post(&meta)
         .json(&json!({"variables": {"message": "Ravi Kumar again"}, "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    let body = res.text().await.unwrap();
+    let deltas: Vec<Value> = body
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(deltas[0]["delta"], "Hi [NAME_1]", "{body}");
+    // ...while the same values typed as NDJSON are an answer being
+    // written: restored.
+    let res = c
+        .post(&meta)
+        .json(
+            &json!({"variables": {"message": "Ravi Kumar again"}, "stream": true, "ndjson": true}),
+        )
         .send()
         .await
         .unwrap();
@@ -706,7 +727,7 @@ async fn other_sites_get_back_streamed_answers_to_sends_only() {
     assert_eq!(deltas[1]["delta"], " bye", "{body}");
 
     let seen = up.seen();
-    assert_eq!(seen.len(), 4);
+    assert_eq!(seen.len(), 5);
     assert!(
         seen[0].text().contains("I am [NAME_1]"),
         "{}",
@@ -717,11 +738,9 @@ async fn other_sites_get_back_streamed_answers_to_sends_only() {
         "{}",
         seen[2].text()
     );
-    assert!(
-        seen[3].text().contains("[NAME_1] again"),
-        "{}",
-        seen[3].text()
-    );
+    for r in &seen[3..] {
+        assert!(r.text().contains("[NAME_1] again"), "{}", r.text());
+    }
 }
 
 /// Reviewer probe (I4): a page opened as `chatgpt.com/?q=<prompt>` would

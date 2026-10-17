@@ -20,8 +20,9 @@
 //!
 //! Which answers are restored at all is decided per endpoint
 //! ([`crate::sites::restore_rule`]); [`for_stream_only`] is the rewriter for
-//! sites whose answers are restored only when they stream (a single JSON
-//! document or a text body passes through there).
+//! sites whose answers are restored only when they stream: event streams
+//! and NDJSON types; any JSON-typed body (even one holding several values)
+//! or text body passes through there.
 //!
 //! Real values only ever land inside parsed JSON strings (re-serialised),
 //! JSON-escaped in streamed JSON fragments, or in plain text; JSON carried
@@ -100,9 +101,10 @@ pub(crate) fn for_content_type_capped(
 }
 
 /// A rewriter for one streamed answer: like [`for_content_type`] for
-/// `text/event-stream`, NDJSON and several JSON values under a JSON type,
-/// but a single JSON document (Google frames included), a text body or any
-/// other type passes through unrestored.
+/// `text/event-stream` and NDJSON types; anything under a JSON type (one
+/// document, Google frames, or a document followed by more lines, as a
+/// GraphQL answer ends in `{"extensions":…}`), a text body or any other
+/// type passes through unrestored.
 pub(crate) fn for_stream_only(
     engine: &Engine,
     scope: &str,
@@ -111,8 +113,8 @@ pub(crate) fn for_stream_only(
     build(engine, scope, content_type, MAX_ITEM_BYTES, false)
 }
 
-/// The rewriter for `content_type`; `documents`: whether single JSON
-/// documents and text bodies are restored too.
+/// The rewriter for `content_type`; `documents`: whether JSON and text
+/// bodies are restored too (else only event streams and NDJSON types).
 fn build(
     engine: &Engine,
     scope: &str,
@@ -138,8 +140,8 @@ fn build(
         | "application/jsonl"
         | "application/x-jsonlines"
         | "application/stream+json" => Box::new(NdjsonRestore::new(engine, scope, cap)),
-        m if m == "application/json" || m == "text/json" || m.ends_with("+json") => {
-            Box::new(JsonRestore::new(engine, scope, cap, documents))
+        m if documents && (m == "application/json" || m == "text/json" || m.ends_with("+json")) => {
+            Box::new(JsonRestore::new(engine, scope, cap))
         }
         "text/plain" if documents => Box::new(PlainRestore {
             engine: engine.clone(),
@@ -618,7 +620,7 @@ impl PlainRestore {
                 out
             }
             PlainKind::Json => {
-                let mut j = JsonRestore::new(&self.engine, &self.scope, MAX_ITEM_BYTES, true);
+                let mut j = JsonRestore::new(&self.engine, &self.scope, MAX_ITEM_BYTES);
                 let out = j.push(&held).to_vec();
                 self.mode = PlainMode::Json(j);
                 out
@@ -678,8 +680,6 @@ enum JsonMode {
     Frames(Frames),
     /// Several JSON values one per line: an NDJSON stream after all.
     Lines(NdjsonRestore),
-    /// Passed through unrestored (a document where only streams are).
-    Raw,
 }
 
 /// Where the first top-level JSON value of a body ends, and whether
@@ -754,19 +754,15 @@ struct JsonRestore {
     engine: Engine,
     scope: String,
     cap: usize,
-    /// False: only a stream of JSON values is restored; one document (or
-    /// Google frames) passes through as it came.
-    documents: bool,
     mode: JsonMode,
 }
 
 impl JsonRestore {
-    fn new(engine: &Engine, scope: &str, cap: usize, documents: bool) -> Self {
+    fn new(engine: &Engine, scope: &str, cap: usize) -> Self {
         JsonRestore {
             engine: engine.clone(),
             scope: scope.to_string(),
             cap,
-            documents,
             mode: JsonMode::Buffer(Vec::new(), TopLevel::default()),
         }
     }
@@ -778,7 +774,6 @@ impl StreamTransform for JsonRestore {
             JsonMode::Stream(s) => return Bytes::from(s.push_bytes(chunk)),
             JsonMode::Frames(f) => return Bytes::from(f.push(chunk)),
             JsonMode::Lines(l) => return l.push(chunk),
-            JsonMode::Raw => return Bytes::copy_from_slice(chunk),
             JsonMode::Buffer(buf, top) => {
                 buf.extend_from_slice(chunk);
                 (buf, top)
@@ -786,10 +781,6 @@ impl StreamTransform for JsonRestore {
         };
         if buf.len() >= XSSI_PREFIX.len() && buf.starts_with(XSSI_PREFIX) {
             let held = std::mem::take(buf);
-            if !self.documents {
-                self.mode = JsonMode::Raw;
-                return Bytes::from(held);
-            }
             // JSON inside text, sent in pieces: frame by frame.
             let mut frames = Frames::new(&self.engine, &self.scope, self.cap);
             let out = frames.push(&held);
@@ -803,12 +794,6 @@ impl StreamTransform for JsonRestore {
             let out = lines.push(&held);
             self.mode = JsonMode::Lines(lines);
             return out;
-        }
-        if !self.documents && (top.scalar || buf.len() > MAX_JSON_BUFFER) {
-            // One value, never restored here: no need to hold it longer.
-            let held = std::mem::take(buf);
-            self.mode = JsonMode::Raw;
-            return Bytes::from(held);
         }
         if buf.len() <= MAX_JSON_BUFFER {
             return Bytes::new();
@@ -825,12 +810,8 @@ impl StreamTransform for JsonRestore {
             JsonMode::Stream(s) => Bytes::from(s.finish_bytes()),
             JsonMode::Frames(f) => Bytes::from(f.finish()),
             JsonMode::Lines(l) => l.finish(),
-            JsonMode::Raw => Bytes::new(),
             JsonMode::Buffer(buf, _) => {
                 let raw = std::mem::take(buf);
-                if !self.documents {
-                    return Bytes::from(raw);
-                }
                 if raw.starts_with(XSSI_PREFIX) {
                     let mut frames = Frames::new(&self.engine, &self.scope, self.cap);
                     let mut out = frames.push(&raw);

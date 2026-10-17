@@ -1847,11 +1847,7 @@ pub(crate) mod tests {
         ] {
             for path in ["/api/v0/chat/completion", "/api/graphql/", "/"] {
                 // Streamed answers to the user's sends.
-                for ct in [
-                    "text/event-stream",
-                    "application/x-ndjson",
-                    "application/json; lines",
-                ] {
+                for ct in ["text/event-stream", "application/x-ndjson"] {
                     assert!(
                         restored(&t, &Method::POST, host, path, ct),
                         "{host}{path} {ct}"
@@ -1865,8 +1861,9 @@ pub(crate) mod tests {
                         "{host}{path} {ct}"
                     );
                 }
-                // A single document (a GraphQL answer, a page) never.
-                for ct in ["application/json", "text/plain"] {
+                // A single document (a GraphQL answer, a page) never, nor
+                // JSON values one per line under a JSON type.
+                for ct in ["application/json", "application/json; lines", "text/plain"] {
                     for m in [Method::POST, Method::GET] {
                         assert!(!restored(&t, &m, host, path, ct), "{m} {host}{path} {ct}");
                     }
@@ -1879,6 +1876,65 @@ pub(crate) mod tests {
         let mut out = r.push(framed.as_bytes()).to_vec();
         out.extend_from_slice(&r.finish());
         assert_eq!(out, framed.as_bytes());
+    }
+
+    /// Review F2: on a site restored only where it streams, a JSON
+    /// document followed by another line (meta.ai's GraphQL answers end in
+    /// `{"extensions":{"is_final":true}}`) was read as a stream of JSON
+    /// values and restored. Only event streams and NDJSON types stream
+    /// there; JSON values one per line stay a stream on a known site's own
+    /// endpoints.
+    #[test]
+    fn json_documents_with_trailing_lines_are_not_streams_on_other_sites() {
+        use http::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let t = global(dir.path());
+        let run = |host: &str, path: &str, ct: &str, body: &str| {
+            let mut r = t.response_stream(&Method::POST, host, path, ct);
+            let mut out = Vec::new();
+            for b in body.as_bytes().chunks(9) {
+                out.extend_from_slice(&r.push(b));
+            }
+            out.extend_from_slice(&r.finish());
+            String::from_utf8(out).unwrap()
+        };
+        let doc = json!({"data": {"bot": {"description": "Public bot: hi [NAME_1]"}}}).to_string();
+        let fin = "{\"extensions\":{\"is_final\":true}}";
+        for body in [
+            doc.clone(),
+            format!("{doc}\r\n{fin}"),
+            format!("{doc}\n{fin}\n"),
+            format!("{doc}\n{doc}\n"),
+            format!("{doc}\nx"),
+            format!("{doc}\n0"),
+        ] {
+            for host in ["meta.ai", "poe.com", "chat.deepseek.com"] {
+                for ct in [
+                    "application/json",
+                    "application/json; charset=utf-8",
+                    "text/json",
+                    "application/graphql-response+json",
+                    "text/plain",
+                ] {
+                    assert_eq!(run(host, "/api/graphql/", ct, &body), body, "{host} {ct}");
+                }
+            }
+        }
+        // The same lines as NDJSON or events do stream.
+        let nd = format!("{doc}\n{fin}\n");
+        assert!(
+            run("meta.ai", "/api/graphql/", "application/x-ndjson", &nd).contains("Ravi Kumar")
+        );
+        let ev = format!("data: {doc}\n\n");
+        assert!(run("meta.ai", "/api/graphql/", "text/event-stream", &ev).contains("Ravi Kumar"));
+        // A known site's send endpoint still reads JSON lines as a stream.
+        let out = run(
+            "chatgpt.com",
+            "/backend-api/conversation",
+            "application/json",
+            &nd,
+        );
+        assert!(out.contains("Ravi Kumar"), "{out}");
     }
 
     #[test]
