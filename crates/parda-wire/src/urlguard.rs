@@ -70,10 +70,13 @@ enum Md {
 enum Html {
     #[default]
     Free,
-    /// Inside a tag; `name` while the tag name is being read.
-    Tag {
-        name: bool,
-    },
+    /// The tag name state.
+    TagName,
+    /// Before an attribute name (also after a quoted value or a `/`): a
+    /// `=` here starts a name, not a value.
+    BeforeAttr,
+    /// An attribute name, or whitespace after one: `=` starts its value.
+    AttrName,
     /// After `=` in a tag: ASCII whitespace before the value.
     ValueBefore,
     ValueQuoted(char),
@@ -203,7 +206,7 @@ impl UrlGuard {
     fn html_trigger(&self, c: char, prev: Option<char>) -> Html {
         let r = &self.recent;
         if c.is_ascii_alphabetic() && prev == Some('<') {
-            Html::Tag { name: true }
+            Html::TagName
         } else if r.ends_with("url(") || r.ends_with("image-set(") {
             Html::CssFn {
                 depth: 0,
@@ -325,11 +328,24 @@ fn bare(c: char, depth: u32) -> (bool, Md) {
 fn html_step(state: Html, c: char) -> (bool, Html) {
     match state {
         Html::Free => (false, Html::Free),
-        Html::Tag { name } => match c {
+        // A `/` (self-closing start tag state) goes back to before an
+        // attribute name; so does anything after a quoted value.
+        Html::TagName => match c {
             '>' => (false, Html::Free),
-            '=' if !name => (false, Html::ValueBefore),
-            c if html_space(c) || c == '/' => (false, Html::Tag { name: false }),
-            _ => (false, Html::Tag { name }),
+            c if html_space(c) || c == '/' => (false, Html::BeforeAttr),
+            _ => (false, Html::TagName),
+        },
+        Html::BeforeAttr => match c {
+            '>' => (false, Html::Free),
+            c if html_space(c) || c == '/' => (false, Html::BeforeAttr),
+            // `=` too: it starts an attribute name.
+            _ => (false, Html::AttrName),
+        },
+        Html::AttrName => match c {
+            '>' => (false, Html::Free),
+            '=' => (false, Html::ValueBefore),
+            '/' => (false, Html::BeforeAttr),
+            _ => (false, Html::AttrName),
         },
         Html::ValueBefore => {
             if html_space(c) {
@@ -344,7 +360,7 @@ fn html_step(state: Html, c: char) -> (bool, Html) {
         }
         Html::ValueQuoted(q) => {
             if c == q {
-                (false, Html::Tag { name: false })
+                (false, Html::BeforeAttr)
             } else {
                 (true, Html::ValueQuoted(q))
             }
@@ -353,7 +369,7 @@ fn html_step(state: Html, c: char) -> (bool, Html) {
             if c == '>' {
                 (false, Html::Free)
             } else if html_space(c) {
-                (false, Html::Tag { name: false })
+                (false, Html::BeforeAttr)
             } else {
                 (true, Html::ValueBare)
             }
