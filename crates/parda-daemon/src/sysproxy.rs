@@ -813,7 +813,10 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert!(w[0].active && w[0].parda, "{w:?}");
         let g = inspect(&mut os, Platform::Linux, PAC).unwrap();
-        assert!(!g[0].active && !g[0].parda, "manual mode: the PAC is unused");
+        assert!(
+            !g[0].active && !g[0].parda,
+            "manual mode: the PAC is unused"
+        );
         os.gnome.0 = "auto".into();
         assert!(inspect(&mut os, Platform::Linux, PAC).unwrap()[0].parda);
         os.win = None;
