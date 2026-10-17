@@ -405,6 +405,45 @@ mod tests {
         assert_eq!(v, json!({"key": ["A\"BX", "\u{c9}X"], "n": 1}));
     }
 
+    /// Upper-cases everything after the first `!` it has seen: its output
+    /// depends on state carried from earlier pieces.
+    struct AfterBang(bool);
+
+    impl ValueRestorer for AfterBang {
+        fn push(&mut self, text: &str) -> String {
+            let mut out = String::new();
+            for c in text.chars() {
+                out.push(if self.0 { c.to_ascii_uppercase() } else { c });
+                self.0 |= c == '!';
+            }
+            out
+        }
+        fn finish(&mut self) -> String {
+            String::new()
+        }
+        fn pending_len(&self) -> usize {
+            0
+        }
+    }
+
+    /// M3: a forced flush in the middle of a value keeps that value's
+    /// restorer, so its state (a URL guard's, here a flag) carries on, and
+    /// the rest of the value is not lost.
+    #[test]
+    fn finish_mid_value_keeps_the_value_restorer() {
+        let new_value: NewValueRestorer = Box::new(|| Box::new(AfterBang(false)));
+        let mut r = JsonFragRestorer::with_values(new_value);
+        let mut out = r.push("{\"a\": \"x!y");
+        out.push_str(&r.finish());
+        out.push_str(&r.push("z\", \"b\": \"q"));
+        out.push_str(&r.finish());
+        out.push_str(&r.push("!r\"}"));
+        out.push_str(&r.finish());
+        let v: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+        // A new value starts with a new restorer.
+        assert_eq!(v, json!({"a": "x!YZ", "b": "q!R"}));
+    }
+
     #[test]
     fn pending_len_counts_what_is_held_back() {
         let dir = tempfile::tempdir().unwrap();

