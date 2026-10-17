@@ -33,13 +33,23 @@ impl HostList {
 
     /// Exact or subdomain match against an entry; `host` has no port.
     pub fn matches(&self, host: &str) -> bool {
+        self.entry_for(host).is_some()
+    }
+
+    /// The entry `host` falls under (the most specific one when entries
+    /// nest); `host` has no port.
+    pub fn entry_for(&self, host: &str) -> Option<&str> {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
-        self.entries.iter().any(|e| {
-            host == *e
-                || (host.len() > e.len()
-                    && host.ends_with(e.as_str())
-                    && host.as_bytes()[host.len() - e.len() - 1] == b'.')
-        })
+        self.entries
+            .iter()
+            .filter(|e| {
+                host == **e
+                    || (host.len() > e.len()
+                        && host.ends_with(e.as_str())
+                        && host.as_bytes()[host.len() - e.len() - 1] == b'.')
+            })
+            .max_by_key(|e| e.len())
+            .map(String::as_str)
     }
 
     /// The normalized entries (lowercase, no leading `*.`/`.`, no trailing dot).
@@ -54,6 +64,19 @@ mod tests {
 
     fn list(v: &[&str]) -> HostList {
         HostList::new(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn entry_for_names_the_most_specific_entry() {
+        let l = list(&["google.com", "gemini.google.com", "claude.ai"]);
+        assert_eq!(l.entry_for("Gemini.Google.com."), Some("gemini.google.com"));
+        assert_eq!(
+            l.entry_for("x.gemini.google.com"),
+            Some("gemini.google.com")
+        );
+        assert_eq!(l.entry_for("mail.google.com"), Some("google.com"));
+        assert_eq!(l.entry_for("api.claude.ai"), Some("claude.ai"));
+        assert_eq!(l.entry_for("claude.ai.evil"), None);
     }
 
     #[test]

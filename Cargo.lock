@@ -2856,17 +2856,27 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "flate2",
+ "form_urlencoded",
  "futures",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "parda-core",
+ "parda-detect",
+ "parda-engine",
+ "parda-wire",
+ "percent-encoding",
+ "proptest",
  "rand 0.8.8",
  "rcgen",
  "reqwest",
  "rustls",
  "rustls-pki-types",
  "serde",
+ "serde_json",
+ "tempfile",
  "time",
  "tokio",
  "tokio-rustls",
@@ -2917,7 +2927,6 @@ dependencies = [
  "anyhow",
  "axum",
  "brotli",
- "brotli-decompressor",
  "bytes",
  "flate2",
  "futures",
@@ -2925,6 +2934,7 @@ dependencies = [
  "parda-core",
  "parda-detect",
  "parda-engine",
+ "parda-wire",
  "proptest",
  "reqwest",
  "ruzstd",
@@ -2969,6 +2979,22 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "parda-wire"
+version = "0.1.0"
+dependencies = [
+ "brotli-decompressor",
+ "bytes",
+ "flate2",
+ "http",
+ "parda-core",
+ "parda-detect",
+ "parda-engine",
+ "ruzstd",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

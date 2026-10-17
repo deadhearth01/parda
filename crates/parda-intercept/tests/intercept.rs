@@ -75,6 +75,7 @@ fn test_pki(names: &[&str]) -> TestPki {
 #[derive(Debug, Clone)]
 struct Seen {
     path: String,
+    query: Option<String>,
     body: String,
     host: String,
     version: http::Version,
@@ -101,6 +102,7 @@ async fn upstream_handle(
     sse_done: Arc<AtomicBool>,
 ) -> Result<Response<Body>, Infallible> {
     let path = req.uri().path().to_string();
+    let query = req.uri().query().map(str::to_string);
     // HTTP/2 carries the authority in the URI, HTTP/1.1 in Host.
     let host = match req.uri().authority() {
         Some(a) => a.to_string(),
@@ -114,6 +116,7 @@ async fn upstream_handle(
     if path == "/ws" {
         seen.lock().unwrap().push(Seen {
             path,
+            query,
             body: String::new(),
             host,
             version,
@@ -149,6 +152,7 @@ async fn upstream_handle(
     let body = String::from_utf8(body.to_vec()).unwrap();
     seen.lock().unwrap().push(Seen {
         path: path.clone(),
+        query,
         body: body.clone(),
         host,
         version,
@@ -234,9 +238,16 @@ async fn start_upstream(pki: TestPki) -> Upstream {
 
 // ------------------------------------------------------------ test transform
 
-/// Request: "secret" → "SECRET" (refuses bodies containing "refuse-me").
-/// Response: "SECRET" → "secret", holding back a possible split match.
+/// Request: "secret" → "SECRET" in the body and the query (refuses bodies
+/// containing "refuse-me"). Response: "SECRET" → "secret", holding back a
+/// possible split match. Every call checks it runs on the blocking pool.
 struct Upper;
+
+/// Panics on an async worker thread ("Cannot start a runtime from within a
+/// runtime"); works on the blocking pool.
+fn assert_blocking_pool() {
+    tokio::runtime::Handle::current().block_on(async {});
+}
 
 impl BodyTransform for Upper {
     fn request(
@@ -246,6 +257,7 @@ impl BodyTransform for Upper {
         _headers: &http::HeaderMap,
         body: Bytes,
     ) -> Result<Bytes, Refusal> {
+        assert_blocking_pool();
         let s = String::from_utf8_lossy(&body);
         if s.contains("refuse-me") {
             return Err(Refusal {
@@ -254,6 +266,11 @@ impl BodyTransform for Upper {
             });
         }
         Ok(Bytes::from(s.replace("secret", "SECRET")))
+    }
+
+    fn request_target(&self, _host: &str, path_and_query: &str) -> Result<String, Refusal> {
+        assert_blocking_pool();
+        Ok(path_and_query.replace("secret", "SECRET"))
     }
 
     fn response_stream(
@@ -273,6 +290,7 @@ struct Lower {
 
 impl StreamTransform for Lower {
     fn push(&mut self, chunk: &[u8]) -> Bytes {
+        assert_blocking_pool();
         const PAT: &[u8] = b"SECRET";
         self.carry.extend_from_slice(chunk);
         let text = String::from_utf8_lossy(&self.carry).replace("SECRET", "secret");
@@ -287,6 +305,7 @@ impl StreamTransform for Lower {
     }
 
     fn finish(&mut self) -> Bytes {
+        assert_blocking_pool();
         Bytes::from(std::mem::take(&mut self.carry))
     }
 }
@@ -964,4 +983,35 @@ async fn ws_connect_to_a_listed_host_on_port_80_is_refused() {
         .unwrap();
     let head = read_head(&mut tcp).await;
     assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+}
+
+#[tokio::test]
+async fn query_strings_go_through_the_transform_on_the_blocking_pool() {
+    let up = start_upstream(test_pki(&["chat.test"])).await;
+    let mut h = start_parda(&up.ca_pem).await;
+    let c = client(h.proxy, &h.state.ca.cert_pem());
+
+    // No body: only the target is rewritten.
+    let res = c
+        .get(format!("https://chat.test:{}/echo?q=my+secret", up.port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    // A body and a query in one request.
+    let res = c
+        .post(format!("https://chat.test:{}/echo?q=secret", up.port))
+        .body("a secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.text().await.unwrap(), "echo: a secret");
+    let seen = up.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].path, "/echo");
+    assert_eq!(seen[0].query.as_deref(), Some("q=my+SECRET"));
+    assert_eq!(seen[1].query.as_deref(), Some("q=SECRET"));
+    assert_eq!(seen[1].body, "a SECRET");
+    // The event path never carries the query.
+    assert_eq!(next_event(&mut h.events).await.path, "/echo");
 }

@@ -489,12 +489,34 @@ async fn forward(
             "parda intercept: Host does not match the CONNECT target\n",
         ));
     }
-    let url = format!(
-        "https://{}{}",
-        target.authority(),
-        req.uri().path_and_query().map_or("/", |p| p.as_str())
-    );
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map_or("/", |p| p.as_str())
+        .to_string();
     if is_upgrade(req.headers()) {
+        // Only the target can carry text here; the tunnel is not inspected.
+        let started = Instant::now();
+        let outcome = rewrite_request(
+            &state,
+            &target.host,
+            &path_and_query,
+            req.headers().clone(),
+            Bytes::new(),
+        )
+        .await;
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(refusal) => {
+                let added_ms = started.elapsed().as_millis() as u64;
+                return Ok(refuse(&state, &target, &path, added_ms, refusal));
+            }
+        };
+        let url = format!(
+            "https://{}{}",
+            target.authority(),
+            outcome.target.as_deref().unwrap_or(&path_and_query)
+        );
         return Ok(upgrade(req, &state, &target, path, url).await);
     }
 
@@ -531,31 +553,28 @@ async fn forward(
     };
 
     let started = Instant::now();
-    let outcome = if body.is_empty() {
+    let outcome = if body.is_empty() && !path_and_query.contains('?') {
         Ok(RequestOutcome::default())
     } else {
-        state
-            .transform
-            .request_outcome(&target.host, &path, &parts.headers, body)
+        rewrite_request(
+            &state,
+            &target.host,
+            &path_and_query,
+            parts.headers.clone(),
+            body,
+        )
+        .await
     };
     let added_ms = started.elapsed().as_millis() as u64;
     let outcome = match outcome {
         Ok(o) => o,
-        Err(refusal) => {
-            let status = StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::FORBIDDEN);
-            emit(
-                &state,
-                &target,
-                &path,
-                status.as_u16(),
-                Default::default(),
-                added_ms,
-                Some(refusal.message.clone()),
-                0,
-            );
-            return Ok(text(status, &format!("{}\n", refusal.message)));
-        }
+        Err(refusal) => return Ok(refuse(&state, &target, &path, added_ms, refusal)),
     };
+    let url = format!(
+        "https://{}{}",
+        target.authority(),
+        outcome.target.as_deref().unwrap_or(&path_and_query)
+    );
 
     let mut headers = end_to_end(&parts.headers);
     headers.remove(HOST);
@@ -627,7 +646,7 @@ async fn forward(
             stream,
             state
                 .transform
-                .response_stream(&target.host, &path, &content_type),
+                .response_stream_for(&parts.method, &target.host, &path, &content_type),
         )
     };
     let mut out = Response::new(body);
@@ -636,32 +655,98 @@ async fn forward(
     Ok(out)
 }
 
-/// Stream `upstream` through `rewriter`, chunk by chunk, then flush it.
+/// Run [`BodyTransform::rewrite_request`] on the blocking pool: redaction
+/// may run the ML model, read the vault or wait on the engine's locks.
+async fn rewrite_request(
+    state: &InterceptState,
+    host: &str,
+    path_and_query: &str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<RequestOutcome, crate::Refusal> {
+    let transform = state.transform.clone();
+    let (host, path_and_query) = (host.to_string(), path_and_query.to_string());
+    tokio::task::spawn_blocking(move || {
+        transform.rewrite_request(&host, &path_and_query, &headers, body)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(crate::Refusal {
+            status: 500,
+            message: "parda_internal: parda failed to filter the request; it was not sent".into(),
+        })
+    })
+}
+
+/// Answer a refused request; nothing goes upstream.
+fn refuse(
+    state: &InterceptState,
+    target: &Target,
+    path: &str,
+    added_ms: u64,
+    refusal: crate::Refusal,
+) -> Response<Body> {
+    let status = StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::FORBIDDEN);
+    emit(
+        state,
+        target,
+        path,
+        status.as_u16(),
+        Default::default(),
+        added_ms,
+        Some(refusal.message.clone()),
+        0,
+    );
+    text(status, &format!("{}\n", refusal.message))
+}
+
+/// Stream `upstream` through `rewriter`, chunk by chunk, then flush it. The
+/// rewriter runs on the blocking pool (restoring may read the vault or wait
+/// on the engine's locks); the stream stays incremental.
 fn transformed(
     upstream: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
     rewriter: Box<dyn StreamTransform>,
 ) -> Body {
-    let frames =
-        futures::stream::unfold(Some((Box::pin(upstream), rewriter)), |state| async move {
-            let (mut upstream, mut rewriter) = state?;
+    if rewriter.is_passthrough() {
+        return passthrough(upstream);
+    }
+    let failed = || BoxError::from("parda intercept: failed to rewrite the response");
+    let frames = futures::stream::unfold(
+        Some((Box::pin(upstream), rewriter)),
+        move |state| async move {
+            let (mut upstream, rewriter) = state?;
+            let mut rewriter = Some(rewriter);
             loop {
-                match upstream.next().await {
+                let chunk = upstream.next().await;
+                let mut rw = rewriter.take()?;
+                match chunk {
                     Some(Ok(chunk)) => {
-                        let out = rewriter.push(&chunk);
+                        let Ok((rw, out)) = tokio::task::spawn_blocking(move || {
+                            let out = rw.push(&chunk);
+                            (rw, out)
+                        })
+                        .await
+                        else {
+                            return Some((Err(failed()), None));
+                        };
                         if !out.is_empty() {
-                            return Some((Ok(Frame::data(out)), Some((upstream, rewriter))));
+                            return Some((Ok(Frame::data(out)), Some((upstream, rw))));
                         }
+                        rewriter = Some(rw);
                     }
                     Some(Err(e)) => {
                         return Some((Err(BoxError::from(e.without_url())), None));
                     }
                     None => {
-                        let out = rewriter.finish();
+                        let Ok(out) = tokio::task::spawn_blocking(move || rw.finish()).await else {
+                            return Some((Err(failed()), None));
+                        };
                         return (!out.is_empty()).then(|| (Ok(Frame::data(out)), None));
                     }
                 }
             }
-        });
+        },
+    );
     BodyExt::boxed_unsync(StreamBody::new(frames))
 }
 

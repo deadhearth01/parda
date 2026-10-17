@@ -264,7 +264,7 @@ impl Engine {
     /// Find entities without replacing anything.
     pub fn scan(&self, text: &str) -> Result<Vec<Detection>> {
         let det = self.inner.detectors.read().clone();
-        let (mut per_text, _, _) = self.inner.detect(&det, &[text])?;
+        let (mut per_text, _, _) = self.inner.detect(&det, &[text], &[])?;
         Ok(flatten(resolve(text, per_text.pop().unwrap_or_default())))
     }
 
@@ -279,6 +279,21 @@ impl Engine {
     /// With protection switched off every text comes back unchanged and
     /// marked [`Redaction::paused`].
     pub fn redact_many(&self, texts: &[&str], scope: &str) -> Result<Vec<Redaction>> {
+        self.redact_many_tiered(texts, &[], scope)
+    }
+
+    /// [`Engine::redact_many`] where the texts flagged in `rules_only` skip
+    /// the ML model and see only the dictionary and rule tiers: identifiers
+    /// a site needs verbatim (ids, tokens, enum words), which the model could
+    /// mistake for names, while an e-mail, phone or key in them is still
+    /// redacted. Still one call and one ML batch for the other texts.
+    /// Missing flags count as `false`.
+    pub fn redact_many_tiered(
+        &self,
+        texts: &[&str],
+        rules_only: &[bool],
+        scope: &str,
+    ) -> Result<Vec<Redaction>> {
         if !self.inner.detectors.read().config.protection.enabled {
             return Ok(texts
                 .iter()
@@ -293,12 +308,23 @@ impl Engine {
                 })
                 .collect());
         }
-        self.inner.redact_many(texts, scope)
+        self.inner.redact_many(texts, rules_only, scope)
     }
 
     pub fn restore(&self, text: &str, scope: &str) -> String {
         match self.inner.table(scope) {
             Some(t) => t.apply(text, None),
+            None => text.to_string(),
+        }
+    }
+
+    /// [`Engine::restore`], except that a surrogate is left as it is when
+    /// the run of non-ASCII-whitespace text before it holds any of
+    /// `/ ? = & % \ : @`, follows `www.`, or is longer than 2 KiB: a real
+    /// value is never put back into something shaped like a URL or query.
+    pub fn restore_url_safe(&self, text: &str, scope: &str) -> String {
+        match self.inner.table(scope) {
+            Some(t) => t.apply_url_safe(text, None, &mut crate::restore::UrlRun::default()),
             None => text.to_string(),
         }
     }
@@ -770,10 +796,27 @@ impl Inner {
     /// linear and cheap), so no split can cut a value they would find. Only
     /// the model runs per window ([`ml_windows`], overlapping), with its
     /// results cached per window; the final result is cached per text.
-    fn detect(&self, det: &Detectors, texts: &[&str]) -> Result<(Vec<Vec<Detection>>, u64, bool)> {
+    ///
+    /// Texts flagged in `rules_only` skip the model (and have their own
+    /// cache entries).
+    fn detect(
+        &self,
+        det: &Detectors,
+        texts: &[&str],
+        rules_only: &[bool],
+    ) -> Result<(Vec<Vec<Detection>>, u64, bool)> {
+        let rules_only = |i: usize| rules_only.get(i).copied().unwrap_or(false);
         let keys: Vec<cache::Key> = texts
             .iter()
-            .map(|t| cache::key("found", det.epoch, t))
+            .enumerate()
+            .map(|(i, t)| {
+                let kind = if rules_only(i) {
+                    "found-rules"
+                } else {
+                    "found"
+                };
+                cache::key(kind, det.epoch, t)
+            })
             .collect();
         let mut results: Vec<Option<Arc<Vec<Detection>>>> =
             keys.iter().map(|k| self.cache.get(k)).collect();
@@ -788,8 +831,10 @@ impl Inner {
         let ml_required = det.ml_required();
         let model = self.ml.as_ref().map_or("", |m| m.name());
         let mut windows: HashMap<usize, Vec<Win>> = HashMap::new();
+        // The texts that need the model.
+        let ml_misses: Vec<usize> = misses.iter().copied().filter(|&i| !rules_only(i)).collect();
         if ml_required {
-            for &ti in &misses {
+            for &ti in &ml_misses {
                 let text = texts[ti];
                 let w = ml_windows(text, DEFAULT_MAX_FRAGMENT_BYTES)
                     .into_iter()
@@ -807,7 +852,7 @@ impl Inner {
         let mut ml_ms = 0;
         let mut ml_skipped = false;
         let mut ml_dets: HashMap<cache::Key, Arc<Vec<Detection>>> = HashMap::new();
-        if ml_required && !misses.is_empty() {
+        if ml_required && !ml_misses.is_empty() {
             match &self.ml {
                 None => {
                     if strict {
@@ -819,7 +864,7 @@ impl Inner {
                     // Unique windows that the model has not seen.
                     let mut texts_for_ml = Vec::new();
                     let mut keys_for_ml = Vec::new();
-                    for &ti in &misses {
+                    for &ti in &ml_misses {
                         for w in &windows[&ti] {
                             let body = &texts[ti][w.span.start..w.span.end];
                             if ml_dets.contains_key(&w.key) || keys_for_ml.contains(&w.key) {
@@ -882,9 +927,9 @@ impl Inner {
             let text = texts[ti];
             let mut dets = det.dict.detect(text);
             dets.extend(det.rules.detect(text));
-            if ml_required && !ml_skipped {
+            if let Some(text_windows) = windows.get(&ti).filter(|_| ml_required && !ml_skipped) {
                 let mut seen = std::collections::HashSet::new();
-                for w in &windows[&ti] {
+                for w in text_windows {
                     let Some(found) = ml_dets.get(&w.key) else {
                         continue;
                     };
@@ -912,7 +957,7 @@ impl Inner {
             let mut dets = det.allow.filter(text, dets);
             dets.sort_by_key(|d| (d.span.start, d.span.end));
             let dets = Arc::new(dets);
-            if ml_ok {
+            if ml_ok || rules_only(ti) {
                 self.cache.put(keys[ti], dets.clone());
             }
             results[ti] = Some(dets);
@@ -930,9 +975,14 @@ impl Inner {
         Ok((per_text, ml_ms, ml_skipped))
     }
 
-    fn redact_many(&self, texts: &[&str], scope: &str) -> Result<Vec<Redaction>> {
+    fn redact_many(
+        &self,
+        texts: &[&str],
+        rules_only: &[bool],
+        scope: &str,
+    ) -> Result<Vec<Redaction>> {
         let det = self.detectors.read().clone();
-        let (per_text, ml_ms, ml_skipped) = self.detect(&det, texts)?;
+        let (per_text, ml_ms, ml_skipped) = self.detect(&det, texts, rules_only)?;
 
         // Policy first, over everything every tier found: a `block` kind
         // refuses the request wherever it sits (inside a URL too), a `warn`
