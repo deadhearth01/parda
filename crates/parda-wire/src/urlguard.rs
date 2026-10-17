@@ -144,10 +144,11 @@ impl UrlGuard {
         let mut url = false;
         let mut md: Vec<Md> = Vec::with_capacity(self.md.len() + 1);
         for state in std::mem::take(&mut self.md) {
-            let (u, next) = md_step(state, c);
-            url |= u;
-            if next != Md::Free && !md.contains(&next) {
-                md.push(next);
+            for (u, next) in std::iter::once(md_step(state, c)).chain(md_also(state, c)) {
+                url |= u;
+                if next != Md::Free && !md.contains(&next) {
+                    md.push(next);
+                }
             }
         }
         let (html_url, html) = html_step(self.html, c);
@@ -221,6 +222,18 @@ impl UrlGuard {
     }
 }
 
+/// A second reading of `c` in `state`, followed besides `md_step`'s: where
+/// the text can be read two ways, both are guarded.
+fn md_also(state: Md, c: char) -> Option<(bool, Md)> {
+    match state {
+        // After a line ending `>` is a block-quote marker, or (indented by
+        // four or more spaces, or lazily continued) the first character of
+        // a bare destination.
+        Md::DestBefore { new_line: true } if c == '>' => Some(bare(c, 0)),
+        _ => None,
+    }
+}
+
 /// One character of the markdown reading.
 fn md_step(state: Md, c: char) -> (bool, Md) {
     match state {
@@ -237,8 +250,8 @@ fn md_step(state: Md, c: char) -> (bool, Md) {
                 let new_line = new_line || line_ending(c);
                 (false, Md::DestBefore { new_line })
             } else if new_line && c == '>' {
-                // A block-quote marker (or a destination that starts
-                // with `>`): what follows may be the destination.
+                // A block-quote marker: what follows may be the
+                // destination (`md_also` follows the other reading).
                 (true, Md::DestBefore { new_line })
             } else if c == '<' {
                 (false, Md::DestPointy { escaped: false })
@@ -654,6 +667,12 @@ mod tests {
             "> [a](\n> ⟨//e/[NAME_1]⟩)",
             // §5.1 a lazy continuation line.
             "> [r]:\n⟨//e/[NAME_1]⟩",
+            // §5.1 / §4.4: indented four spaces, `>` is not a marker but
+            // the first character of a bare destination (§6.3).
+            "[a](\n    ⟨><a>[NAME_1]⟩)",
+            "[r]:\n    ⟨><a>[NAME_1]⟩",
+            "> [r]:\n>     ⟨><a>[NAME_1]⟩",
+            "[r]:\n    ⟨>[NAME_1]⟩",
             // §5.2 definitions in list items.
             "- [r]: ⟨//e/[NAME_1]⟩",
             "1) [r]: ⟨//e/[NAME_1]⟩",
