@@ -14,7 +14,9 @@
 //!   whitespace never ends a URL.
 //! - Autolinks `<scheme:…>`.
 //! - Inside an HTML tag (`<` + letter … `>`), every attribute value; only
-//!   TAB, LF, FF, CR and SPACE end an unquoted one, as for browsers.
+//!   TAB, LF, FF, CR and SPACE end an unquoted one, as for browsers. A tag
+//!   is read from every `<` + letter, even inside what another reading
+//!   takes for a value: that may be a comment, CDATA or code to a renderer.
 //! - CSS `url(…)` and `image-set(…)` (quotes honoured, to an unquoted `)`),
 //!   and what follows `@import` (to an unquoted `;`, across line breaks).
 //!
@@ -65,43 +67,50 @@ enum Md {
     Autolink,
 }
 
-/// The HTML / CSS reading of the text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum Html {
-    #[default]
-    Free,
+/// One HTML tag reading (a start tag that may have begun at a `<` +
+/// letter), in the states of the HTML tokenizer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tag {
     /// The tag name state.
-    TagName,
+    Name,
     /// Before an attribute name (also after a quoted value or a `/`): a
     /// `=` here starts a name, not a value.
     BeforeAttr,
     /// An attribute name, or whitespace after one: `=` starts its value.
     AttrName,
-    /// After `=` in a tag: ASCII whitespace before the value.
+    /// After `=`: ASCII whitespace before the value.
     ValueBefore,
     ValueQuoted(char),
     ValueBare,
+}
+
+/// The CSS reading of the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Css {
+    #[default]
+    Free,
     /// `url(` / `image-set(`: to an unquoted `)` at depth 0.
-    CssFn {
+    Fn {
         depth: u32,
         quote: Option<char>,
         escaped: bool,
     },
     /// After `@import`: to an unquoted `;`.
-    CssImport {
-        quote: Option<char>,
-    },
+    Import { quote: Option<char> },
 }
 
-/// Splits a stream of text into URL and non-URL parts. Markdown and HTML
-/// are read side by side, and every place a markdown destination could
-/// start is followed (a construct can turn out to be unterminated, or hide
-/// another): a character is inside a URL if any reading says so.
+/// Splits a stream of text into URL and non-URL parts. Markdown, HTML and
+/// CSS are read side by side, and every place a markdown destination or an
+/// HTML tag could start is followed (a construct can turn out to be
+/// unterminated, to be text inside a comment or code, or hide another): a
+/// character is inside a URL if any reading says so.
 #[derive(Debug, Default)]
 pub struct UrlGuard {
     /// Markdown readings in progress (never `Free`).
     md: Vec<Md>,
-    html: Html,
+    /// Tag readings in progress (at most one per state).
+    tags: Vec<Tag>,
+    css: Css,
     /// The last characters seen, lower-cased.
     recent: String,
     prev: Option<char>,
@@ -151,9 +160,27 @@ impl UrlGuard {
                 }
             }
         }
-        let (html_url, html) = html_step(self.html, c);
-        url |= html_url;
+        let mut tags: Vec<Tag> = Vec::with_capacity(self.tags.len() + 1);
+        for state in std::mem::take(&mut self.tags) {
+            for (u, next) in std::iter::once(tag_step(state, c)).chain(tag_also(state, c)) {
+                url |= u;
+                if let Some(next) = next
+                    && !tags.contains(&next)
+                {
+                    tags.push(next);
+                }
+            }
+        }
+        let (css_url, css) = css_step(self.css, c);
+        url |= css_url;
         self.remember(c);
+        // A tag may start at any `<` + letter, whatever else is going on:
+        // what another reading takes for a quoted value may be a comment,
+        // CDATA, raw text or markdown code to a renderer.
+        if c.is_ascii_alphabetic() && prev == Some('<') && !tags.contains(&Tag::Name) {
+            tags.push(Tag::Name);
+        }
+        self.tags = tags;
         // A destination or autolink may start after `c`, whatever else is
         // going on.
         if let Some(start) = self.md_trigger(c, prev)
@@ -168,10 +195,10 @@ impl UrlGuard {
             md.push(Md::Saturated);
         }
         self.md = md;
-        self.html = if html == Html::Free && !html_url {
-            self.html_trigger(c, prev)
+        self.css = if css == Css::Free && !css_url {
+            self.css_trigger()
         } else {
-            html
+            css
         };
         url
     }
@@ -203,21 +230,19 @@ impl UrlGuard {
         }
     }
 
-    /// Does `c` (just seen, outside any tag or CSS URL) start one?
-    fn html_trigger(&self, c: char, prev: Option<char>) -> Html {
+    /// Does a CSS URL start after the character just seen?
+    fn css_trigger(&self) -> Css {
         let r = &self.recent;
-        if c.is_ascii_alphabetic() && prev == Some('<') {
-            Html::TagName
-        } else if r.ends_with("url(") || r.ends_with("image-set(") {
-            Html::CssFn {
+        if r.ends_with("url(") || r.ends_with("image-set(") {
+            Css::Fn {
                 depth: 0,
                 quote: None,
                 escaped: false,
             }
         } else if r.ends_with("@import") {
-            Html::CssImport { quote: None }
+            Css::Import { quote: None }
         } else {
-            Html::Free
+            Css::Free
         }
     }
 }
@@ -337,62 +362,54 @@ fn bare(c: char, depth: u32) -> (bool, Md) {
     }
 }
 
-/// One character of the HTML / CSS reading.
-fn html_step(state: Html, c: char) -> (bool, Html) {
+/// A second reading of `c` in `state`, followed besides `tag_step`'s.
+fn tag_also(state: Tag, c: char) -> Option<(bool, Option<Tag>)> {
     match state {
-        Html::Free => (false, Html::Free),
+        // Browsers start an attribute name with this `=`; other HTML
+        // parsers (sanitizers, non-browser renderers) may start a value.
+        Tag::BeforeAttr if c == '=' => Some((false, Some(Tag::ValueBefore))),
+        _ => None,
+    }
+}
+
+/// One character of a tag reading (`None`: the tag has ended).
+fn tag_step(state: Tag, c: char) -> (bool, Option<Tag>) {
+    if c == '>' && !matches!(state, Tag::ValueQuoted(_)) {
+        return (false, None);
+    }
+    match state {
         // A `/` (self-closing start tag state) goes back to before an
         // attribute name; so does anything after a quoted value.
-        Html::TagName => match c {
-            '>' => (false, Html::Free),
-            c if html_space(c) || c == '/' => (false, Html::BeforeAttr),
-            _ => (false, Html::TagName),
+        Tag::Name if html_space(c) || c == '/' => (false, Some(Tag::BeforeAttr)),
+        Tag::Name => (false, Some(Tag::Name)),
+        Tag::BeforeAttr if html_space(c) || c == '/' => (false, Some(Tag::BeforeAttr)),
+        // `=` too: it starts an attribute name.
+        Tag::BeforeAttr => (false, Some(Tag::AttrName)),
+        Tag::AttrName => match c {
+            '=' => (false, Some(Tag::ValueBefore)),
+            '/' => (false, Some(Tag::BeforeAttr)),
+            _ => (false, Some(Tag::AttrName)),
         },
-        Html::BeforeAttr => match c {
-            '>' => (false, Html::Free),
-            c if html_space(c) || c == '/' => (false, Html::BeforeAttr),
-            // `=` too: it starts an attribute name.
-            _ => (false, Html::AttrName),
-        },
-        Html::AttrName => match c {
-            '>' => (false, Html::Free),
-            '=' => (false, Html::ValueBefore),
-            '/' => (false, Html::BeforeAttr),
-            _ => (false, Html::AttrName),
-        },
-        Html::ValueBefore => {
-            if html_space(c) {
-                (false, Html::ValueBefore)
-            } else if c == '"' || c == '\'' {
-                (false, Html::ValueQuoted(c))
-            } else if c == '>' {
-                (false, Html::Free)
-            } else {
-                (true, Html::ValueBare)
-            }
-        }
-        Html::ValueQuoted(q) => {
-            if c == q {
-                (false, Html::BeforeAttr)
-            } else {
-                (true, Html::ValueQuoted(q))
-            }
-        }
-        Html::ValueBare => {
-            if c == '>' {
-                (false, Html::Free)
-            } else if html_space(c) {
-                (false, Html::BeforeAttr)
-            } else {
-                (true, Html::ValueBare)
-            }
-        }
-        Html::CssFn {
+        Tag::ValueBefore if html_space(c) => (false, Some(Tag::ValueBefore)),
+        Tag::ValueBefore if c == '"' || c == '\'' => (false, Some(Tag::ValueQuoted(c))),
+        Tag::ValueBefore => (true, Some(Tag::ValueBare)),
+        Tag::ValueQuoted(q) if c == q => (false, Some(Tag::BeforeAttr)),
+        Tag::ValueQuoted(q) => (true, Some(Tag::ValueQuoted(q))),
+        Tag::ValueBare if html_space(c) => (false, Some(Tag::BeforeAttr)),
+        Tag::ValueBare => (true, Some(Tag::ValueBare)),
+    }
+}
+
+/// One character of the CSS reading.
+fn css_step(state: Css, c: char) -> (bool, Css) {
+    match state {
+        Css::Free => (false, Css::Free),
+        Css::Fn {
             depth,
             quote,
             escaped,
         } => {
-            let next = |depth, quote, escaped| Html::CssFn {
+            let next = |depth, quote, escaped| Css::Fn {
                 depth,
                 quote,
                 escaped,
@@ -407,23 +424,23 @@ fn html_step(state: Html, c: char) -> (bool, Html) {
                 match c {
                     '"' | '\'' => (true, next(depth, Some(c), false)),
                     '(' => (true, next(depth + 1, None, false)),
-                    ')' if depth == 0 => (false, Html::Free),
+                    ')' if depth == 0 => (false, Css::Free),
                     ')' => (true, next(depth - 1, None, false)),
                     _ => (true, next(depth, None, false)),
                 }
             }
         }
-        Html::CssImport { quote: Some(q) } => (
+        Css::Import { quote: Some(q) } => (
             true,
-            Html::CssImport {
+            Css::Import {
                 quote: (c != q).then_some(q),
             },
         ),
         // CSS allows any whitespace (line breaks too) after `@import`.
-        Html::CssImport { quote: None } => match c {
-            ';' => (false, Html::Free),
-            '"' | '\'' => (true, Html::CssImport { quote: Some(c) }),
-            _ => (true, Html::CssImport { quote: None }),
+        Css::Import { quote: None } => match c {
+            ';' => (false, Css::Free),
+            '"' | '\'' => (true, Css::Import { quote: Some(c) }),
+            _ => (true, Css::Import { quote: None }),
         },
     }
 }
