@@ -179,6 +179,15 @@ enum TextRestorer {
     Plain(Guarded<StreamRestorer>),
     Json(JsonFragRestorer),
     Sniff(Box<Sniff>),
+    /// More than [`SNIFF_MAX`] bytes of leading BOM and whitespace, and
+    /// nothing else yet: it goes out as it comes (the plain restorer's
+    /// context), held no longer. The first other char decides: clearly
+    /// prose (not `{`, `[` or `"`) is restored as plain text, anything else
+    /// passes through unrestored ([`TextRestorer::Raw`]).
+    Blank(Guarded<StreamRestorer>),
+    /// Passes through unrestored (tags visible): a text whose start was
+    /// not read in time to tell what it is.
+    Raw,
 }
 
 /// A text not decided yet: everything seen so far (bounded: at most
@@ -227,6 +236,9 @@ const JSON_WS: [char; 4] = [' ', '\t', '\n', '\r'];
 enum TextKind {
     Plain,
     Json,
+    /// More than [`SNIFF_MAX`] bytes of BOM and whitespace first: what
+    /// follows decides, without being held ([`TextRestorer::Blank`]).
+    Blank,
 }
 
 /// Decide what a streamed text is from its start `text` (all of it when
@@ -237,10 +249,11 @@ enum TextKind {
 /// JSON before that (`[NAME_1]`, `[1] see`, `{ is`) is plain. Only the
 /// first [`SNIFF_MAX`] bytes are read, so the answer never depends on how
 /// the text was split. More than [`SNIFF_MAX`] bytes of BOM and whitespace
-/// first is plain text (whitespace alone would otherwise never decide).
+/// first is [`TextKind::Blank`] (whitespace alone would otherwise never
+/// decide, and holding it would not be bounded).
 fn sniff_after(text: &str, lead: Lead, end: bool) -> Option<TextKind> {
     if lead.len > SNIFF_MAX {
-        return Some(TextKind::Plain);
+        return Some(TextKind::Blank);
     }
     let t = &text[lead.len..];
     if !t.starts_with(['{', '[']) {
@@ -301,6 +314,8 @@ impl TextRestorer {
         match self {
             TextRestorer::Plain(r) => r.push(text),
             TextRestorer::Json(r) => r.push(text),
+            TextRestorer::Blank(_) => self.after_blank(text, true),
+            TextRestorer::Raw => text.to_string(),
             TextRestorer::Sniff(s) => {
                 s.seen.push_str(text);
                 s.lead.advance(&s.seen);
@@ -321,24 +336,63 @@ impl TextRestorer {
         let mut r = match kind {
             TextKind::Plain => TextRestorer::plain(&s.engine, &s.scope),
             TextKind::Json => TextRestorer::json(&s.engine, &s.scope),
+            TextKind::Blank => {
+                TextRestorer::Blank(Guarded::new(s.engine.stream_restorer(&s.scope).url_safe()))
+            }
         };
         let (done, rest) = s.seen.split_at(s.emitted);
-        match &mut r {
-            TextRestorer::Plain(p) => p.skip(done),
-            TextRestorer::Json(j) => {
-                let _ = j.push(done);
-            }
-            TextRestorer::Sniff(_) => {}
-        }
+        r.skip(done);
         let out = r.push(rest);
         *self = r;
         out
     }
 
+    /// [`TextRestorer::Blank`]: `text` goes out up to its first char that is
+    /// not whitespace or a BOM; that char decides what the rest is. With
+    /// `restore` false, `text` went out already (see [`TextRestorer::skip`]).
+    fn after_blank(&mut self, text: &str, restore: bool) -> String {
+        let TextRestorer::Blank(r) = self else {
+            return String::new();
+        };
+        let Some(at) = text.find(|c: char| !(c.is_whitespace() || c == '\u{feff}')) else {
+            r.skip(text);
+            return if restore {
+                text.to_string()
+            } else {
+                String::new()
+            };
+        };
+        let (blank, rest) = text.split_at(at);
+        r.skip(blank);
+        if rest.starts_with(['{', '[', '"']) {
+            *self = TextRestorer::Raw;
+            return if restore {
+                text.to_string()
+            } else {
+                String::new()
+            };
+        }
+        let TextRestorer::Blank(r) = std::mem::replace(self, TextRestorer::Raw) else {
+            unreachable!("matched above");
+        };
+        let mut plain = TextRestorer::Plain(r);
+        if restore {
+            let mut out = blank.to_string();
+            out.push_str(&plain.push(rest));
+            *self = plain;
+            out
+        } else {
+            plain.skip(rest);
+            *self = plain;
+            String::new()
+        }
+    }
+
     fn finish(&mut self) -> String {
         match self {
-            TextRestorer::Plain(r) => r.finish(),
+            TextRestorer::Plain(r) | TextRestorer::Blank(r) => r.finish(),
             TextRestorer::Json(r) => r.finish(),
+            TextRestorer::Raw => String::new(),
             TextRestorer::Sniff(s) => {
                 if let Some(kind) = sniff_after(&s.seen, s.lead, false) {
                     let mut out = self.decide(kind);
@@ -356,9 +410,10 @@ impl TextRestorer {
 
     fn pending_len(&self) -> usize {
         match self {
-            TextRestorer::Plain(r) => r.pending_len(),
+            TextRestorer::Plain(r) | TextRestorer::Blank(r) => r.pending_len(),
             TextRestorer::Json(r) => r.pending_len(),
             TextRestorer::Sniff(s) => s.seen.len() - s.emitted,
+            TextRestorer::Raw => 0,
         }
     }
 
@@ -375,6 +430,10 @@ impl TextRestorer {
                 let _ = r.push(text);
                 let _ = r.finish();
             }
+            TextRestorer::Blank(_) => {
+                let _ = self.after_blank(text, false);
+            }
+            TextRestorer::Raw => {}
             TextRestorer::Sniff(s) => {
                 s.seen.push_str(text);
                 s.emitted = s.seen.len();
@@ -3285,6 +3344,118 @@ mod tests {
         }
     }
 
+    /// Final review round 2 (whitespace cap): more than SNIFF_MAX bytes of
+    /// leading BOM and whitespace decided plain text whatever followed, so
+    /// JSON after it (`{"a": "[QUOTED_1]"}` in pieces) was restored as text
+    /// and a value with a quote broke out of its string. Past the cap, the
+    /// rest passes through unrestored (tags visible) unless it is clearly
+    /// prose: its first char (after more whitespace or BOMs) is not `{`,
+    /// `[` or `"`. Held state stays small, forced flushes included.
+    #[test]
+    fn past_the_whitespace_cap_only_prose_is_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let q = quoted_tag(&e);
+        let leads = [
+            "\n".repeat(SNIFF_MAX + 1),
+            format!("\u{feff}{}", " \r\n\t".repeat(SNIFF_MAX)),
+            format!("{}\u{a0}\u{feff}\u{2003} ", "\t".repeat(SNIFF_MAX + 1)),
+        ];
+        let texts = [
+            (format!("{{\"a\": \"{q} [NAME_1]\"}}"), false),
+            ("[\"[NAME_1]\", 1]".to_string(), false),
+            ("\"[NAME_1]\" and more".to_string(), false),
+            ("[NAME_1] wrote".to_string(), false),
+            ("Hi [NAME_1], see [EMAIL_1]".to_string(), true),
+        ];
+        for lead in &leads {
+            for (text, prose) in &texts {
+                let sent = format!("{lead}{text}");
+                let want = if *prose {
+                    format!("{lead}Hi Ravi Kumar, see ravi@example.com")
+                } else {
+                    sent.clone()
+                };
+                let chars: Vec<char> = sent.chars().collect();
+                for n in [1, 5, 64, 1500, chars.len()] {
+                    for flush in [false, true] {
+                        let mut r = TextRestorer::sniffing(&e, SCOPE);
+                        let mut out = String::new();
+                        for (i, piece) in chars.chunks(n).enumerate() {
+                            out.push_str(&r.push(&piece.iter().collect::<String>()));
+                            if flush && i % 3 == 2 {
+                                out.push_str(&r.finish());
+                            }
+                            assert!(r.pending_len() <= 4 * SNIFF_MAX, "{text} {n}");
+                        }
+                        out.push_str(&r.finish());
+                        let at = format!("{:?} {text} n={n} flush={flush}", &lead[..4]);
+                        if *prose && flush {
+                            // A flush may split a tag: never a wrong value.
+                            assert!(!out.contains('"') && out.starts_with(lead), "{at}: {out}");
+                        } else {
+                            assert!(out == want, "{at}: {out:?}");
+                        }
+                    }
+                }
+            }
+        }
+        // The same through a stream: an OpenAI-shaped delta (unknown key)
+        // of whitespace past the cap, then JSON in pieces.
+        let openai = |c: &str| json!({"choices": [{"index": 0, "delta": {"content": c}}]});
+        let ws = " \n".repeat(600);
+        let deltas = [ws.as_str(), "{\"a\": \"", q.as_str(), " [NAME_1]", "\"}"];
+        let body: String = deltas
+            .iter()
+            .map(|c| format!("data: {}\n\n", openai(c)))
+            .collect();
+        let out = run(&e, "text/event-stream", body.as_bytes(), 7);
+        let text = String::from_utf8(out).unwrap();
+        let joined: String = text
+            .split("\n\n")
+            .filter_map(|ev| ev.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .filter_map(|v| {
+                v["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .collect();
+        assert_eq!(joined, deltas.concat());
+    }
+
+    /// The same rule for text/plain bodies: their leading whitespace is held
+    /// (up to the JSON buffer) until what follows tells, so JSON after it is
+    /// restored as JSON (never as text); past the buffer the rest passes
+    /// through unrestored, prose included.
+    #[test]
+    fn text_bodies_after_long_whitespace_are_never_restored_as_text_blindly() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let q = quoted_tag(&e);
+        let doc = format!("{{\"a\": \"{q} [NAME_1]\"}}");
+        let lead = " \n".repeat(SNIFF_MAX * 2);
+        let body = format!("{lead}{doc}");
+        for n in [1, 7, 4096] {
+            let out = run(&e, "text/plain", body.as_bytes(), n);
+            let v: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(v["a"], format!("{QUOTED} Ravi Kumar"), "{n}");
+        }
+        // The whitespace alone passes the buffer before anything else comes.
+        let lead = " ".repeat(MAX_JSON_BUFFER + 1);
+        for text in [doc.as_str(), "Hi [NAME_1]"] {
+            let mut t = for_content_type(&e, SCOPE, "text/plain");
+            let mut out = Vec::new();
+            for c in lead.as_bytes().chunks(64 * 1024) {
+                out.extend_from_slice(&t.push(c));
+            }
+            out.extend_from_slice(&t.push(text.as_bytes()));
+            out.extend_from_slice(&t.finish());
+            assert!(out.len() == lead.len() + text.len(), "{text}");
+            assert!(out.ends_with(text.as_bytes()), "{text}");
+        }
+    }
+
     /// Scan finding on 06da9ce: an item just under the 16 MiB cap, pushed in
     /// small chunks, must not be rescanned from its start on every chunk
     /// (newline and blank-line search, UTF-16 counting); nor may a large
@@ -3752,11 +3923,16 @@ mod tests {
         assert_eq!(sniff_text(&long, false), Some(Json));
         let prose = format!("[1] {}", "a".repeat(SNIFF_MAX * 2));
         assert_eq!(sniff_text(&prose, false), Some(Plain));
-        // More than SNIFF_MAX bytes of whitespace first: plain, whatever
-        // follows (R6); up to it, what follows decides.
+        // More than SNIFF_MAX bytes of whitespace first: decided without
+        // reading on (R6); what follows is then restored only when clearly
+        // prose (see `past_the_whitespace_cap_only_prose_is_restored`). Up
+        // to it, what follows decides.
         let blank = "\n".repeat(SNIFF_MAX + 1);
-        assert_eq!(sniff_text(&blank, false), Some(Plain));
-        assert_eq!(sniff_text(&format!("{blank}{{\"a\""), false), Some(Plain));
+        assert_eq!(sniff_text(&blank, false), Some(TextKind::Blank));
+        assert_eq!(
+            sniff_text(&format!("{blank}{{\"a\""), false),
+            Some(TextKind::Blank)
+        );
         let blank = format!("\u{feff}{}", " ".repeat(SNIFF_MAX - 3));
         assert_eq!(sniff_text(&blank, false), None);
         assert_eq!(sniff_text(&format!("{blank}{{\"a\""), false), Some(Json));
