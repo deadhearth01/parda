@@ -70,9 +70,9 @@ impl EngineTransform {
         }
     }
 
-    /// Apply new settings; the next request uses them. (`listen` and
-    /// `hosts` also need the listener restarted to change what is
-    /// decrypted.)
+    /// Apply new settings; the next request uses them, and the next CONNECT
+    /// and PAC request use the new `hosts` (see [`BodyTransform::hosts`]).
+    /// Only `listen` needs the listener restarted.
     pub fn set_config(&self, cfg: &InterceptConfig) {
         *self.settings.write().unwrap_or_else(|e| e.into_inner()) =
             Arc::new(Settings::from_config(cfg));
@@ -359,6 +359,10 @@ fn engine_refusal(e: EngineError) -> Refusal {
 }
 
 impl BodyTransform for EngineTransform {
+    fn hosts(&self) -> Option<HostList> {
+        Some(self.settings().hosts.clone())
+    }
+
     fn request(
         &self,
         host: &str,

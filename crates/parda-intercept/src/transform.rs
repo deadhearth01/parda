@@ -112,6 +112,14 @@ pub trait BodyTransform: Send + Sync + 'static {
         }
         Ok(out)
     }
+
+    /// The hosts to decrypt right now, for a transform that keeps a live
+    /// list (the engine transform follows `intercept.hosts` through its
+    /// `set_config`). The server asks on every CONNECT and PAC request;
+    /// `None` (the default) keeps [`crate::InterceptState::hosts`].
+    fn hosts(&self) -> Option<crate::HostList> {
+        None
+    }
 }
 
 /// Rewrites one response body chunk by chunk, without buffering it whole.

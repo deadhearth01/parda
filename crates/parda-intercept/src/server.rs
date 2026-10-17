@@ -25,7 +25,7 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio_rustls::TlsAcceptor;
 
 use crate::transform::RequestOutcome;
@@ -62,6 +62,8 @@ pub struct InterceptEvent {
 /// Everything a running intercept listener needs.
 pub struct InterceptState {
     pub ca: Arc<Ca>,
+    /// The hosts to decrypt, unless the transform keeps a live list
+    /// ([`BodyTransform::hosts`]); see [`InterceptState::listed_hosts`].
     pub hosts: HostList,
     pub transform: Arc<dyn BodyTransform>,
     pub events: broadcast::Sender<InterceptEvent>,
@@ -90,6 +92,12 @@ impl InterceptState {
             upstream_http1: upstream_client_builder().http1_only().build()?,
             timeouts: Timeouts::default(),
         })
+    }
+
+    /// The hosts decrypted right now: the transform's live list when it
+    /// keeps one, else [`InterceptState::hosts`].
+    pub fn listed_hosts(&self) -> HostList {
+        self.transform.hosts().unwrap_or_else(|| self.hosts.clone())
     }
 }
 
@@ -159,13 +167,35 @@ pub fn upstream_client_builder() -> reqwest::ClientBuilder {
 /// - `CONNECT` to any other host: a blind byte tunnel.
 /// - Plain `GET /parda.pac`: the PAC file. Any other plain request: 405.
 pub async fn serve(listener: TcpListener, state: Arc<InterceptState>) -> anyhow::Result<()> {
+    serve_with_shutdown(listener, state, std::future::pending()).await
+}
+
+/// [`serve`] until `shutdown` completes. Then the listener is closed at
+/// once, idle connections and blind tunnels are closed, requests in
+/// progress (a streamed answer included) finish first, and this returns
+/// when every connection has ended. Callers bound the wait if they need to
+/// (the daemon allows 5 s). Upgraded (WebSocket) streams to listed hosts are
+/// not waited for.
+pub async fn serve_with_shutdown(
+    listener: TcpListener,
+    state: Arc<InterceptState>,
+    shutdown: impl Future<Output = ()> + Send,
+) -> anyhow::Result<()> {
     let local = listener.local_addr()?;
     anyhow::ensure!(
         is_loopback(local.ip()),
         "parda intercept must listen on a loopback address, not {local}"
     );
+    // Every connection task holds a receiver: the sender sees when the last
+    // one is gone.
+    let (stop_tx, stop) = watch::channel(false);
+    let mut shutdown = std::pin::pin!(shutdown);
     loop {
-        let tcp = match listener.accept().await {
+        let accepted = tokio::select! {
+            r = listener.accept() => r,
+            () = &mut shutdown => break,
+        };
+        let tcp = match accepted {
             Ok((tcp, peer)) if is_loopback(peer.ip()) => tcp,
             Ok((_, peer)) => {
                 tracing::warn!(%peer, "intercept: dropped a non-loopback client");
@@ -179,21 +209,40 @@ pub async fn serve(listener: TcpListener, state: Arc<InterceptState>) -> anyhow:
             }
         };
         let state = state.clone();
+        let mut conn_stop = stop.clone();
         tokio::spawn(async move {
             let _ = tcp.set_nodelay(true);
             let header_read = state.timeouts.header_read;
-            let svc = service_fn(move |req| front(req, state.clone(), local));
-            if let Err(e) = http1::Builder::new()
+            let handler_stop = conn_stop.clone();
+            let svc = service_fn(move |req| front(req, state.clone(), local, handler_stop.clone()));
+            let conn = http1::Builder::new()
                 .timer(TokioTimer::new())
                 .header_read_timeout(header_read)
                 .serve_connection(TokioIo::new(tcp), svc)
-                .with_upgrades()
-                .await
-            {
+                .with_upgrades();
+            let mut conn = std::pin::pin!(conn);
+            let res = tokio::select! {
+                r = conn.as_mut() => r,
+                () = stopped(&mut conn_stop) => {
+                    conn.as_mut().graceful_shutdown();
+                    conn.await
+                }
+            };
+            if let Err(e) = res {
                 tracing::debug!(error = %e, "intercept: client connection ended");
             }
         });
     }
+    drop(listener);
+    drop(stop);
+    stop_tx.send_replace(true);
+    stop_tx.closed().await;
+    Ok(())
+}
+
+/// Completes once the listener shuts down (or the server is gone).
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    let _ = stop.wait_for(|s| *s).await;
 }
 
 /// A request on the plain (proxy-facing) side of the listener.
@@ -201,11 +250,13 @@ async fn front(
     req: Request<Incoming>,
     state: Arc<InterceptState>,
     local: SocketAddr,
+    stop: watch::Receiver<bool>,
 ) -> Result<Response<Body>, Infallible> {
     if req.method() == Method::CONNECT {
-        return Ok(connect(req, state).await);
+        return Ok(connect(req, state, stop).await);
     }
-    if let Some(res) = redirect_listed_http(&req, &state.hosts) {
+    let hosts = state.listed_hosts();
+    if let Some(res) = redirect_listed_http(&req, &hosts) {
         return Ok(res);
     }
     if req.method() == Method::GET && req.uri().path() == "/parda.pac" && is_local(req.uri()) {
@@ -224,7 +275,7 @@ async fn front(
                 "parda intercept: the PAC file is for this machine's proxy settings only\n",
             ));
         }
-        let mut res = Response::new(full(pac(&state.hosts, local)));
+        let mut res = Response::new(full(pac(&hosts, local)));
         let h = res.headers_mut();
         h.insert(
             CONTENT_TYPE,
@@ -289,14 +340,18 @@ fn is_local_host(h: &str) -> bool {
     h.eq_ignore_ascii_case("localhost") || h.parse::<std::net::IpAddr>().is_ok_and(is_loopback)
 }
 
-async fn connect(req: Request<Incoming>, state: Arc<InterceptState>) -> Response<Body> {
+async fn connect(
+    req: Request<Incoming>,
+    state: Arc<InterceptState>,
+    mut stop: watch::Receiver<bool>,
+) -> Response<Body> {
     let Some(authority) = req.uri().authority().cloned() else {
         return text(StatusCode::BAD_REQUEST, "CONNECT needs host:port\n");
     };
     let host = normalize_host(authority.host());
     let port = authority.port_u16().unwrap_or(443);
 
-    if state.hosts.matches(&host) {
+    if state.listed_hosts().matches(&host) {
         if port == 80 {
             // ws:// (or plain http tunnelled): parda only filters TLS
             // traffic, and must not let it pass unfiltered.
@@ -307,7 +362,7 @@ async fn connect(req: Request<Incoming>, state: Arc<InterceptState>) -> Response
         }
         tokio::spawn(async move {
             match hyper::upgrade::on(req).await {
-                Ok(io) => intercept_tls(TokioIo::new(io), host, port, state).await,
+                Ok(io) => intercept_tls(TokioIo::new(io), host, port, state, stop).await,
                 Err(e) => tracing::debug!(error = %e, "intercept: CONNECT upgrade failed"),
             }
         });
@@ -336,7 +391,11 @@ async fn connect(req: Request<Incoming>, state: Arc<InterceptState>) -> Response
             Ok(io) => {
                 let mut client = TokioIo::new(io);
                 let mut server = upstream;
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                // Ends with either side, or when the listener shuts down.
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {}
+                    () = stopped(&mut stop) => {}
+                }
             }
             Err(e) => tracing::debug!(error = %e, "intercept: CONNECT upgrade failed"),
         }
@@ -394,6 +453,7 @@ async fn intercept_tls(
     host: String,
     port: u16,
     state: Arc<InterceptState>,
+    mut stop: watch::Receiver<bool>,
 ) {
     let cfg = match server_config(state.ca.clone(), host.clone()) {
         Ok(c) => c,
@@ -423,13 +483,22 @@ async fn intercept_tls(
     // during a streamed response).
     let idle = state.timeouts.idle;
     let svc = service_fn(move |req| forward(req, state.clone(), target.clone()));
-    if let Err(e) = http1::Builder::new()
+    let conn = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(idle)
         .serve_connection(TokioIo::new(tls), svc)
-        .with_upgrades()
-        .await
-    {
+        .with_upgrades();
+    let mut conn = std::pin::pin!(conn);
+    // On shutdown, the request in progress finishes and the connection
+    // closes; an idle one closes at once.
+    let res = tokio::select! {
+        r = conn.as_mut() => r,
+        () = stopped(&mut stop) => {
+            conn.as_mut().graceful_shutdown();
+            conn.await
+        }
+    };
+    if let Err(e) = res {
         tracing::debug!(error = %e, "intercept: decrypted connection ended");
     }
 }
