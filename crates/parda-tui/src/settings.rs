@@ -16,6 +16,8 @@ pub enum Setting {
     Style,
     Proxy,
     UnscannedMedia,
+    Intercept,
+    InterceptUnscanned,
     Clipboard,
     RestoreOnCopy,
     Model,
@@ -51,6 +53,8 @@ pub fn all() -> Vec<Setting> {
         Setting::Style,
         Setting::Proxy,
         Setting::UnscannedMedia,
+        Setting::Intercept,
+        Setting::InterceptUnscanned,
         Setting::Clipboard,
         Setting::RestoreOnCopy,
         Setting::Model,
@@ -119,6 +123,24 @@ pub fn row(s: &Setting, c: &Config) -> Row {
                 UnscannedMedia::Block => "block".into(),
             };
             r.help = "v0.1 cannot read text inside images or documents: allow forwards them unscanned, block refuses the request.";
+        }
+        Setting::Intercept => {
+            r.group = "AI sites";
+            r.label = format!(
+                "filter AI sites in browsers & apps ({})",
+                c.intercept.listen
+            );
+            (r.value, r.on) = switch(c.intercept.enabled);
+            r.help = "Filters ChatGPT, Claude, Gemini … in browsers and desktop apps; applies at once. Set up: `parda ca create`, `parda ca install`, `parda intercept on`. Undo all: `parda intercept off`.";
+        }
+        Setting::InterceptUnscanned => {
+            r.group = "AI sites";
+            r.label = "files & images sent to AI sites".into();
+            r.value = match c.intercept.unscanned {
+                UnscannedMedia::Allow => "allow (not scanned)".into(),
+                UnscannedMedia::Block => "block".into(),
+            };
+            r.help = "parda cannot read text inside uploaded files or images: allow sends them unscanned (with a warning), block refuses the upload.";
         }
         Setting::Clipboard => {
             r.group = "chat apps";
@@ -262,6 +284,13 @@ pub fn step(s: &Setting, c: &mut Config, forward: bool) {
                 UnscannedMedia::Block => UnscannedMedia::Allow,
             }
         }
+        Setting::Intercept => c.intercept.enabled = !c.intercept.enabled,
+        Setting::InterceptUnscanned => {
+            c.intercept.unscanned = match c.intercept.unscanned {
+                UnscannedMedia::Allow => UnscannedMedia::Block,
+                UnscannedMedia::Block => UnscannedMedia::Allow,
+            }
+        }
         Setting::Clipboard => c.clipboard.enabled = !c.clipboard.enabled,
         Setting::RestoreOnCopy => c.clipboard.restore_on_copy = !c.clipboard.restore_on_copy,
         Setting::Model => {
@@ -368,6 +397,27 @@ mod tests {
         let r = row(&Setting::Threshold, &Config::default());
         assert!(!r.restart);
         assert!(THRESHOLDS.iter().all(|t| *t >= 0.3));
+    }
+
+    #[test]
+    fn intercept_rows_apply_live_and_toggle_the_config() {
+        let mut c = Config::default();
+        let r = row(&Setting::Intercept, &c);
+        assert_eq!(r.on, Some(false));
+        assert!(r.label.contains("127.0.0.1:8788"), "{}", r.label);
+        assert!(!r.restart, "the daemon starts and stops the listener live");
+        assert!(r.help.contains("parda intercept on"), "{}", r.help);
+        step(&Setting::Intercept, &mut c, true);
+        assert!(c.intercept.enabled);
+        assert_eq!(row(&Setting::Intercept, &c).on, Some(true));
+
+        let r = row(&Setting::InterceptUnscanned, &c);
+        assert!(!r.restart);
+        assert!(r.value.starts_with("allow"), "{}", r.value);
+        step(&Setting::InterceptUnscanned, &mut c, true);
+        assert_eq!(c.intercept.unscanned, UnscannedMedia::Block);
+        // The agent proxy's own rule is a separate setting.
+        assert_eq!(c.proxy.unscanned_media, UnscannedMedia::Allow);
     }
 
     #[test]

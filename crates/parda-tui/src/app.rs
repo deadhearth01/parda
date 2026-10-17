@@ -364,7 +364,9 @@ impl App {
             self.message = Some("cannot read the configuration".into());
             return;
         };
+        let intercept_was = c.intercept.enabled;
         f(&mut c);
+        let switched_on = c.intercept.enabled && !intercept_was;
         let res = c
             .to_toml_string()
             .map_err(anyhow::Error::from)
@@ -374,6 +376,7 @@ impl App {
                 "saved — restart the daemon to apply (parda stop, then parda daemon / service)"
                     .into()
             }
+            Ok(v) if switched_on => intercept_message(&v["intercept"]),
             Ok(_) => "saved and applied".into(),
             Err(e) => format!("update failed: {e}"),
         });
@@ -564,5 +567,41 @@ impl App {
 
     pub fn draw(&self, f: &mut Frame) {
         tabs::draw(self, f);
+    }
+}
+
+/// What switching intercept on did, from the daemon's answer.
+fn intercept_message(it: &Value) -> String {
+    match (it["listening"].as_str(), it["error"].as_str()) {
+        (Some(addr), _) if it["pac"].is_string() => format!("intercept listening on {addr}"),
+        (Some(addr), _) => format!(
+            "intercept listening on {addr} — run `parda intercept on` to send AI sites through it"
+        ),
+        (None, Some(e)) => format!("saved, but not listening — {e}"),
+        _ => "saved and applied".into(),
+    }
+}
+
+#[cfg(test)]
+mod intercept_message_tests {
+    use super::intercept_message;
+    use serde_json::json;
+
+    #[test]
+    fn says_what_switching_intercept_on_did() {
+        let on = json!({"listening": "127.0.0.1:8788", "pac": "http://127.0.0.1:8788/parda.pac"});
+        assert_eq!(
+            intercept_message(&on),
+            "intercept listening on 127.0.0.1:8788"
+        );
+        let no_pac = json!({"listening": "127.0.0.1:8788", "pac": null});
+        assert!(intercept_message(&no_pac).contains("run `parda intercept on`"));
+        let failed = json!({"listening": null, "error": "intercept: no CA"});
+        assert_eq!(
+            intercept_message(&failed),
+            "saved, but not listening — intercept: no CA"
+        );
+        // An older daemon says nothing about it.
+        assert_eq!(intercept_message(&json!(null)), "saved and applied");
     }
 }

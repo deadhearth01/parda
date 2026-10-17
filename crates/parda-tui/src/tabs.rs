@@ -13,6 +13,15 @@ use crate::app::{App, Hit, Prompt, Tab};
 use crate::settings;
 
 const ACCENT: Color = Color::Cyan;
+/// Intercepted AI-site traffic, told apart from the agent proxy at a glance.
+const INTERCEPT: Color = Color::Magenta;
+
+fn surface_color(surface: &str) -> Color {
+    match surface {
+        "intercept" => INTERCEPT,
+        _ => ACCENT,
+    }
+}
 
 fn hit(app: &App, r: Rect, h: Hit) {
     app.hits.borrow_mut().push((r, h));
@@ -258,7 +267,7 @@ fn dashboard(app: &App, f: &mut Frame, area: Rect) {
             let latencies: Vec<u64> = app
                 .events
                 .iter()
-                .filter(|e| e.surface == "proxy")
+                .filter(|e| e.surface == "proxy" || e.surface == "intercept")
                 .filter_map(|e| e.latency_ms)
                 .collect();
             match (
@@ -342,6 +351,12 @@ fn dashboard(app: &App, f: &mut Frame, area: Rect) {
                 .map(|a| format!("http://{a}"))
                 .unwrap_or_else(|| "off".into())
         )),
+    ];
+    let mut lines = lines;
+    if let Some(l) = intercept_line(&st["intercept"]) {
+        lines.push(l);
+    }
+    lines.extend([
         Line::from(format!(
             "clipboard  {}",
             if st["clipboard"].as_bool() == Some(true) {
@@ -367,7 +382,7 @@ fn dashboard(app: &App, f: &mut Frame, area: Rect) {
             num(&stats["cache_hits"]),
             frags
         )),
-    ];
+    ]);
     f.render_widget(
         Paragraph::new(lines)
             .block(block("Status"))
@@ -422,6 +437,37 @@ fn dashboard(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(table, right[1]);
 }
 
+/// The dashboard's intercept line, from the daemon status; `None` for a
+/// daemon too old to report it.
+fn intercept_line(it: &Value) -> Option<Line<'static>> {
+    if !it.is_object() {
+        return None;
+    }
+    let label = Span::raw("intercept  ");
+    let pac_set = it["pac"].is_string();
+    let warn = Style::default().fg(Color::Yellow);
+    let bad = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let (msg, style) = match (it["listening"].as_str(), it["error"].as_str()) {
+        (Some(addr), _) if pac_set => (
+            format!("on · {addr} · system proxy set"),
+            Style::default().fg(INTERCEPT),
+        ),
+        (Some(addr), _) => (
+            format!("on · {addr} · NO system proxy (parda intercept on)"),
+            warn,
+        ),
+        (None, Some(e)) => (format!("NOT LISTENING — {e}"), bad),
+        (None, None) if pac_set => (
+            "OFF but the system proxy still points here — AI sites fail to load; \
+             run parda intercept off"
+                .to_string(),
+            bad,
+        ),
+        (None, None) => ("off".to_string(), Style::default().fg(Color::DarkGray)),
+    };
+    Some(Line::from(vec![label, Span::styled(msg, style)]))
+}
+
 fn uptime(s: u64) -> String {
     match s {
         0..=59 => format!("{s}s"),
@@ -457,7 +503,10 @@ fn live(app: &App, f: &mut Frame, area: Rect) {
             };
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{ts} "), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:<9} ", e.surface), Style::default().fg(ACCENT)),
+                Span::styled(
+                    format!("{:<9} ", e.surface),
+                    Style::default().fg(surface_color(&e.surface)),
+                ),
                 Span::styled(e.summary.clone(), style),
                 Span::raw(format!("{ms} {}", kinds.join(" "))),
             ]))
@@ -633,13 +682,16 @@ fn settings_tab(app: &App, f: &mut Frame, area: Rect) {
         ])
         .split(area);
     let connect = vec![
-        Line::from(format!("Claude Code   export ANTHROPIC_BASE_URL={url}")),
-        Line::from(format!("Codex / SDKs  export OPENAI_BASE_URL={url}/v1")),
         Line::from(format!(
-            "Chat apps     copy, then press the paste-safe hotkey ({}) instead of paste · config {}",
-            text(&st["hotkey"]),
-            text(s(st, &["paths", "config"]))
+            "Agents    export ANTHROPIC_BASE_URL={url} OPENAI_BASE_URL={url}/v1"
         )),
+        Line::from(format!(
+            "Chat apps copy, then press the paste-safe hotkey ({}) instead of paste",
+            text(&st["hotkey"]),
+        )),
+        Line::from(
+            "AI sites  parda ca create · parda ca install · parda intercept on · undo: parda intercept off",
+        ),
     ];
     f.render_widget(
         Paragraph::new(connect)
@@ -709,9 +761,10 @@ fn settings_tab(app: &App, f: &mut Frame, area: Rect) {
     let mut state = ListState::default();
     state.select(Some(sel - start));
     let title = format!(
-        "Settings ({}/{}) · ↻ = applies after a daemon restart",
+        "Settings ({}/{}) · ↻ = applies after a daemon restart · {}",
         sel + 1,
-        rows.len()
+        rows.len(),
+        text(s(st, &["paths", "config"]))
     );
     f.render_stateful_widget(
         List::new(items)
@@ -759,6 +812,8 @@ mod tests {
             Ok(match req {
                 Request::Status => json!({
                     "pid": 42, "uptime_s": 7, "proxy": "127.0.0.1:8787", "clipboard": true,
+                    "intercept": {"enabled": true, "listening": "127.0.0.1:8788", "ca": true,
+                                  "error": null, "pac": "http://127.0.0.1:8788/parda.pac"},
                     "hotkey": "default", "model": "gliner-pii-edge", "mode": "strict", "style": "surrogate",
                     "stats": {"redactions": 3, "cache_hits": 1, "fragments": 4, "ml_calls": 2,
                               "ml_ms_total": 18, "ml_failures": 0,
@@ -788,7 +843,15 @@ mod tests {
                     let old = parda_core::Config::from_toml_str(&self.config).unwrap();
                     let new = parda_core::Config::from_toml_str(&toml).unwrap();
                     self.config = toml;
-                    json!({"restart_required": old.proxy.enabled != new.proxy.enabled})
+                    // As a daemon without a CA answers.
+                    let intercept = new.intercept.enabled.then(|| {
+                        json!({"listening": null, "pac": null,
+                               "error": "intercept: no CA — run `parda ca create`"})
+                    });
+                    json!({
+                        "restart_required": old.proxy.enabled != new.proxy.enabled,
+                        "intercept": intercept,
+                    })
                 }
                 _ => json!({}),
             })
@@ -1056,6 +1119,87 @@ mod tests {
         }
         assert_eq!(app.settings_sel, last);
         assert!(render(&app).contains("Organization"));
+    }
+
+    #[test]
+    fn dashboard_says_whether_ai_sites_are_intercepted() {
+        let mut app = App::new();
+        app.refresh(&mut fake());
+        let screen = render(&app);
+        assert!(
+            screen.contains("intercept  on · 127.0.0.1:8788 · system proxy set"),
+            "{screen}"
+        );
+        let mut st = app.status.clone().unwrap();
+        for (intercept, want) in [
+            (
+                json!({"enabled": true, "listening": "127.0.0.1:8788", "ca": true, "error": null, "pac": null}),
+                "on · 127.0.0.1:8788 · NO system proxy",
+            ),
+            (
+                json!({"enabled": true, "listening": null, "ca": false,
+                       "error": "intercept: no CA — run `parda ca create`", "pac": null}),
+                "NOT LISTENING — intercept: no",
+            ),
+            (
+                json!({"enabled": false, "listening": null, "ca": true, "error": null, "pac": null}),
+                "intercept  off",
+            ),
+            (
+                json!({"enabled": false, "listening": null, "ca": true, "error": null,
+                       "pac": "http://127.0.0.1:8788/parda.pac"}),
+                "OFF but the system proxy",
+            ),
+        ] {
+            st["intercept"] = intercept;
+            app.status = Some(st.clone());
+            let screen = render(&app);
+            assert!(screen.contains(want), "{want:?}:\n{screen}");
+        }
+        // An older daemon without the field: no intercept line.
+        st.as_object_mut().unwrap().remove("intercept");
+        app.status = Some(st);
+        assert!(!render(&app).contains("intercept  "));
+    }
+
+    #[test]
+    fn live_feed_tags_intercept_events() {
+        let mut b = fake();
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Char('2')), &mut b);
+        let mut e = Event::now("intercept", "chatgpt.com → 200 · 2 redacted");
+        e.counts.insert("Person".into(), 2);
+        app.on_event(e);
+        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| app.draw(f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let (x, y) = find(&app, "intercept");
+        assert_eq!(buf[(x, y)].fg, Color::Magenta);
+        let screen = render(&app);
+        assert!(screen.contains("chatgpt.com → 200 · 2 redacted") && screen.contains("Person×2"));
+    }
+
+    #[test]
+    fn settings_switch_intercept_and_its_unscanned_rule_live() {
+        let mut b = fake();
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Char('6')), &mut b);
+        let screen = render(&app);
+        assert!(screen.contains("parda intercept on"), "{screen}");
+        let (x, y) = find(&app, "filter AI sites in browsers");
+        click_at(&mut app, &mut b, x, y, MouseButton::Left);
+        assert!(cfg(&b).intercept.enabled);
+        let msg = app.message.clone().unwrap_or_default();
+        assert!(
+            msg.contains("not listening — intercept: no CA — run `parda ca create`"),
+            "{msg}"
+        );
+        let (x, y) = find(&app, "files & images sent to AI sites");
+        click_at(&mut app, &mut b, x, y, MouseButton::Left);
+        assert_eq!(
+            cfg(&b).intercept.unscanned,
+            parda_core::UnscannedMedia::Block
+        );
     }
 
     #[test]
