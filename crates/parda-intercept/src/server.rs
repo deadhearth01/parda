@@ -639,7 +639,9 @@ async fn forward(
         None,
         outcome.unscanned,
     );
-    let stream = res.bytes_stream();
+    let stream = res
+        .bytes_stream()
+        .map(|r| r.map_err(|e| BoxError::from(e.without_url())));
     let body = if still_encoded {
         passthrough(stream)
     } else {
@@ -703,46 +705,60 @@ fn refuse(
 
 /// Stream `upstream` through `rewriter`, chunk by chunk, then flush it. The
 /// rewriter runs on the blocking pool (restoring may read the vault or wait
-/// on the engine's locks); the stream stays incremental.
+/// on the engine's locks); the stream stays incremental. When the upstream
+/// fails, what the rewriter holds goes out first, then the error.
 fn transformed(
-    upstream: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    upstream: impl Stream<Item = Result<Bytes, BoxError>> + Send + 'static,
     rewriter: Box<dyn StreamTransform>,
 ) -> Body {
     if rewriter.is_passthrough() {
         return passthrough(upstream);
     }
+    enum State<S> {
+        Running(S, Box<dyn StreamTransform>),
+        /// The upstream failed after the held text went out.
+        Failed(BoxError),
+        Done,
+    }
     let failed = || BoxError::from("parda intercept: failed to rewrite the response");
     let frames = futures::stream::unfold(
-        Some((Box::pin(upstream), rewriter)),
+        State::Running(Box::pin(upstream), rewriter),
         move |state| async move {
-            let (mut upstream, rewriter) = state?;
-            let mut rewriter = Some(rewriter);
+            let (mut upstream, mut rw) = match state {
+                State::Running(upstream, rw) => (upstream, rw),
+                State::Failed(e) => return Some((Err(e), State::Done)),
+                State::Done => return None,
+            };
             loop {
-                let chunk = upstream.next().await;
-                let mut rw = rewriter.take()?;
-                match chunk {
+                match upstream.next().await {
                     Some(Ok(chunk)) => {
-                        let Ok((rw, out)) = tokio::task::spawn_blocking(move || {
+                        let Ok((back, out)) = tokio::task::spawn_blocking(move || {
                             let out = rw.push(&chunk);
                             (rw, out)
                         })
                         .await
                         else {
-                            return Some((Err(failed()), None));
+                            return Some((Err(failed()), State::Done));
                         };
+                        rw = back;
                         if !out.is_empty() {
-                            return Some((Ok(Frame::data(out)), Some((upstream, rw))));
+                            return Some((Ok(Frame::data(out)), State::Running(upstream, rw)));
                         }
-                        rewriter = Some(rw);
                     }
                     Some(Err(e)) => {
-                        return Some((Err(BoxError::from(e.without_url())), None));
+                        let Ok(out) = tokio::task::spawn_blocking(move || rw.finish()).await else {
+                            return Some((Err(e), State::Done));
+                        };
+                        if out.is_empty() {
+                            return Some((Err(e), State::Done));
+                        }
+                        return Some((Ok(Frame::data(out)), State::Failed(e)));
                     }
                     None => {
                         let Ok(out) = tokio::task::spawn_blocking(move || rw.finish()).await else {
-                            return Some((Err(failed()), None));
+                            return Some((Err(failed()), State::Done));
                         };
-                        return (!out.is_empty()).then(|| (Ok(Frame::data(out)), None));
+                        return (!out.is_empty()).then(|| (Ok(Frame::data(out)), State::Done));
                     }
                 }
             }
@@ -752,11 +768,8 @@ fn transformed(
 }
 
 /// Stream `upstream` unchanged.
-fn passthrough(upstream: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static) -> Body {
-    BodyExt::boxed_unsync(StreamBody::new(upstream.map(|r| {
-        r.map(Frame::data)
-            .map_err(|e| BoxError::from(e.without_url()))
-    })))
+fn passthrough(upstream: impl Stream<Item = Result<Bytes, BoxError>> + Send + 'static) -> Body {
+    BodyExt::boxed_unsync(StreamBody::new(upstream.map(|r| r.map(Frame::data))))
 }
 
 /// A WebSocket (or other) upgrade on a listed host: relay the handshake,
@@ -812,7 +825,10 @@ async fn upgrade(
         );
         let mut out_headers = end_to_end(res.headers());
         out_headers.remove(CONTENT_LENGTH);
-        let mut out = Response::new(passthrough(res.bytes_stream()));
+        let mut out = Response::new(passthrough(
+            res.bytes_stream()
+                .map(|r| r.map_err(|e| BoxError::from(e.without_url()))),
+        ));
         *out.status_mut() = status;
         *out.headers_mut() = out_headers;
         return out;
@@ -1040,6 +1056,47 @@ mod tests {
         .await
         .expect("read_body must give up on its own");
         assert_eq!(r.unwrap_err(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    /// Holds everything until the end (like a restorer holding events
+    /// behind a possible tag).
+    struct HoldAll(Vec<u8>);
+
+    impl StreamTransform for HoldAll {
+        fn push(&mut self, chunk: &[u8]) -> Bytes {
+            self.0.extend_from_slice(chunk);
+            Bytes::new()
+        }
+        fn finish(&mut self) -> Bytes {
+            Bytes::from(std::mem::take(&mut self.0))
+        }
+    }
+
+    /// Review finding (fix round 1b): an upstream error mid-stream first
+    /// sends what the rewriter holds, then the error.
+    #[tokio::test]
+    async fn an_upstream_error_sends_what_was_held_first() {
+        let upstream = futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"data: a\n\n")),
+            Ok(Bytes::from_static(b"data: b\n\n")),
+            Err(BoxError::from("connection reset")),
+            Ok(Bytes::from_static(b"never")),
+        ]);
+        let mut body = transformed(upstream, Box::new(HoldAll(Vec::new())));
+        let mut data = Vec::new();
+        let mut error = None;
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(f) => data.extend_from_slice(f.data_ref().unwrap()),
+                Err(e) => {
+                    error = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        assert_eq!(data, b"data: a\n\ndata: b\n\n");
+        assert_eq!(error.as_deref(), Some("connection reset"));
+        assert!(body.frame().await.is_none());
     }
 
     #[test]
