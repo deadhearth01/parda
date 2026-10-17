@@ -681,12 +681,8 @@ async fn forward(
     };
 
     let status = res.status();
-    let content_type = res
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    // Several Content-Type headers that disagree: passed through unrestored.
+    let content_type = crate::restore::response_content_type(res.headers());
     // reqwest decodes what it can; anything still encoded is passed through
     // untouched (the transform could not read it).
     let still_encoded = res
@@ -711,15 +707,14 @@ async fn forward(
     let stream = res
         .bytes_stream()
         .map(|r| r.map_err(|e| BoxError::from(e.without_url())));
-    let body = if still_encoded {
-        passthrough(stream)
-    } else {
-        transformed(
+    let body = match content_type {
+        Some(content_type) if !still_encoded => transformed(
             stream,
             state
                 .transform
                 .response_stream(&parts.method, &target.host, &path, &content_type),
-        )
+        ),
+        _ => passthrough(stream),
     };
     let mut out = Response::new(body);
     *out.status_mut() = status;

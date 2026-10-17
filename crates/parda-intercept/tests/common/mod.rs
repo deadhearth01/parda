@@ -62,6 +62,8 @@ impl Seen {
 pub struct Reply {
     pub status: u16,
     pub content_type: &'static str,
+    /// Further `Content-Type` headers, sent after the first.
+    pub more_content_types: Vec<&'static str>,
     pub chunks: Vec<Bytes>,
 }
 
@@ -70,6 +72,7 @@ impl Reply {
         Reply {
             status: 200,
             content_type,
+            more_content_types: Vec::new(),
             chunks: chunks.into_iter().map(Into::into).collect(),
         }
     }
@@ -118,11 +121,13 @@ async fn handle(
         tokio::time::sleep(Duration::from_millis(2)).await;
         Some((Ok::<_, Infallible>(Frame::data(next)), it))
     });
-    Ok(Response::builder()
+    let mut res = Response::builder()
         .status(reply.status)
-        .header("content-type", reply.content_type)
-        .body(BodyExt::boxed(StreamBody::new(frames)))
-        .unwrap())
+        .header("content-type", reply.content_type);
+    for ct in reply.more_content_types {
+        res = res.header("content-type", ct);
+    }
+    Ok(res.body(BodyExt::boxed(StreamBody::new(frames))).unwrap())
 }
 
 pub async fn start_upstream(responder: Responder) -> Upstream {

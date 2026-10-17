@@ -152,6 +152,32 @@ fn build(
     }
 }
 
+/// The `Content-Type` a response is restored by: `""` when there is none
+/// (or it is not visible ASCII, which restores nothing), the first one
+/// when every one has the same media type (ASCII case and parameters
+/// aside), and `None` when several disagree: a client may read such a
+/// body by another type than parda did, so it passes through unrestored.
+pub(crate) fn response_content_type(headers: &http::HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(http::header::CONTENT_TYPE).iter();
+    let Some(first) = values.next() else {
+        return Some(String::new());
+    };
+    let media = |v: &http::HeaderValue| {
+        v.to_str().ok().map(|s| {
+            s.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+    };
+    let want = media(first);
+    if values.any(|v| want.is_none() || media(v) != want) {
+        return None;
+    }
+    Some(first.to_str().unwrap_or("").to_string())
+}
+
 /// A rewriter that changes nothing.
 pub(crate) fn passthrough() -> Box<dyn StreamTransform> {
     Box::new(Passthrough)
@@ -4194,6 +4220,41 @@ mod tests {
         assert_eq!(lines[1], "not json [NAME_1]");
         let last: Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(last["t"], "ravi@example.com");
+    }
+
+    /// Review F5: Content-Type headers that disagree restore nothing.
+    #[test]
+    fn disagreeing_content_types_restore_nothing() {
+        use http::HeaderValue;
+        let ct = |vals: &[&[u8]]| {
+            let mut h = http::HeaderMap::new();
+            for v in vals {
+                h.append(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_bytes(v).unwrap(),
+                );
+            }
+            response_content_type(&h)
+        };
+        assert_eq!(ct(&[]).as_deref(), Some(""));
+        assert_eq!(
+            ct(&[b"text/event-stream; charset=utf-8"]).as_deref(),
+            Some("text/event-stream; charset=utf-8")
+        );
+        assert_eq!(
+            ct(&[b"Application/JSON", b"application/json ; charset=utf-8"]).as_deref(),
+            Some("Application/JSON")
+        );
+        for vals in [
+            &[&b"application/json"[..], b"text/html"][..],
+            &[b"text/event-stream", b"application/json"],
+            &[b"application/json", b"application/json", b"text/plain"],
+            &[b"application/json", b""],
+            &[b"application/json", b"application/json\xff"],
+            &[b"application/json\xff", b"application/json\xff"],
+        ] {
+            assert_eq!(ct(vals), None, "{vals:?}");
+        }
     }
 
     /// Values with CR, CR CR and CRLF (an SSE reader ends a line at each).

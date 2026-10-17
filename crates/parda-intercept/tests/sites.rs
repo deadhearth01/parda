@@ -782,3 +782,59 @@ async fn referer_loses_its_query_and_fragment() {
         }
     }
 }
+
+/// Review F5: a response with several `Content-Type` headers was restored
+/// by the first one, while a browser may read it by another (an
+/// `application/json` document read as `text/html`, say). Headers that
+/// disagree on the media type pass the answer through unrestored; the same
+/// media type repeated (ASCII case and parameters aside) is still one type.
+#[tokio::test]
+async fn conflicting_content_types_pass_through_unrestored() {
+    let doc = json!({"t": "hi [NAME_1]"}).to_string();
+    let cases: Vec<(&'static str, Vec<&'static str>, bool)> = vec![
+        ("application/json", vec![], true),
+        ("application/json", vec!["text/html"], false),
+        ("text/html", vec!["application/json"], false),
+        ("application/json", vec!["text/plain"], false),
+        (
+            "application/json",
+            vec!["application/json", "text/html"],
+            false,
+        ),
+        ("application/json", vec![""], false),
+        (
+            "application/json",
+            vec!["APPLICATION/JSON; charset=utf-8"],
+            true,
+        ),
+        (
+            "application/json; charset=utf-8",
+            vec!["application/json"],
+            true,
+        ),
+    ];
+    for (first, more, want) in cases {
+        let (first2, more2, doc2) = (first, more.clone(), doc.clone());
+        let up = start_upstream(Arc::new(move |_: &Seen| {
+            let mut r = Reply::new(first2, vec![doc2.clone()]);
+            r.more_content_types = more2.clone();
+            r
+        }))
+        .await;
+        let parda = start_parda(&up, |_| {}, None).await;
+        let c = parda.client();
+        let url = format!("https://chatgpt.com:{}/backend-api/conversation", up.port);
+        let res = c
+            .post(&url)
+            .json(&json!({"prompt": "I am Ravi Kumar"}))
+            .send()
+            .await
+            .unwrap();
+        let body = res.text().await.unwrap();
+        let restored = body.contains("Ravi Kumar");
+        assert_eq!(restored, want, "{first} {more:?}: {body}");
+        if !want {
+            assert_eq!(body, doc, "{first} {more:?}");
+        }
+    }
+}

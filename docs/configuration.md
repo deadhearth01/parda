@@ -176,9 +176,10 @@ Tags follow `replace.style` (there is no separate style for intercept).
     (`{"`, `["`), not because it starts with a bracket (`[NAME_1] said`, `[1] see` are text); JSON
     text that turns into prose goes on unrestored. A line break (CR, LF or CRLF) in a real value
     restored into event-stream text starts a new `data:` line, so it never splits the event; it
-    reads back as LF. HTML pages and other types pass through
-    unchanged. A single event, line or frame larger than 16 MiB passes through, with the rest of
-    that answer, unrestored.
+    reads back as LF. HTML pages and other types pass through unchanged, and so does an answer with
+    several `Content-Type` headers that name different types (a browser might read it as another
+    type than parda did). A single event, line or frame larger than 16 MiB passes through, with the
+    rest of that answer, unrestored.
   - **A tag inside a URL is never restored**, so a prompt-injected image or link cannot carry your
     real data to another server. URLs are read as markdown renderers and browsers read them:
     markdown link and image targets (`](…)`, `](<…>)`, backslash escapes, spaces in `<…>`) and
