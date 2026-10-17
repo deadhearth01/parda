@@ -225,7 +225,9 @@ Every finding has a kind and a tier. Per-kind actions (`redact`, `block`, `warn`
 - **Decryption:** for AI hosts, parda terminates TLS with a local root certificate that you approve once in your OS. It is generated on your machine and its private key never leaves it.
 - **Filtering:** request bodies are tagged and responses restored, including streams.
 - **Forwarding:** requests go to the real site with full certificate verification.
-- **Turning it off:** `parda intercept off` restores your previous network settings exactly.
+- **Turning it on:** `parda ca create`, then `parda ca install` (your OS asks you to approve the certificate), then `parda intercept on` — it checks the certificate is trusted, starts the listener in the daemon and points every enabled network service's automatic proxy setting at parda, printing what it changed. Firefox uses its own settings; `on` prints the two to set.
+- **Checking it:** `parda intercept status` shows the certificate, the listener, each network service's current setting and the site list, and changes nothing. `parda doctor` warns when the system still sends AI sites to parda while nothing listens.
+- **Turning it off:** `parda intercept off` restores your previous network settings exactly (it also works with the daemon stopped or after a crash). A setting you changed yourself meanwhile is left as it is; one that cannot be put back keeps parda filtering and makes the command fail, so you can run it again.
 - **When parda isn't running:** the PAC file is unreachable and the system goes direct, so a stopped parda never breaks your internet. The dashboard shows whether protection is active.
 
 ### 7. Clipboard paste-safe

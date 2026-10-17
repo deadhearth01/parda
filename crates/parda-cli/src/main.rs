@@ -100,6 +100,9 @@ enum Command {
     /// The local root certificate used to protect AI websites and apps.
     #[command(subcommand)]
     Ca(CaCmd),
+    /// Filter AI websites and apps: point the system proxy setting at parda.
+    #[command(subcommand)]
+    Intercept(InterceptCmd),
     /// Print environment settings that route an agent through parda.
     Env {
         #[arg(value_parser = ["claude", "codex", "openai", "anthropic"])]
@@ -186,6 +189,16 @@ enum CaCmd {
     Status,
 }
 
+#[derive(Subcommand)]
+enum InterceptCmd {
+    /// Start filtering AI sites (needs a trusted `parda ca`); prints how to undo.
+    On,
+    /// Put the previous proxy settings back and stop filtering AI sites.
+    Off,
+    /// Certificate, listener, system proxy and site list (changes nothing).
+    Status,
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -244,6 +257,11 @@ fn main() {
             CaCmd::Uninstall => commands::ca::uninstall(),
             CaCmd::Status => commands::ca::status(),
         },
+        Command::Intercept(i) => commands::intercept::with_system(match i {
+            InterceptCmd::On => commands::intercept::on,
+            InterceptCmd::Off => commands::intercept::off,
+            InterceptCmd::Status => commands::intercept::status,
+        }),
         Command::Env { agent } => commands::env::run(&agent),
     };
     if let Err(e) = result {

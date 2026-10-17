@@ -5,6 +5,7 @@ pub mod ca;
 pub mod daemon;
 pub mod doctor;
 pub mod env;
+pub mod intercept;
 pub mod model;
 pub mod protection;
 pub mod redact;
