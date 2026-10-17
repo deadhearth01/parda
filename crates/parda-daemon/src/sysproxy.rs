@@ -314,6 +314,59 @@ pub fn enable(
     Ok(state)
 }
 
+/// The automatic proxy setting one target uses right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Current {
+    /// macOS network service, `user` (Windows) or `GNOME`.
+    pub target: String,
+    /// The configured PAC URL, if any (it may be switched off).
+    pub url: Option<String>,
+    /// Whether the PAC URL is in use.
+    pub active: bool,
+    /// In use, and it is a parda PAC (any port).
+    pub parda: bool,
+}
+
+/// What the system uses now — every enabled macOS network service, the
+/// Windows user setting or the GNOME setting. Only reads; never changes
+/// anything (for `parda intercept status` and `parda doctor`).
+pub fn inspect(
+    r: &mut dyn Runner,
+    platform: Platform,
+    pac_url: &str,
+) -> anyhow::Result<Vec<Current>> {
+    let current = |target: String, url: Option<String>, active: bool| {
+        let parda = active && url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url));
+        Current {
+            target,
+            url,
+            active,
+            parda,
+        }
+    };
+    Ok(match platform {
+        Platform::MacOs => {
+            let mut out = Vec::new();
+            for (name, on) in mac_services(r)? {
+                if on {
+                    let s = mac_get(r, &name)?;
+                    out.push(current(s.target, s.url, s.enabled));
+                }
+            }
+            out
+        }
+        Platform::Windows => {
+            let url = win_query(r);
+            let active = url.is_some();
+            vec![current("user".into(), url, active)]
+        }
+        Platform::Linux => {
+            let s = gnome_get(r)?;
+            vec![current("GNOME".into(), s.url, s.target == "auto")]
+        }
+    })
+}
+
 /// Whether the current setting of `s.target` still points at parda.
 fn still_ours(
     r: &mut dyn Runner,
@@ -711,6 +764,63 @@ mod tests {
             os.gnome,
             ("manual".to_string(), "http://corp/g.pac".to_string())
         );
+    }
+
+    /// Calls that would change a setting.
+    fn writes(os: &Os) -> Vec<&String> {
+        os.calls
+            .iter()
+            .filter(|c| {
+                c.starts_with("networksetup -set")
+                    || c.starts_with("reg add")
+                    || c.starts_with("reg delete")
+                    || c.starts_with("gsettings set")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inspect_reads_every_enabled_macos_service_without_changing_anything() {
+        let (_d, p) = paths();
+        let mut os = mac();
+        enable(&mut os, &p, Platform::MacOs, PAC).unwrap();
+        os.mac.get_mut("iPhone USB").unwrap().1 = false; // user switched it off
+        os.calls.clear();
+        let before = snapshot(&os);
+        let now = inspect(&mut os, Platform::MacOs, PAC).unwrap();
+        assert!(writes(&os).is_empty(), "{:?}", os.calls);
+        assert_eq!(snapshot(&os), before);
+        let get = |t: &str| now.iter().find(|c| c.target == t).cloned();
+        assert!(
+            get("Bluetooth PAN").is_none(),
+            "disabled services are skipped"
+        );
+        let wifi = get("Wi-Fi").unwrap();
+        assert!(wifi.active && wifi.parda, "{wifi:?}");
+        assert_eq!(wifi.url.as_deref(), Some(PAC));
+        let usb = get("iPhone USB").unwrap();
+        assert!(!usb.active && !usb.parda, "{usb:?}");
+    }
+
+    #[test]
+    fn inspect_recognises_an_old_port_and_other_pacs_on_windows_and_gnome() {
+        let mut os = Os {
+            win: Some("http://127.0.0.1:9999/parda.pac".into()),
+            gnome: ("manual".into(), PAC.into()),
+            ..Default::default()
+        };
+        let w = inspect(&mut os, Platform::Windows, PAC).unwrap();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].active && w[0].parda, "{w:?}");
+        let g = inspect(&mut os, Platform::Linux, PAC).unwrap();
+        assert!(!g[0].active && !g[0].parda, "manual mode: the PAC is unused");
+        os.gnome.0 = "auto".into();
+        assert!(inspect(&mut os, Platform::Linux, PAC).unwrap()[0].parda);
+        os.win = None;
+        let w = inspect(&mut os, Platform::Windows, PAC).unwrap();
+        assert!(!w[0].active && w[0].url.is_none());
+        assert!(writes(&os).is_empty(), "{:?}", os.calls);
+        assert_eq!(os.refreshed, 0);
     }
 
     #[test]
