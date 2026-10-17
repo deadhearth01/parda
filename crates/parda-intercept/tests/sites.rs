@@ -537,15 +537,13 @@ async fn multipart_files_are_unscanned_and_blockable() {
 #[tokio::test]
 async fn websocket_upgrades_are_refused_when_unscanned_is_block() {
     let up = start_upstream(site()).await;
-    let mut parda = start_parda(
-        &up,
-        |c| c.intercept.unscanned = UnscannedMedia::Block,
-        None,
-    )
-    .await;
+    let mut parda = start_parda(&up, |c| c.intercept.unscanned = UnscannedMedia::Block, None).await;
     let res = parda
         .client()
-        .get(format!("https://chatgpt.com:{}/backend-api/ws?x=1", up.port))
+        .get(format!(
+            "https://chatgpt.com:{}/backend-api/ws?x=1",
+            up.port
+        ))
         .version(http::Version::HTTP_11)
         .header("connection", "upgrade")
         .header("upgrade", "websocket")

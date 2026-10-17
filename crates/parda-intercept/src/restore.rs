@@ -181,14 +181,48 @@ enum TextRestorer {
     Sniff(Box<Sniff>),
 }
 
-/// A text not decided yet: everything seen so far (bounded by
-/// [`SNIFF_MAX`]), of which the first `emitted` bytes went out unrestored
-/// (a forced flush).
+/// A text not decided yet: everything seen so far (bounded: at most
+/// [`SNIFF_MAX`] bytes of leading BOM and whitespace, then at most that
+/// much more), of which the first `emitted` bytes went out unrestored (a
+/// forced flush). `lead` bytes of it are known to be a leading BOM or
+/// whitespace, so each byte is read once.
 struct Sniff {
     engine: Engine,
     scope: String,
     seen: String,
     emitted: usize,
+    lead: Lead,
+}
+
+/// How far the leading BOMs, then JSON whitespace, of a text reach.
+#[derive(Debug, Clone, Copy, Default)]
+struct Lead {
+    len: usize,
+    /// Past the BOMs (a BOM after whitespace is text).
+    past_bom: bool,
+}
+
+impl Lead {
+    fn of(text: &str) -> Self {
+        let mut lead = Lead::default();
+        lead.advance(text);
+        lead
+    }
+
+    /// Read on into `text`, whose first `self.len` bytes were read before.
+    fn advance(&mut self, text: &str) {
+        if !self.past_bom {
+            let rest = &text[self.len..];
+            let t = rest.trim_start_matches('\u{feff}');
+            self.len += rest.len() - t.len();
+            if t.is_empty() {
+                return;
+            }
+            self.past_bom = true;
+        }
+        let rest = &text[self.len..];
+        self.len += rest.len() - rest.trim_start_matches(JSON_WS).len();
+    }
 }
 
 /// Whitespace between JSON tokens.
@@ -207,11 +241,18 @@ enum TextKind {
 /// a value followed by another on a later line; a text that stops being
 /// JSON before that (`[NAME_1]`, `[1] see`, `{ is`) is plain. Only the
 /// first [`SNIFF_MAX`] bytes are read, so the answer never depends on how
-/// the text was split.
+/// the text was split. More than [`SNIFF_MAX`] bytes of BOM and whitespace
+/// first is plain text (whitespace alone would otherwise never decide).
 fn sniff_text(text: &str, end: bool) -> Option<TextKind> {
-    let t = text
-        .trim_start_matches('\u{feff}')
-        .trim_start_matches(JSON_WS);
+    sniff_after(text, Lead::of(text), end)
+}
+
+/// [`sniff_text`] with the leading BOM and whitespace already measured.
+fn sniff_after(text: &str, lead: Lead, end: bool) -> Option<TextKind> {
+    if lead.len > SNIFF_MAX {
+        return Some(TextKind::Plain);
+    }
+    let t = &text[lead.len..];
     if !t.starts_with(['{', '[']) {
         return (end || !t.is_empty()).then_some(TextKind::Plain);
     }
@@ -262,6 +303,7 @@ impl TextRestorer {
             scope: scope.to_string(),
             seen: String::new(),
             emitted: 0,
+            lead: Lead::default(),
         }))
     }
 
@@ -271,7 +313,8 @@ impl TextRestorer {
             TextRestorer::Json(r) => r.push(text),
             TextRestorer::Sniff(s) => {
                 s.seen.push_str(text);
-                match sniff_text(&s.seen, false) {
+                s.lead.advance(&s.seen);
+                match sniff_after(&s.seen, s.lead, false) {
                     Some(kind) => self.decide(kind),
                     None => String::new(),
                 }
@@ -307,7 +350,7 @@ impl TextRestorer {
             TextRestorer::Plain(r) => r.finish(),
             TextRestorer::Json(r) => r.finish(),
             TextRestorer::Sniff(s) => {
-                if let Some(kind) = sniff_text(&s.seen, false) {
+                if let Some(kind) = sniff_after(&s.seen, s.lead, false) {
                     let mut out = self.decide(kind);
                     out.push_str(&self.finish());
                     return out;
@@ -345,7 +388,8 @@ impl TextRestorer {
             TextRestorer::Sniff(s) => {
                 s.seen.push_str(text);
                 s.emitted = s.seen.len();
-                if let Some(kind) = sniff_text(&s.seen, false) {
+                s.lead.advance(&s.seen);
+                if let Some(kind) = sniff_after(&s.seen, s.lead, false) {
                     let _ = self.decide(kind);
                 }
             }
@@ -3118,6 +3162,132 @@ mod tests {
         out
     }
 
+    /// R6 (final review): a sniffed text (unknown key, patch path) made of
+    /// whitespace only never decided, so it kept all of it and re-trimmed it
+    /// on every push. Past SNIFF_MAX bytes of leading whitespace it is plain
+    /// text: the state stays small, forced flushes included, and a tag that
+    /// finally comes is restored.
+    #[test]
+    fn whitespace_only_sniffing_decides_plain_with_bounded_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let started = std::time::Instant::now();
+        let limit = std::time::Duration::from_secs(60);
+        for (lead, unit) in [("", "\n\n"), ("\u{feff}", " \t\r\n"), ("", " ")] {
+            let mut r = TextRestorer::sniffing(&e, SCOPE);
+            let (mut sent, mut out) = (String::from(lead), r.push(lead));
+            let mut i = 0usize;
+            while sent.len() < 32 * 1024 * 1024 {
+                let delta = unit.repeat(16);
+                sent.push_str(&delta);
+                out.push_str(&r.push(&delta));
+                if i % 1000 == 0 {
+                    // A forced flush (64 held events or 1 MiB).
+                    out.push_str(&r.finish());
+                }
+                assert!(
+                    r.pending_len() <= 4 * SNIFF_MAX,
+                    "{unit:?}: {} bytes held after {}",
+                    r.pending_len(),
+                    sent.len()
+                );
+                if let TextRestorer::Sniff(s) = &r {
+                    assert!(
+                        s.seen.len() <= 4 * SNIFF_MAX,
+                        "{unit:?}: seen {}",
+                        s.seen.len()
+                    );
+                }
+                if i % 4096 == 0 {
+                    assert!(started.elapsed() < limit, "{unit:?}: {} bytes", sent.len());
+                }
+                i += 1;
+            }
+            assert!(!r.is_sniffing(), "{unit:?}: still undecided");
+            out.push_str(&r.push("Hi [NAME_1]"));
+            out.push_str(&r.finish());
+            sent.push_str("Hi Ravi Kumar");
+            assert!(
+                out == sent,
+                "{unit:?}: not passed through and restored exactly"
+            );
+        }
+    }
+
+    /// The same through whole streams: an OpenAI-shaped SSE delta (unknown
+    /// key), a chatgpt.com patch path and an NDJSON line, each carrying
+    /// 32 MiB of whitespace in small deltas, take linear time and restore the
+    /// tag at the end.
+    #[test]
+    fn whitespace_deltas_in_streams_take_linear_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let limit = std::time::Duration::from_secs(120);
+        let ws = " \n".repeat(512);
+        let n = 32 * 1024 * 1024 / ws.len();
+        let openai = |c: &str| json!({"choices": [{"index": 0, "delta": {"content": c}}]});
+        let mut sse_openai = String::new();
+        let mut patch = String::new();
+        let mut ndjson = String::new();
+        for i in 0..=n {
+            let c = if i == n { "Hi [NAME_1]" } else { ws.as_str() };
+            sse_openai.push_str(&format!("data: {}\n\n", openai(c)));
+            let p = if i == 0 {
+                json!({"p": "/message/content/parts/0", "o": "append", "v": c})
+            } else {
+                json!({"v": c})
+            };
+            patch.push_str(&format!("data: {p}\n\n"));
+            ndjson.push_str(&format!(
+                "{}\n",
+                json!({"result": {"response": {"token": c}}})
+            ));
+        }
+        // Text held while sniffing goes out in a later event: compare the
+        // texts the events add up to.
+        let joined = |b: &[u8], sse: bool, at: &[&str]| -> String {
+            let text = String::from_utf8_lossy(b).into_owned();
+            let items: Vec<&str> = if sse {
+                text.split("\n\n")
+                    .filter_map(|e| e.strip_prefix("data: "))
+                    .collect()
+            } else {
+                text.lines().collect()
+            };
+            items
+                .iter()
+                .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+                .filter_map(|v| {
+                    at.iter()
+                        .find_map(|p| v.pointer(p).and_then(Value::as_str).map(str::to_string))
+                })
+                .collect()
+        };
+        let mut want = ws.repeat(n);
+        want.push_str("Hi Ravi Kumar");
+        for (ct, body, sse, at) in [
+            (
+                "text/event-stream",
+                &sse_openai,
+                true,
+                &["/choices/0/delta/content"][..],
+            ),
+            ("text/event-stream", &patch, true, &["/v"][..]),
+            (
+                "application/x-ndjson",
+                &ndjson,
+                false,
+                &["/result/response/token"][..],
+            ),
+        ] {
+            let out = run_within(&e, ct, body.as_bytes(), 1500, limit);
+            assert!(
+                joined(&out, sse, at) == want,
+                "{ct} {at:?}: not restored exactly"
+            );
+        }
+    }
+
     /// Scan finding on 06da9ce: an item just under the 16 MiB cap, pushed in
     /// small chunks, must not be rescanned from its start on every chunk
     /// (newline and blank-line search, UTF-16 counting); nor may a large
@@ -3585,6 +3755,14 @@ mod tests {
         assert_eq!(sniff_text(&long, false), Some(Json));
         let prose = format!("[1] {}", "a".repeat(SNIFF_MAX * 2));
         assert_eq!(sniff_text(&prose, false), Some(Plain));
+        // More than SNIFF_MAX bytes of whitespace first: plain, whatever
+        // follows (R6); up to it, what follows decides.
+        let blank = "\n".repeat(SNIFF_MAX + 1);
+        assert_eq!(sniff_text(&blank, false), Some(Plain));
+        assert_eq!(sniff_text(&format!("{blank}{{\"a\""), false), Some(Plain));
+        let blank = format!("\u{feff}{}", " ".repeat(SNIFF_MAX - 3));
+        assert_eq!(sniff_text(&blank, false), None);
+        assert_eq!(sniff_text(&format!("{blank}{{\"a\""), false), Some(Json));
     }
 
     #[test]
