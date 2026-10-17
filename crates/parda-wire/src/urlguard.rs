@@ -110,7 +110,9 @@ pub struct UrlGuard {
     md: Vec<Md>,
     /// Tag readings in progress (at most one per state).
     tags: Vec<Tag>,
-    css: Css,
+    /// CSS readings in progress (never `Free`; at most one per quote and
+    /// escape state).
+    css: Vec<Css>,
     /// The last characters seen, lower-cased.
     recent: String,
     prev: Option<char>,
@@ -171,9 +173,17 @@ impl UrlGuard {
                 }
             }
         }
-        let (css_url, css) = css_step(self.css, c);
-        url |= css_url;
+        let mut css: Vec<Css> = Vec::with_capacity(self.css.len() + 1);
+        for state in std::mem::take(&mut self.css) {
+            let (u, next) = css_step(state, c);
+            url |= u;
+            add_css(&mut css, next);
+        }
         self.remember(c);
+        // A CSS URL may start at any trigger, whatever else is going on: a
+        // quote in text that is not CSS must not hide it.
+        add_css(&mut css, self.css_trigger());
+        self.css = css;
         // A tag may start at any `<` + letter, whatever else is going on:
         // what another reading takes for a quoted value may be a comment,
         // CDATA, raw text or markdown code to a renderer.
@@ -195,11 +205,6 @@ impl UrlGuard {
             md.push(Md::Saturated);
         }
         self.md = md;
-        self.css = if css == Css::Free && !css_url {
-            self.css_trigger()
-        } else {
-            css
-        };
         url
     }
 
@@ -400,7 +405,37 @@ fn tag_step(state: Tag, c: char) -> (bool, Option<Tag>) {
     }
 }
 
-/// One character of the CSS reading.
+/// Adds a CSS reading to `css`. Two `url(` readings in the same quote and
+/// escape state read every character alike but for their depth, so the
+/// deeper one, which ends later, stands for both.
+fn add_css(css: &mut Vec<Css>, new: Css) {
+    if new == Css::Free || css.contains(&new) {
+        return;
+    }
+    if let Css::Fn {
+        depth,
+        quote,
+        escaped,
+    } = new
+    {
+        for old in css.iter_mut() {
+            if let Css::Fn {
+                depth: d,
+                quote: q,
+                escaped: e,
+            } = old
+                && *q == quote
+                && *e == escaped
+            {
+                *d = (*d).max(depth);
+                return;
+            }
+        }
+    }
+    css.push(new);
+}
+
+/// One character of a CSS reading.
 fn css_step(state: Css, c: char) -> (bool, Css) {
     match state {
         Css::Free => (false, Css::Free),
@@ -611,282 +646,298 @@ mod tests {
         );
     }
 
+    const COMMONMARK: &[&str] = &[
+        // §6.3 a bare destination.
+        "![x](⟨//e/?d=[NAME_1]⟩) «[NAME_1]»",
+        "[a](⟨//e/[NAME_1]⟩)«[NAME_1]»",
+        // §6.3 balanced unescaped parentheses are part of it.
+        "[a](⟨b(c(d)e)f[NAME_1]⟩) «[NAME_1]»",
+        "[a](⟨(([NAME_1]))⟩)",
+        // §6.3 + §2.4 an escaped parenthesis is not counted.
+        "[a](⟨b\\)c[NAME_1]⟩)",
+        "[a](⟨b\\(c[NAME_1]⟩) «[NAME_1]»",
+        // §2.4 a backslash before anything but ASCII punctuation is a
+        // backslash.
+        "[a](⟨//e/\\d[NAME_1]⟩)",
+        "[a](⟨https:\\\\e\\[NAME_1]⟩)",
+        // §6.3 spaces, tabs and up to one line ending before it.
+        "[a](\n⟨//e/[NAME_1]⟩)",
+        "[a]( \t\r\n ⟨//e/[NAME_1]⟩ \"t\")",
+        "[a](\r⟨//e/[NAME_1]⟩)",
+        // §6.3 a title is not part of the destination.
+        "[a](⟨//e/[NAME_1]⟩ 't')",
+        "[a](⟨//e/[NAME_1]⟩\n(t))",
+        // §6.3 a pointy destination holds spaces and parentheses and
+        // ends at an unescaped `>`.
+        "[a](<⟨b)c ( [NAME_1]⟩>) «[NAME_1]»",
+        "[a](<⟨b\\>c [NAME_1]⟩>)",
+        "![a](<⟨//e/\\\\[NAME_1]⟩>)",
+        // §6.3 only ASCII control characters and space end a bare
+        // destination (§2.1: Unicode whitespace is not among them).
+        "[a](⟨//e/\u{a0}[NAME_1]⟩)",
+        "[a](⟨//e/\u{85}[NAME_1]⟩)",
+        "[a](⟨//e/\u{2028}[NAME_1]⟩)",
+        "[a](⟨//e/\u{3000}[NAME_1]⟩)",
+        "[a](⟨//e/\u{feff}[NAME_1]⟩)",
+        // §2.5 entity and numeric character references are not syntax.
+        "[a](⟨//e/&#41;[NAME_1]⟩)",
+        "[a](⟨//e/&#x29;&#32;[NAME_1]⟩)",
+        "[a](<⟨//e/&gt;[NAME_1]⟩>)",
+        "[a](⟨//e/?a=1&amp;b=[NAME_1]⟩)",
+        // §6.3 link text may hold brackets, code and images (§6.4).
+        "[a [b] `c`](⟨//e/[NAME_1]⟩)",
+        "[`](`](⟨//e/[NAME_1]⟩)",
+        "[![i](⟨//e/[NAME_1]⟩)](⟨//f/[EMAIL_1]⟩)",
+        // §4.7 link reference definitions.
+        "[r]: ⟨//e/[NAME_1]⟩\n\n![x][r] «[NAME_1]»",
+        "[r]:⟨//e/[NAME_1]⟩",
+        "[r]:\n⟨//e/[NAME_1]⟩",
+        "[r]:\r\n   ⟨//e/[NAME_1]⟩ 'title'",
+        "[r]: <⟨//e/ [NAME_1]⟩>",
+        "   [r]: ⟨//e/[NAME_1]⟩",
+        "[a]: ⟨//e/1⟩\n[b]: ⟨//e/[NAME_1]⟩",
+        "[r\\]x]: ⟨//e/[NAME_1]⟩",
+        // §4.7 a label may span lines; §2.1 a line ending is LF, CR or
+        // CRLF.
+        "[r\nx]: ⟨//e/[NAME_1]⟩\n\n![a][r x]",
+        "[r\r\nx]:\r\n⟨//e/[NAME_1]⟩",
+        "[r\rx]:\r⟨//e/[NAME_1]⟩\r\r![a][r x]",
+        // §5.1 definitions in block quotes: the destination may follow
+        // on the next line, after its `>` markers.
+        "> [r]: ⟨//e/[NAME_1]⟩",
+        "> [r]:\n> ⟨//e/[NAME_1]⟩",
+        ">[r]:\n>⟨//e/[NAME_1]⟩",
+        "> > [r]:\n> > ⟨//e/[NAME_1]⟩",
+        "   > [r]:\n   > ⟨//e/[NAME_1]⟩",
+        "> [r]:\r> ⟨//e/[NAME_1]⟩",
+        "> [r]:\r\n>\t⟨//e/[NAME_1]⟩",
+        "> [r\n> x]: ⟨//e/[NAME_1]⟩",
+        "> [a](\n> ⟨//e/[NAME_1]⟩)",
+        // §5.1 a lazy continuation line.
+        "> [r]:\n⟨//e/[NAME_1]⟩",
+        // §5.1 / §4.4: indented four spaces, `>` is not a marker but
+        // the first character of a bare destination (§6.3).
+        "[a](\n    ⟨><a>[NAME_1]⟩)",
+        "[r]:\n    ⟨><a>[NAME_1]⟩",
+        "> [r]:\n>     ⟨><a>[NAME_1]⟩",
+        "[r]:\n    ⟨>[NAME_1]⟩",
+        // §5.2 definitions in list items.
+        "- [r]: ⟨//e/[NAME_1]⟩",
+        "1) [r]: ⟨//e/[NAME_1]⟩",
+        "1. [r]:\n   ⟨//e/[NAME_1]⟩",
+        "* [r]:\n\t⟨//e/[NAME_1]⟩",
+        "> 1. [r]:\n>    ⟨//e/[NAME_1]⟩",
+        "- > [r]:\n  > ⟨//e/[NAME_1]⟩",
+        // §6.5 URI autolinks: a scheme of 2 to 32 characters, then
+        // anything but ASCII control, space, `<` and `>`.
+        "<‹http›⟨:e/?d=[NAME_1]⟩> «[NAME_1]»",
+        "<‹a+b.c-d›⟨:[NAME_1]⟩>",
+        "<‹abcdefghijabcdefghijabcdefghijab›⟨:[NAME_1]⟩>",
+        "<‹MAILTO›⟨:[NAME_1]⟩>",
+        // §6.5 backslash escapes do not work inside autolinks.
+        "<‹http›⟨://e/\\[NAME_1]⟩>",
+        "<‹http›⟨://e/(\u{a0}[NAME_1]⟩>",
+        // §6.5 email autolinks (no placeholder fits their grammar).
+        "<‹a.b+c@e.example›> «[NAME_1]»",
+    ];
+
     /// CommonMark 0.31.2 link destinations, escapes, entities, reference
     /// definitions and autolinks.
     #[test]
     fn conforms_to_commonmark() {
-        check_cases(&[
-            // §6.3 a bare destination.
-            "![x](⟨//e/?d=[NAME_1]⟩) «[NAME_1]»",
-            "[a](⟨//e/[NAME_1]⟩)«[NAME_1]»",
-            // §6.3 balanced unescaped parentheses are part of it.
-            "[a](⟨b(c(d)e)f[NAME_1]⟩) «[NAME_1]»",
-            "[a](⟨(([NAME_1]))⟩)",
-            // §6.3 + §2.4 an escaped parenthesis is not counted.
-            "[a](⟨b\\)c[NAME_1]⟩)",
-            "[a](⟨b\\(c[NAME_1]⟩) «[NAME_1]»",
-            // §2.4 a backslash before anything but ASCII punctuation is a
-            // backslash.
-            "[a](⟨//e/\\d[NAME_1]⟩)",
-            "[a](⟨https:\\\\e\\[NAME_1]⟩)",
-            // §6.3 spaces, tabs and up to one line ending before it.
-            "[a](\n⟨//e/[NAME_1]⟩)",
-            "[a]( \t\r\n ⟨//e/[NAME_1]⟩ \"t\")",
-            "[a](\r⟨//e/[NAME_1]⟩)",
-            // §6.3 a title is not part of the destination.
-            "[a](⟨//e/[NAME_1]⟩ 't')",
-            "[a](⟨//e/[NAME_1]⟩\n(t))",
-            // §6.3 a pointy destination holds spaces and parentheses and
-            // ends at an unescaped `>`.
-            "[a](<⟨b)c ( [NAME_1]⟩>) «[NAME_1]»",
-            "[a](<⟨b\\>c [NAME_1]⟩>)",
-            "![a](<⟨//e/\\\\[NAME_1]⟩>)",
-            // §6.3 only ASCII control characters and space end a bare
-            // destination (§2.1: Unicode whitespace is not among them).
-            "[a](⟨//e/\u{a0}[NAME_1]⟩)",
-            "[a](⟨//e/\u{85}[NAME_1]⟩)",
-            "[a](⟨//e/\u{2028}[NAME_1]⟩)",
-            "[a](⟨//e/\u{3000}[NAME_1]⟩)",
-            "[a](⟨//e/\u{feff}[NAME_1]⟩)",
-            // §2.5 entity and numeric character references are not syntax.
-            "[a](⟨//e/&#41;[NAME_1]⟩)",
-            "[a](⟨//e/&#x29;&#32;[NAME_1]⟩)",
-            "[a](<⟨//e/&gt;[NAME_1]⟩>)",
-            "[a](⟨//e/?a=1&amp;b=[NAME_1]⟩)",
-            // §6.3 link text may hold brackets, code and images (§6.4).
-            "[a [b] `c`](⟨//e/[NAME_1]⟩)",
-            "[`](`](⟨//e/[NAME_1]⟩)",
-            "[![i](⟨//e/[NAME_1]⟩)](⟨//f/[EMAIL_1]⟩)",
-            // §4.7 link reference definitions.
-            "[r]: ⟨//e/[NAME_1]⟩\n\n![x][r] «[NAME_1]»",
-            "[r]:⟨//e/[NAME_1]⟩",
-            "[r]:\n⟨//e/[NAME_1]⟩",
-            "[r]:\r\n   ⟨//e/[NAME_1]⟩ 'title'",
-            "[r]: <⟨//e/ [NAME_1]⟩>",
-            "   [r]: ⟨//e/[NAME_1]⟩",
-            "[a]: ⟨//e/1⟩\n[b]: ⟨//e/[NAME_1]⟩",
-            "[r\\]x]: ⟨//e/[NAME_1]⟩",
-            // §4.7 a label may span lines; §2.1 a line ending is LF, CR or
-            // CRLF.
-            "[r\nx]: ⟨//e/[NAME_1]⟩\n\n![a][r x]",
-            "[r\r\nx]:\r\n⟨//e/[NAME_1]⟩",
-            "[r\rx]:\r⟨//e/[NAME_1]⟩\r\r![a][r x]",
-            // §5.1 definitions in block quotes: the destination may follow
-            // on the next line, after its `>` markers.
-            "> [r]: ⟨//e/[NAME_1]⟩",
-            "> [r]:\n> ⟨//e/[NAME_1]⟩",
-            ">[r]:\n>⟨//e/[NAME_1]⟩",
-            "> > [r]:\n> > ⟨//e/[NAME_1]⟩",
-            "   > [r]:\n   > ⟨//e/[NAME_1]⟩",
-            "> [r]:\r> ⟨//e/[NAME_1]⟩",
-            "> [r]:\r\n>\t⟨//e/[NAME_1]⟩",
-            "> [r\n> x]: ⟨//e/[NAME_1]⟩",
-            "> [a](\n> ⟨//e/[NAME_1]⟩)",
-            // §5.1 a lazy continuation line.
-            "> [r]:\n⟨//e/[NAME_1]⟩",
-            // §5.1 / §4.4: indented four spaces, `>` is not a marker but
-            // the first character of a bare destination (§6.3).
-            "[a](\n    ⟨><a>[NAME_1]⟩)",
-            "[r]:\n    ⟨><a>[NAME_1]⟩",
-            "> [r]:\n>     ⟨><a>[NAME_1]⟩",
-            "[r]:\n    ⟨>[NAME_1]⟩",
-            // §5.2 definitions in list items.
-            "- [r]: ⟨//e/[NAME_1]⟩",
-            "1) [r]: ⟨//e/[NAME_1]⟩",
-            "1. [r]:\n   ⟨//e/[NAME_1]⟩",
-            "* [r]:\n\t⟨//e/[NAME_1]⟩",
-            "> 1. [r]:\n>    ⟨//e/[NAME_1]⟩",
-            "- > [r]:\n  > ⟨//e/[NAME_1]⟩",
-            // §6.5 URI autolinks: a scheme of 2 to 32 characters, then
-            // anything but ASCII control, space, `<` and `>`.
-            "<‹http›⟨:e/?d=[NAME_1]⟩> «[NAME_1]»",
-            "<‹a+b.c-d›⟨:[NAME_1]⟩>",
-            "<‹abcdefghijabcdefghijabcdefghijab›⟨:[NAME_1]⟩>",
-            "<‹MAILTO›⟨:[NAME_1]⟩>",
-            // §6.5 backslash escapes do not work inside autolinks.
-            "<‹http›⟨://e/\\[NAME_1]⟩>",
-            "<‹http›⟨://e/(\u{a0}[NAME_1]⟩>",
-            // §6.5 email autolinks (no placeholder fits their grammar).
-            "<‹a.b+c@e.example›> «[NAME_1]»",
-        ]);
+        check_cases(COMMONMARK);
     }
+
+    const GFM_AUTOLINKS: &[&str] = &[
+        // `www.`, then a domain, then a path to whitespace or `<`.
+        "‹www.›⟨e.example/?d=[NAME_1]⟩ «[NAME_1]»",
+        "see ‹WWW.›⟨e.example/[NAME_1]⟩",
+        "(‹www.›⟨e.example/[NAME_1]⟩)",
+        "*‹www.›⟨e.example/a?b=[NAME_1]&c=d⟩*",
+        // cmark-gfm ends the path only at ASCII whitespace or `<`.
+        "‹www.›⟨e.example/?d=\u{a0}[NAME_1]⟩",
+        // `http://` and `https://`.
+        "‹http://›⟨e.example/?d=[NAME_1]⟩ «[NAME_1]»",
+        "go to ‹HTTPS://›⟨e.example/[NAME_1]⟩.",
+        "‹https://›⟨e.example/?d=\u{3000}[NAME_1]⟩",
+        "(‹https://›⟨e.example/(a)[NAME_1]⟩)",
+        // A literal URL inside a link destination is one URL.
+        "[a](⟨https://e.example/[NAME_1]⟩)",
+        // Email addresses, and the `mailto:` / `xmpp:` protocols.
+        "mail ‹a.b-c_d+e@e.example›. «[NAME_1]»",
+        "‹mailto:a@e.example›",
+        "‹xmpp:a@e.example/r@x.y›",
+    ];
 
     /// GFM 0.29 §6.9 extended autolinks.
     #[test]
     fn conforms_to_gfm_autolinks() {
-        check_cases(&[
-            // `www.`, then a domain, then a path to whitespace or `<`.
-            "‹www.›⟨e.example/?d=[NAME_1]⟩ «[NAME_1]»",
-            "see ‹WWW.›⟨e.example/[NAME_1]⟩",
-            "(‹www.›⟨e.example/[NAME_1]⟩)",
-            "*‹www.›⟨e.example/a?b=[NAME_1]&c=d⟩*",
-            // cmark-gfm ends the path only at ASCII whitespace or `<`.
-            "‹www.›⟨e.example/?d=\u{a0}[NAME_1]⟩",
-            // `http://` and `https://`.
-            "‹http://›⟨e.example/?d=[NAME_1]⟩ «[NAME_1]»",
-            "go to ‹HTTPS://›⟨e.example/[NAME_1]⟩.",
-            "‹https://›⟨e.example/?d=\u{3000}[NAME_1]⟩",
-            "(‹https://›⟨e.example/(a)[NAME_1]⟩)",
-            // A literal URL inside a link destination is one URL.
-            "[a](⟨https://e.example/[NAME_1]⟩)",
-            // Email addresses, and the `mailto:` / `xmpp:` protocols.
-            "mail ‹a.b-c_d+e@e.example›. «[NAME_1]»",
-            "‹mailto:a@e.example›",
-            "‹xmpp:a@e.example/r@x.y›",
-        ]);
+        check_cases(GFM_AUTOLINKS);
     }
+
+    const HTML_TOKENIZER: &[&str] = &[
+        // Attribute value (double-quoted) / (single-quoted) /
+        // (unquoted) states.
+        "<img src=\"⟨//e/?d=[NAME_1]⟩\"> «[NAME_1]»",
+        "<img src='⟨//e/?d=\" [NAME_1]⟩'>",
+        "<img src=⟨//e/[NAME_1]⟩> «[NAME_1]»",
+        // Unquoted: only TAB, LF, FF, CR, SPACE and `>` end it.
+        "<img src=⟨//e/?d=\u{b}[NAME_1]⟩>",
+        "<img src=⟨//e/\"'<=`[NAME_1]⟩ alt=x>",
+        "<img src=⟨//e/\u{a0}[NAME_1]⟩>",
+        // Before attribute value: whitespace, line endings too.
+        "<img src =\n\t\"⟨//e/[NAME_1]⟩\">",
+        "<img\nsrc\n=\n⟨//e/[NAME_1]⟩>",
+        "<IMG SRC=⟨//e/[NAME_1]⟩>",
+        "<img\u{c}src=⟨//e/[NAME_1]⟩>",
+        // Self-closing start tag state: `/` between attributes.
+        "<img/src=⟨//e/[NAME_1]⟩>",
+        "<img/ /src='⟨//e/[NAME_1]⟩'/>",
+        // After attribute value (quoted): no whitespace needed.
+        "<img alt=\"x\"src=\"⟨//e/[NAME_1]⟩\">",
+        // Before attribute name: a `=` here starts a name, not a value.
+        "<img =\"x src=\"⟨//e/[NAME_1]⟩\">",
+        "<img alt=\"a\"=\"x src=\"⟨//e/[NAME_1]⟩\">",
+        "<img/=\"x src=\"⟨//e/[NAME_1]⟩\">",
+        "<img alt=a =\"x src=\"⟨//e/[NAME_1]⟩\">",
+        // Not a value to a browser, but other HTML parsers (sanitizers,
+        // non-browser renderers) may read one: guarded as before.
+        "<img =⟨//e/?d=[NAME_1]⟩>",
+        "<img src =⟨x⟩ =⟨//e/[NAME_1]⟩>",
+        "<img/=⟨//e/[NAME_1]⟩>",
+        // Attribute name state: quotes and `<` belong to the name.
+        "<img a\"b=⟨//e/[NAME_1]⟩>",
+        "<img a'b'c src='⟨//e/[NAME_1]⟩'>",
+        "<img x<y src=⟨//e/[NAME_1]⟩>",
+        // Character references do not end a value.
+        "<img src=⟨//e/&#32;[NAME_1]⟩>",
+        "<img src=\"⟨//e/&quot;[NAME_1]⟩\">",
+        // URL attributes: srcset, style, meta content, ping,
+        // formaction, poster, background, base href, srcdoc, ...
+        "<img srcset=\"⟨//e/a.png 1x, //e/[NAME_1].png 2x⟩\">",
+        "<img srcset=⟨//e/a.png,//e/[NAME_1].png⟩ sizes=1px>",
+        "<picture><source srcset='⟨//e/[NAME_1] 2x⟩'></picture>",
+        "<div style=\"background:url(⟨//e/[NAME_1]⟩)\">x</div>",
+        "<div style=background:url(⟨//e/[NAME_1]⟩)>x</div>",
+        "<p style=\"background:url(&quot;⟨//e/[NAME_1]⟩&quot;)\">",
+        "<meta http-equiv=refresh content='0; url=⟨//e/[NAME_1]⟩'>",
+        "<meta http-equiv=refresh content=0;url=⟨//e/[NAME_1]⟩>",
+        "<a href=\"#\" ping=\"⟨//e/[NAME_1] //f/[EMAIL_1]⟩\">x</a>",
+        "<button formaction=⟨//e/[NAME_1]⟩>x</button>",
+        "<video poster=\"⟨//e/[NAME_1].png⟩\"></video>",
+        "<body background=⟨//e/[NAME_1].png⟩>",
+        "<table background='⟨//e/[NAME_1]⟩'>",
+        "<base href=\"⟨//e/[NAME_1]/⟩\"><img src=⟨x.png⟩>",
+        "<svg><image href=⟨//e/[NAME_1]⟩ /></svg>",
+        "<svg><use xlink:href='⟨//e/[NAME_1]#a⟩'/></svg>",
+        "<object data=⟨//e/[NAME_1]⟩></object>",
+        "<link rel=stylesheet href=⟨//e/[NAME_1].css⟩>",
+        "<form action=⟨//e/[NAME_1]⟩></form>",
+        "<iframe srcdoc=\"<img src=⟨//f/[EMAIL_1]⟩>\"></iframe>",
+        "<iframe srcdoc=\"&lt;img src=⟨//f/[EMAIL_1]⟩&gt;\"></iframe>",
+        // Comment states: a comment is not markup and ends at `-->`,
+        // `--!>`, `<!-->` or `<!--->`; a tag after it is a tag.
+        "<!-- <a title=\" --><img src=\"⟨//e/[NAME_1]⟩\">",
+        "<!-- <a title=' --!><img src='⟨//e/[NAME_1]⟩'>",
+        "<!--><a title=\"<img src=\"⟨//e/[NAME_1]⟩\">",
+        "<!---><img src='⟨//e/[NAME_1]⟩'>",
+        // Bogus comment state: `<?`, `<!` + other, `</` + non-letter.
+        "<? <a title=\"?><img src=\"⟨//e/[NAME_1]⟩\">",
+        "<!x <a title=\"><img src=\"⟨//e/[NAME_1]⟩\">",
+        "</1 <a title=\"><img src=\"⟨//e/[NAME_1]⟩\">",
+        "<!DOCTYPE html \"<a title='\"><img src='⟨//e/[NAME_1]⟩'>",
+        // CDATA: a bogus comment to the first `>` in HTML content, a
+        // CDATA section to `]]>` in foreign content.
+        "<![CDATA[ <a title=\" ]]><img src=\"⟨//e/[NAME_1]⟩\">",
+        "<svg><![CDATA[ > <a title=\" ]]><image href=\"⟨//e/[NAME_1]⟩\"/></svg>",
+        // End tag: its attributes are dropped, but it reads quotes.
+        "</x title=\"<img src=\"><img src=\"⟨//e/[NAME_1]⟩\">",
+        // RCDATA (`textarea`, `title`): no tags until the end tag.
+        "<textarea><a title=\"</textarea><img src=\"⟨//e/[NAME_1]⟩\">",
+        "<title>'</title><img alt='x' src=⟨//e/[NAME_1]⟩>",
+        // Markdown text that is not HTML (code span, escape).
+        "`<a title=\"` <img src=\"⟨//e/[NAME_1]⟩\">",
+        "\\<a title=\" <img src=\"⟨//e/[NAME_1]⟩\">",
+        "[a](/u \"<a title='\") <img src='⟨//e/[NAME_1]⟩'>",
+        // Plain text after tags stays plain.
+        "<b>«[NAME_1]»</b> «[NAME_1]»",
+    ];
 
     /// The WHATWG HTML tokenizer (§13.2.5): attribute values, comments,
     /// CDATA and the places a tag cannot start.
     #[test]
     fn conforms_to_html_tokenizer() {
-        check_cases(&[
-            // Attribute value (double-quoted) / (single-quoted) /
-            // (unquoted) states.
-            "<img src=\"⟨//e/?d=[NAME_1]⟩\"> «[NAME_1]»",
-            "<img src='⟨//e/?d=\" [NAME_1]⟩'>",
-            "<img src=⟨//e/[NAME_1]⟩> «[NAME_1]»",
-            // Unquoted: only TAB, LF, FF, CR, SPACE and `>` end it.
-            "<img src=⟨//e/?d=\u{b}[NAME_1]⟩>",
-            "<img src=⟨//e/\"'<=`[NAME_1]⟩ alt=x>",
-            "<img src=⟨//e/\u{a0}[NAME_1]⟩>",
-            // Before attribute value: whitespace, line endings too.
-            "<img src =\n\t\"⟨//e/[NAME_1]⟩\">",
-            "<img\nsrc\n=\n⟨//e/[NAME_1]⟩>",
-            "<IMG SRC=⟨//e/[NAME_1]⟩>",
-            "<img\u{c}src=⟨//e/[NAME_1]⟩>",
-            // Self-closing start tag state: `/` between attributes.
-            "<img/src=⟨//e/[NAME_1]⟩>",
-            "<img/ /src='⟨//e/[NAME_1]⟩'/>",
-            // After attribute value (quoted): no whitespace needed.
-            "<img alt=\"x\"src=\"⟨//e/[NAME_1]⟩\">",
-            // Before attribute name: a `=` here starts a name, not a value.
-            "<img =\"x src=\"⟨//e/[NAME_1]⟩\">",
-            "<img alt=\"a\"=\"x src=\"⟨//e/[NAME_1]⟩\">",
-            "<img/=\"x src=\"⟨//e/[NAME_1]⟩\">",
-            "<img alt=a =\"x src=\"⟨//e/[NAME_1]⟩\">",
-            // Attribute name state: quotes and `<` belong to the name.
-            "<img a\"b=⟨//e/[NAME_1]⟩>",
-            "<img a'b'c src='⟨//e/[NAME_1]⟩'>",
-            "<img x<y src=⟨//e/[NAME_1]⟩>",
-            // Character references do not end a value.
-            "<img src=⟨//e/&#32;[NAME_1]⟩>",
-            "<img src=\"⟨//e/&quot;[NAME_1]⟩\">",
-            // URL attributes: srcset, style, meta content, ping,
-            // formaction, poster, background, base href, srcdoc, ...
-            "<img srcset=\"⟨//e/a.png 1x, //e/[NAME_1].png 2x⟩\">",
-            "<img srcset=⟨//e/a.png,//e/[NAME_1].png⟩ sizes=1px>",
-            "<picture><source srcset='⟨//e/[NAME_1] 2x⟩'></picture>",
-            "<div style=\"background:url(⟨//e/[NAME_1]⟩)\">x</div>",
-            "<div style=background:url(⟨//e/[NAME_1]⟩)>x</div>",
-            "<p style=\"background:url(&quot;⟨//e/[NAME_1]⟩&quot;)\">",
-            "<meta http-equiv=refresh content='0; url=⟨//e/[NAME_1]⟩'>",
-            "<meta http-equiv=refresh content=0;url=⟨//e/[NAME_1]⟩>",
-            "<a href=\"#\" ping=\"⟨//e/[NAME_1] //f/[EMAIL_1]⟩\">x</a>",
-            "<button formaction=⟨//e/[NAME_1]⟩>x</button>",
-            "<video poster=\"⟨//e/[NAME_1].png⟩\"></video>",
-            "<body background=⟨//e/[NAME_1].png⟩>",
-            "<table background='⟨//e/[NAME_1]⟩'>",
-            "<base href=\"⟨//e/[NAME_1]/⟩\"><img src=⟨x.png⟩>",
-            "<svg><image href=⟨//e/[NAME_1]⟩ /></svg>",
-            "<svg><use xlink:href='⟨//e/[NAME_1]#a⟩'/></svg>",
-            "<object data=⟨//e/[NAME_1]⟩></object>",
-            "<link rel=stylesheet href=⟨//e/[NAME_1].css⟩>",
-            "<form action=⟨//e/[NAME_1]⟩></form>",
-            "<iframe srcdoc=\"<img src=⟨//f/[EMAIL_1]⟩>\"></iframe>",
-            "<iframe srcdoc=\"&lt;img src=⟨//f/[EMAIL_1]⟩&gt;\"></iframe>",
-            // Comment states: a comment is not markup and ends at `-->`,
-            // `--!>`, `<!-->` or `<!--->`; a tag after it is a tag.
-            "<!-- <a title=\" --><img src=\"⟨//e/[NAME_1]⟩\">",
-            "<!-- <a title=' --!><img src='⟨//e/[NAME_1]⟩'>",
-            "<!--><a title=\"<img src=\"⟨//e/[NAME_1]⟩\">",
-            "<!---><img src='⟨//e/[NAME_1]⟩'>",
-            // Bogus comment state: `<?`, `<!` + other, `</` + non-letter.
-            "<? <a title=\"?><img src=\"⟨//e/[NAME_1]⟩\">",
-            "<!x <a title=\"><img src=\"⟨//e/[NAME_1]⟩\">",
-            "</1 <a title=\"><img src=\"⟨//e/[NAME_1]⟩\">",
-            "<!DOCTYPE html \"<a title='\"><img src='⟨//e/[NAME_1]⟩'>",
-            // CDATA: a bogus comment to the first `>` in HTML content, a
-            // CDATA section to `]]>` in foreign content.
-            "<![CDATA[ <a title=\" ]]><img src=\"⟨//e/[NAME_1]⟩\">",
-            "<svg><![CDATA[ > <a title=\" ]]><image href=\"⟨//e/[NAME_1]⟩\"/></svg>",
-            // End tag: its attributes are dropped, but it reads quotes.
-            "</x title=\"<img src=\"><img src=\"⟨//e/[NAME_1]⟩\">",
-            // RCDATA (`textarea`, `title`): no tags until the end tag.
-            "<textarea><a title=\"</textarea><img src=\"⟨//e/[NAME_1]⟩\">",
-            "<title>'</title><img alt='x' src=⟨//e/[NAME_1]⟩>",
-            // Markdown text that is not HTML (code span, escape).
-            "`<a title=\"` <img src=\"⟨//e/[NAME_1]⟩\">",
-            "\\<a title=\" <img src=\"⟨//e/[NAME_1]⟩\">",
-            "[a](/u \"<a title='\") <img src='⟨//e/[NAME_1]⟩'>",
-            // Plain text after tags stays plain.
-            "<b>«[NAME_1]»</b> «[NAME_1]»",
-        ]);
+        check_cases(HTML_TOKENIZER);
     }
+
+    const CSS_SYNTAX: &[&str] = &[
+        // §4.3.6 consume a url token.
+        "<style>p{background:url(⟨//e/[NAME_1]⟩)}</style> «[NAME_1]»",
+        "<style>p{background:URL(⟨//e/[NAME_1]⟩)}</style>",
+        "<style>p{background:url(\n ⟨//e/[NAME_1]⟩ )}</style>",
+        // §4.3.7 an escaped `)` stays in the url.
+        "<style>p{background:url(⟨//e/\\)[NAME_1]⟩)}</style>",
+        // §4.3.4 `url(` + quote: a function holding a string token.
+        "<style>p{background:url(\"⟨//e/)[NAME_1]⟩\")}</style>",
+        "<style>p{background:url('⟨//e/\\'[NAME_1]⟩')}</style>",
+        // §4.3.5 an escaped newline continues a string.
+        "<style>p{background:url(\"⟨//e/\\\n[NAME_1]⟩\")}</style>",
+        // §4.3.4 the name is compared after escapes are consumed
+        // (§4.3.7): `u\72l(` is `url(`.
+        "<style>p{background:u\\72l(⟨//e/[NAME_1]⟩)}</style>",
+        "<style>p{background:u\\72 l(⟨//e/[NAME_1]⟩)}</style>",
+        "<style>p{background:\\75\\72\\6c(⟨//e/[NAME_1]⟩)}</style>",
+        "<style>p{background:\\url(⟨//e/[NAME_1]⟩)}</style>",
+        "<style>p{background:u\\R\\L(⟨//e/[NAME_1]⟩)}</style>",
+        // CSS Images 4 image-set(): strings are URLs too.
+        "<style>p{background:image-set(\"⟨//e/[NAME_1]⟩\" 1x, url(⟨//f/[EMAIL_1]⟩) 2x)}</style>",
+        "<style>p{background:-webkit-image-set('⟨//e/[NAME_1]⟩' 1x)}</style>",
+        "<style>p{background:image-s\\65t(\"⟨//e/[NAME_1]⟩\" 1x)}</style>",
+        // CSS Cascade 5 §2 @import: a string or url, then conditions.
+        "<style>@import \"⟨//e/[NAME_1]⟩\";</style> «[NAME_1]»",
+        "<style>@IMPORT\n'⟨//e/[NAME_1]⟩';</style>",
+        "<style>@import url(\"⟨//e/[NAME_1]⟩\") layer(x) screen;</style>",
+        // A `;` inside a url token or string does not end @import.
+        "<style>@import url(⟨//e/;[NAME_1]⟩);</style>",
+        "<style>@import '⟨//e/\\';[NAME_1]⟩';</style>",
+        // §4.3.11 an at-keyword's name is compared after escapes.
+        "<style>@\\69mport '⟨//e/[NAME_1]⟩';</style>",
+        "<style>@\\69 mport\"⟨//e/;[NAME_1]⟩\";</style>",
+        "<style>@font-face{src:url(⟨//e/[NAME_1].woff⟩)}</style>",
+        // A url reading started in other text does not hide the next
+        // one.
+        "<style>a[title=\"<b x='\"]{background:url('⟨//e/[NAME_1]⟩')}</style>",
+        "`url('` <style>p{background:url(\"⟨//e/')[NAME_1]⟩\")}</style>",
+        "<a title='url('><style>p{background:url('⟨//e/)[NAME_1]⟩')}</style>",
+        "`@import '` <style>@import \"⟨//e/';[NAME_1]⟩\";</style>",
+    ];
 
     /// CSS Syntax 3 url tokens and the functions and rules that take URLs.
     #[test]
     fn conforms_to_css_syntax() {
-        check_cases(&[
-            // §4.3.6 consume a url token.
-            "<style>p{background:url(⟨//e/[NAME_1]⟩)}</style> «[NAME_1]»",
-            "<style>p{background:URL(⟨//e/[NAME_1]⟩)}</style>",
-            "<style>p{background:url(\n ⟨//e/[NAME_1]⟩ )}</style>",
-            // §4.3.7 an escaped `)` stays in the url.
-            "<style>p{background:url(⟨//e/\\)[NAME_1]⟩)}</style>",
-            // §4.3.4 `url(` + quote: a function holding a string token.
-            "<style>p{background:url(\"⟨//e/)[NAME_1]⟩\")}</style>",
-            "<style>p{background:url('⟨//e/\\'[NAME_1]⟩')}</style>",
-            // §4.3.5 an escaped newline continues a string.
-            "<style>p{background:url(\"⟨//e/\\\n[NAME_1]⟩\")}</style>",
-            // §4.3.4 the name is compared after escapes are consumed
-            // (§4.3.7): `u\72l(` is `url(`.
-            "<style>p{background:u\\72l(⟨//e/[NAME_1]⟩)}</style>",
-            "<style>p{background:u\\72 l(⟨//e/[NAME_1]⟩)}</style>",
-            "<style>p{background:\\75\\72\\6c(⟨//e/[NAME_1]⟩)}</style>",
-            "<style>p{background:\\url(⟨//e/[NAME_1]⟩)}</style>",
-            "<style>p{background:u\\R\\L(⟨//e/[NAME_1]⟩)}</style>",
-            // CSS Images 4 image-set(): strings are URLs too.
-            "<style>p{background:image-set(\"⟨//e/[NAME_1]⟩\" 1x, url(⟨//f/[EMAIL_1]⟩) 2x)}</style>",
-            "<style>p{background:-webkit-image-set('⟨//e/[NAME_1]⟩' 1x)}</style>",
-            "<style>p{background:image-s\\65t(\"⟨//e/[NAME_1]⟩\" 1x)}</style>",
-            // CSS Cascade 5 §2 @import: a string or url, then conditions.
-            "<style>@import \"⟨//e/[NAME_1]⟩\";</style> «[NAME_1]»",
-            "<style>@IMPORT\n'⟨//e/[NAME_1]⟩';</style>",
-            "<style>@import url(\"⟨//e/[NAME_1]⟩\") layer(x) screen;</style>",
-            // A `;` inside a url token or string does not end @import.
-            "<style>@import url(⟨//e/;[NAME_1]⟩);</style>",
-            "<style>@import '⟨//e/\\';[NAME_1]⟩';</style>",
-            // §4.3.11 an at-keyword's name is compared after escapes.
-            "<style>@\\69mport '⟨//e/[NAME_1]⟩';</style>",
-            "<style>@\\69 mport\"⟨//e/;[NAME_1]⟩\";</style>",
-            "<style>@font-face{src:url(⟨//e/[NAME_1].woff⟩)}</style>",
-            // A url reading started in other text does not hide the next
-            // one.
-            "<style>a[title=\"<b x='\"]{background:url('⟨//e/[NAME_1]⟩')}</style>",
-            "`url('` <style>p{background:url(\"⟨//e/')[NAME_1]⟩\")}</style>",
-            "`@import '` <style>@import \"⟨//e/';[NAME_1]⟩\";</style>",
-        ]);
+        check_cases(CSS_SYNTAX);
     }
+
+    const WHATWG_URL: &[&str] = &[
+        "[a](⟨https：／／e∕[NAME_1]⟩)",
+        "![a](⟨//e．example／?d=[NAME_1]⟩)",
+        "[a](⟨//e/）[NAME_1]⟩)",
+        "[r]: ⟨http:／／e∕[NAME_1]⟩",
+        "<‹http›⟨:／／e∕[NAME_1]⟩>",
+        "<img src=\"⟨https：//e/[NAME_1]⟩\">",
+        "<img src=⟨／／e/[NAME_1]⟩>",
+        "<img src=⟨\u{2215}\u{2215}e/[NAME_1]⟩>",
+        // The parser removes ASCII tab and newline anywhere in a URL.
+        "<img src=\"⟨//e/?d=\n[NAME_1]⟩\">",
+        "<img src='⟨//e/?d=\t[NAME_1]⟩'>",
+        "<style>p{background:url(⟨//e／[NAME_1]⟩)}</style>",
+    ];
 
     /// WHATWG URL: characters the URL parser maps (UTS #46 in hosts) or
     /// drops may sit inside a destination or value; none of them ends it.
     #[test]
     fn conforms_to_whatwg_url() {
-        check_cases(&[
-            "[a](⟨https：／／e∕[NAME_1]⟩)",
-            "![a](⟨//e．example／?d=[NAME_1]⟩)",
-            "[a](⟨//e/）[NAME_1]⟩)",
-            "[r]: ⟨http:／／e∕[NAME_1]⟩",
-            "<‹http›⟨:／／e∕[NAME_1]⟩>",
-            "<img src=\"⟨https：//e/[NAME_1]⟩\">",
-            "<img src=⟨／／e/[NAME_1]⟩>",
-            "<img src=⟨\u{2215}\u{2215}e/[NAME_1]⟩>",
-            // The parser removes ASCII tab and newline anywhere in a URL.
-            "<img src=\"⟨//e/?d=\n[NAME_1]⟩\">",
-            "<img src='⟨//e/?d=\t[NAME_1]⟩'>",
-            "<style>p{background:url(⟨//e／[NAME_1]⟩)}</style>",
-        ]);
+        check_cases(WHATWG_URL);
     }
 
     /// Does feeding `case` (markers removed) saturate the markdown
@@ -900,11 +951,11 @@ mod tests {
         })
     }
 
-    #[test]
-    fn saturated_readings_guard_the_line_and_keep_a_pending_destination() {
+    /// Cases that saturate the markdown readings.
+    fn saturated_cases() -> Vec<String> {
         let many = "](x(".repeat(MAX_THREADS + 1);
         let label = "\\](x(".repeat(MAX_THREADS);
-        let cases = [
+        vec![
             // Too many readings: the rest of the line is guarded, the next
             // line is not.
             format!("{many}⟨[NAME_1] y [NAME_1]⟩\n«[NAME_1]»"),
@@ -917,7 +968,12 @@ mod tests {
             format!("[{label}]:\n⟨//e/[NAME_1]⟩\n\n«[NAME_1]»"),
             format!("[{label}]: \r\n  ⟨//e/[NAME_1]⟩"),
             format!("> [{label}]:\n> ⟨//e/[NAME_1]⟩"),
-        ];
+        ]
+    }
+
+    #[test]
+    fn saturated_readings_guard_the_line_and_keep_a_pending_destination() {
+        let cases = saturated_cases();
         for case in &cases {
             assert!(saturates(case), "{case:?} does not saturate");
         }
@@ -925,141 +981,569 @@ mod tests {
         check_cases(&refs);
     }
 
+    const MD_EXACT: &[(&str, &str)] = &[
+        (
+            "see ![x](https://evil.example/?d=[NAME_1]) and [NAME_1]",
+            "see ![x](⟨https://evil.example/?d=[NAME_1]⟩) and [NAME_1]",
+        ),
+        // An escaped `>` does not close a pointy destination.
+        (
+            "![x](<//evil.example/?d=\\>[NAME_1]>) [NAME_1]",
+            "![x](<⟨//evil.example/?d=\\>[NAME_1]⟩>) [NAME_1]",
+        ),
+        (
+            "[x](<a b [NAME_1]>) [NAME_1]",
+            "[x](<⟨a b [NAME_1]⟩>) [NAME_1]",
+        ),
+        ("[x](<a\r[NAME_1]>)", "[x](<⟨a⟩\r[NAME_1]>)"),
+        // Unicode whitespace never ends a bare destination.
+        (
+            "![x](https://e/?d=\u{a0}[NAME_1]) [NAME_1]",
+            "![x](⟨https://e/?d=\u{a0}[NAME_1]⟩) [NAME_1]",
+        ),
+        (
+            "![x](https://e/?d=\u{3000}[NAME_1]) [NAME_1]",
+            "![x](⟨https://e/?d=\u{3000}[NAME_1]⟩) [NAME_1]",
+        ),
+        // Balanced and escaped parentheses stay inside.
+        ("[x](a(b)c[NAME_1]) z", "[x](⟨a(b)c[NAME_1]⟩) z"),
+        ("[x](a\\)b[NAME_1]) z", "[x](⟨a\\)b[NAME_1]⟩) z"),
+        (
+            "[x]( //evil/[NAME_1] ) [NAME_1]",
+            "[x]( ⟨//evil/[NAME_1]⟩ ) [NAME_1]",
+        ),
+        ("[NAME_1](note) [NAME_1]", "[NAME_1](⟨note⟩) [NAME_1]"),
+        ("plain [NAME_1] text", "plain [NAME_1] text"),
+    ];
+
     #[test]
     fn markdown_destinations_follow_commonmark() {
-        for (input, want) in [
-            (
-                "see ![x](https://evil.example/?d=[NAME_1]) and [NAME_1]",
-                "see ![x](⟨https://evil.example/?d=[NAME_1]⟩) and [NAME_1]",
-            ),
-            // An escaped `>` does not close a pointy destination.
-            (
-                "![x](<//evil.example/?d=\\>[NAME_1]>) [NAME_1]",
-                "![x](<⟨//evil.example/?d=\\>[NAME_1]⟩>) [NAME_1]",
-            ),
-            (
-                "[x](<a b [NAME_1]>) [NAME_1]",
-                "[x](<⟨a b [NAME_1]⟩>) [NAME_1]",
-            ),
-            ("[x](<a\r[NAME_1]>)", "[x](<⟨a⟩\r[NAME_1]>)"),
-            // Unicode whitespace never ends a bare destination.
-            (
-                "![x](https://e/?d=\u{a0}[NAME_1]) [NAME_1]",
-                "![x](⟨https://e/?d=\u{a0}[NAME_1]⟩) [NAME_1]",
-            ),
-            (
-                "![x](https://e/?d=\u{3000}[NAME_1]) [NAME_1]",
-                "![x](⟨https://e/?d=\u{3000}[NAME_1]⟩) [NAME_1]",
-            ),
-            // Balanced and escaped parentheses stay inside.
-            ("[x](a(b)c[NAME_1]) z", "[x](⟨a(b)c[NAME_1]⟩) z"),
-            ("[x](a\\)b[NAME_1]) z", "[x](⟨a\\)b[NAME_1]⟩) z"),
-            (
-                "[x]( //evil/[NAME_1] ) [NAME_1]",
-                "[x]( ⟨//evil/[NAME_1]⟩ ) [NAME_1]",
-            ),
-            ("[NAME_1](note) [NAME_1]", "[NAME_1](⟨note⟩) [NAME_1]"),
-            ("plain [NAME_1] text", "plain [NAME_1] text"),
-        ] {
+        for &(input, want) in MD_EXACT {
             assert_eq!(marked(&[input]), want, "{input}");
         }
     }
 
+    const REF_EXACT: &[(&str, &str)] = &[
+        (
+            "> [r]: //evil.example/?d=[NAME_1]\n\n![x][r]",
+            "> [r]: ⟨//evil.example/?d=[NAME_1]⟩\n\n![x][r]",
+        ),
+        ("- [r]: //e/[NAME_1]\n", "- [r]: ⟨//e/[NAME_1]⟩\n"),
+        ("1) [r]: //e/[NAME_1]\n", "1) [r]: ⟨//e/[NAME_1]⟩\n"),
+        (
+            "hi\r[r]: //e/[NAME_1]\r\r![x][r]",
+            "hi\r[r]: ⟨//e/[NAME_1]⟩\r\r![x][r]",
+        ),
+        (
+            "  [1]: <a b [NAME_1]>\n[NAME_1]",
+            "  [1]: <⟨a b [NAME_1]⟩>\n[NAME_1]",
+        ),
+        // Over-protection is cheap: the value after `[x]:` stays a tag.
+        ("[NAME_1]: [EMAIL_1] ok", "[NAME_1]: ⟨[EMAIL_1]⟩ ok"),
+        ("a: [NAME_1]", "a: [NAME_1]"),
+        // A label may span lines.
+        (
+            "[r\nx]: <//e/?d= [NAME_1]>\n![a][r x]",
+            "[r\nx]: <⟨//e/?d= [NAME_1]⟩>\n![a][r x]",
+        ),
+        // An unterminated autolink is text: the `](` in it still starts
+        // a destination after the line ending.
+        ("<http:![i](\r[EMAIL_1] x", "<http⟨:![i](⟩\r⟨[EMAIL_1]⟩ x"),
+        // HTML inside a failed markdown destination is still HTML.
+        (
+            "](< <img src=\"\n> [NAME_1]\">",
+            "](<⟨ <img src=\"\n> [NAME_1]⟩\">",
+        ),
+    ];
+
     #[test]
     fn reference_definitions_anywhere_on_a_line() {
-        for (input, want) in [
-            (
-                "> [r]: //evil.example/?d=[NAME_1]\n\n![x][r]",
-                "> [r]: ⟨//evil.example/?d=[NAME_1]⟩\n\n![x][r]",
-            ),
-            ("- [r]: //e/[NAME_1]\n", "- [r]: ⟨//e/[NAME_1]⟩\n"),
-            ("1) [r]: //e/[NAME_1]\n", "1) [r]: ⟨//e/[NAME_1]⟩\n"),
-            (
-                "hi\r[r]: //e/[NAME_1]\r\r![x][r]",
-                "hi\r[r]: ⟨//e/[NAME_1]⟩\r\r![x][r]",
-            ),
-            (
-                "  [1]: <a b [NAME_1]>\n[NAME_1]",
-                "  [1]: <⟨a b [NAME_1]⟩>\n[NAME_1]",
-            ),
-            // Over-protection is cheap: the value after `[x]:` stays a tag.
-            ("[NAME_1]: [EMAIL_1] ok", "[NAME_1]: ⟨[EMAIL_1]⟩ ok"),
-            ("a: [NAME_1]", "a: [NAME_1]"),
-            // A label may span lines.
-            (
-                "[r\nx]: <//e/?d= [NAME_1]>\n![a][r x]",
-                "[r\nx]: <⟨//e/?d= [NAME_1]⟩>\n![a][r x]",
-            ),
-            // An unterminated autolink is text: the `](` in it still starts
-            // a destination after the line ending.
-            ("<http:![i](\r[EMAIL_1] x", "<http⟨:![i](⟩\r⟨[EMAIL_1]⟩ x"),
-            // HTML inside a failed markdown destination is still HTML.
-            (
-                "](< <img src=\"\n> [NAME_1]\">",
-                "](<⟨ <img src=\"\n> [NAME_1]⟩\">",
-            ),
-        ] {
+        for &(input, want) in REF_EXACT {
             assert_eq!(marked(&[input]), want, "{input:?}");
         }
     }
+
+    const HTML_CSS_EXACT: &[(&str, &str)] = &[
+        (
+            "<http:evil.example/?d=[NAME_1]> [NAME_1]",
+            "<http⟨:evil.example/?d=[NAME_1]⟩> [NAME_1]",
+        ),
+        (
+            "<link rel=preload imagesrcset=\"//e/?d=[NAME_1] 1x\">[NAME_1]",
+            "<link rel=⟨preload⟩ imagesrcset=\"⟨//e/?d=[NAME_1] 1x⟩\">[NAME_1]",
+        ),
+        (
+            "<a ping='//e/[NAME_1]' href=\"#\">x [NAME_1]</a>",
+            "<a ping='⟨//e/[NAME_1]⟩' href=\"⟨#⟩\">x [NAME_1]</a>",
+        ),
+        (
+            "<meta http-equiv=refresh content=\"0;url=//e/[NAME_1]\">",
+            "<meta http-equiv=⟨refresh⟩ content=\"⟨0;url=//e/[NAME_1]⟩\">",
+        ),
+        (
+            "<img src       \t   =\"//e/[NAME_1]\">",
+            "<img src       \t   =\"⟨//e/[NAME_1]⟩\">",
+        ),
+        // Only HTML whitespace ends an unquoted value.
+        (
+            "<img src=//e/?d=\u{1}[NAME_1]>[NAME_1]",
+            "<img src=⟨//e/?d=\u{1}[NAME_1]⟩>[NAME_1]",
+        ),
+        (
+            "<style>@import\n\"//e/?[NAME_1]\";</style>",
+            "<style>@import⟨\n\"//e/?[NAME_1]\"⟩;</style>",
+        ),
+        (
+            "<style>@import \"//e/[NAME_1]\"; p{}</style>",
+            "<style>@import⟨ \"//e/[NAME_1]\"⟩; p{}</style>",
+        ),
+        (
+            "x{background:url('//e/?x=)[NAME_1]')} [NAME_1]",
+            "x{background:url(⟨'//e/?x=)[NAME_1]'⟩)} [NAME_1]",
+        ),
+        (
+            "x{background:url(\n'//e/[NAME_1]')} [NAME_1]",
+            "x{background:url(⟨\n'//e/[NAME_1]'⟩)} [NAME_1]",
+        ),
+        (
+            "x{b:image-set(\"//e/[NAME_1]\" 1x)} [NAME_1]",
+            "x{b:image-set(⟨\"//e/[NAME_1]\" 1x⟩)} [NAME_1]",
+        ),
+    ];
 
     #[test]
     fn autolinks_html_attributes_and_css() {
-        for (input, want) in [
-            (
-                "<http:evil.example/?d=[NAME_1]> [NAME_1]",
-                "<http⟨:evil.example/?d=[NAME_1]⟩> [NAME_1]",
-            ),
-            (
-                "<link rel=preload imagesrcset=\"//e/?d=[NAME_1] 1x\">[NAME_1]",
-                "<link rel=⟨preload⟩ imagesrcset=\"⟨//e/?d=[NAME_1] 1x⟩\">[NAME_1]",
-            ),
-            (
-                "<a ping='//e/[NAME_1]' href=\"#\">x [NAME_1]</a>",
-                "<a ping='⟨//e/[NAME_1]⟩' href=\"⟨#⟩\">x [NAME_1]</a>",
-            ),
-            (
-                "<meta http-equiv=refresh content=\"0;url=//e/[NAME_1]\">",
-                "<meta http-equiv=⟨refresh⟩ content=\"⟨0;url=//e/[NAME_1]⟩\">",
-            ),
-            (
-                "<img src       \t   =\"//e/[NAME_1]\">",
-                "<img src       \t   =\"⟨//e/[NAME_1]⟩\">",
-            ),
-            // Only HTML whitespace ends an unquoted value.
-            (
-                "<img src=//e/?d=\u{1}[NAME_1]>[NAME_1]",
-                "<img src=⟨//e/?d=\u{1}[NAME_1]⟩>[NAME_1]",
-            ),
-            (
-                "<style>@import\n\"//e/?[NAME_1]\";</style>",
-                "<style>@import⟨\n\"//e/?[NAME_1]\"⟩;</style>",
-            ),
-            (
-                "<style>@import \"//e/[NAME_1]\"; p{}</style>",
-                "<style>@import⟨ \"//e/[NAME_1]\"⟩; p{}</style>",
-            ),
-            (
-                "x{background:url('//e/?x=)[NAME_1]')} [NAME_1]",
-                "x{background:url(⟨'//e/?x=)[NAME_1]'⟩)} [NAME_1]",
-            ),
-            (
-                "x{background:url(\n'//e/[NAME_1]')} [NAME_1]",
-                "x{background:url(⟨\n'//e/[NAME_1]'⟩)} [NAME_1]",
-            ),
-            (
-                "x{b:image-set(\"//e/[NAME_1]\" 1x)} [NAME_1]",
-                "x{b:image-set(⟨\"//e/[NAME_1]\" 1x⟩)} [NAME_1]",
-            ),
-        ] {
+        for &(input, want) in HTML_CSS_EXACT {
             assert_eq!(marked(&[input]), want, "{input:?}");
         }
     }
 
+    /// The guard as of 3903dbc, before the conformance suite: the guard
+    /// must never be narrower than it.
+    mod reference {
+        use crate::urlguard::Part;
+
+        /// Look-behind kept for keyword triggers (`image-set(` is the longest).
+        const RECENT_CHARS: usize = 12;
+        /// Longest autolink scheme (CommonMark: 2–32 characters).
+        const MAX_SCHEME: u8 = 32;
+        /// Markdown readings followed at once; more than this protects the rest of
+        /// the line.
+        const MAX_THREADS: usize = 8;
+
+        /// One markdown reading of the text (a destination or autolink that may
+        /// have started here).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+        enum Md {
+            #[default]
+            Free,
+            /// Too many readings at once: protect to the end of the line.
+            Saturated,
+            /// After `](` or `]:`: ASCII whitespace before a destination.
+            DestBefore,
+            /// `<…>` destination.
+            DestPointy { escaped: bool },
+            /// Bare destination; `depth` counts open parentheses.
+            DestBare { depth: u32, escaped: bool },
+            /// After `<` + letter: a possible autolink scheme.
+            Scheme { len: u8 },
+            /// `<scheme:…>`.
+            Autolink,
+        }
+
+        /// The HTML / CSS reading of the text.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+        enum Html {
+            #[default]
+            Free,
+            /// Inside a tag; `name` while the tag name is being read.
+            Tag {
+                name: bool,
+            },
+            /// After `=` in a tag: ASCII whitespace before the value.
+            ValueBefore,
+            ValueQuoted(char),
+            ValueBare,
+            /// `url(` / `image-set(`: to an unquoted `)` at depth 0.
+            CssFn {
+                depth: u32,
+                quote: Option<char>,
+                escaped: bool,
+            },
+            /// After `@import`: to an unquoted `;`.
+            CssImport {
+                quote: Option<char>,
+            },
+        }
+
+        /// Splits a stream of text into URL and non-URL parts. Markdown and HTML
+        /// are read side by side, and every place a markdown destination could
+        /// start is followed (a construct can turn out to be unterminated, or hide
+        /// another): a character is inside a URL if any reading says so.
+        #[derive(Debug, Default)]
+        pub(super) struct UrlGuard {
+            /// Markdown readings in progress (never `Free`).
+            md: Vec<Md>,
+            html: Html,
+            /// The last characters seen, lower-cased.
+            recent: String,
+            prev: Option<char>,
+        }
+
+        fn ascii_space_or_control(c: char) -> bool {
+            (c as u32) <= 0x20 || c as u32 == 0x7f
+        }
+
+        /// Whitespace to an HTML tokenizer: TAB, LF, FF, CR, SPACE (any other
+        /// control character stays inside a name or value).
+        fn html_space(c: char) -> bool {
+            matches!(c, '\t' | '\n' | '\x0c' | '\r' | ' ')
+        }
+
+        fn line_ending(c: char) -> bool {
+            c == '\n' || c == '\r'
+        }
+
+        impl UrlGuard {
+            /// The parts of the next piece of text.
+            pub fn split(&mut self, text: &str) -> Vec<Part> {
+                let mut parts: Vec<Part> = Vec::new();
+                for c in text.chars() {
+                    let url = self.step(c);
+                    match parts.last_mut() {
+                        Some(p) if p.url == url => p.text.push(c),
+                        _ => parts.push(Part {
+                            url,
+                            text: c.to_string(),
+                        }),
+                    }
+                }
+                parts
+            }
+
+            /// Is `c` part of a URL? Moves every reading on.
+            fn step(&mut self, c: char) -> bool {
+                let prev = self.prev;
+                let mut url = false;
+                let mut md: Vec<Md> = Vec::with_capacity(self.md.len() + 1);
+                for state in std::mem::take(&mut self.md) {
+                    let (u, next) = md_step(state, c);
+                    url |= u;
+                    if next != Md::Free && !md.contains(&next) {
+                        md.push(next);
+                    }
+                }
+                let (html_url, html) = html_step(self.html, c);
+                url |= html_url;
+                self.remember(c);
+                // A destination or autolink may start after `c`, whatever else is
+                // going on.
+                if let Some(start) = self.md_trigger(c, prev)
+                    && !md.contains(&start)
+                {
+                    md.push(start);
+                }
+                if md.len() > MAX_THREADS {
+                    md = vec![Md::Saturated];
+                }
+                self.md = md;
+                self.html = if html == Html::Free && !html_url {
+                    self.html_trigger(c, prev)
+                } else {
+                    html
+                };
+                url
+            }
+
+            fn remember(&mut self, c: char) {
+                self.prev = Some(c);
+                self.recent.extend(c.to_lowercase());
+                let excess = self.recent.chars().count().saturating_sub(RECENT_CHARS);
+                if excess > 0 {
+                    let cut = self
+                        .recent
+                        .char_indices()
+                        .nth(excess)
+                        .map_or(self.recent.len(), |(i, _)| i);
+                    self.recent.drain(..cut);
+                }
+            }
+
+            /// Does a markdown destination or autolink start after `c`?
+            fn md_trigger(&self, c: char, prev: Option<char>) -> Option<Md> {
+                // Every `](` and every `]:` (reference labels may span lines):
+                // guarding more is cheap.
+                if (c == '(' || c == ':') && prev == Some(']') {
+                    Some(Md::DestBefore)
+                } else if c.is_ascii_alphabetic() && prev == Some('<') {
+                    Some(Md::Scheme { len: 1 })
+                } else {
+                    None
+                }
+            }
+
+            /// Does `c` (just seen, outside any tag or CSS URL) start one?
+            fn html_trigger(&self, c: char, prev: Option<char>) -> Html {
+                let r = &self.recent;
+                if c.is_ascii_alphabetic() && prev == Some('<') {
+                    Html::Tag { name: true }
+                } else if r.ends_with("url(") || r.ends_with("image-set(") {
+                    Html::CssFn {
+                        depth: 0,
+                        quote: None,
+                        escaped: false,
+                    }
+                } else if r.ends_with("@import") {
+                    Html::CssImport { quote: None }
+                } else {
+                    Html::Free
+                }
+            }
+        }
+
+        /// One character of the markdown reading.
+        fn md_step(state: Md, c: char) -> (bool, Md) {
+            match state {
+                Md::Free => (false, Md::Free),
+                Md::Saturated => {
+                    if line_ending(c) {
+                        (false, Md::Free)
+                    } else {
+                        (true, Md::Saturated)
+                    }
+                }
+                Md::DestBefore => {
+                    if ascii_space_or_control(c) {
+                        (false, Md::DestBefore)
+                    } else if c == '<' {
+                        (false, Md::DestPointy { escaped: false })
+                    } else {
+                        bare(c, 0)
+                    }
+                }
+                Md::DestPointy { escaped: true } => (true, Md::DestPointy { escaped: false }),
+                Md::DestPointy { escaped: false } => match c {
+                    '\\' => (true, Md::DestPointy { escaped: true }),
+                    '>' => (false, Md::Free),
+                    c if line_ending(c) => (false, Md::Free),
+                    _ => (true, Md::DestPointy { escaped: false }),
+                },
+                Md::DestBare {
+                    depth,
+                    escaped: true,
+                } => (
+                    true,
+                    Md::DestBare {
+                        depth,
+                        escaped: false,
+                    },
+                ),
+                Md::DestBare {
+                    depth,
+                    escaped: false,
+                } => bare(c, depth),
+                Md::Scheme { len } => {
+                    if c == ':' && len >= 2 {
+                        (true, Md::Autolink)
+                    } else if (c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+                        && len < MAX_SCHEME
+                    {
+                        (false, Md::Scheme { len: len + 1 })
+                    } else {
+                        (false, Md::Free)
+                    }
+                }
+                Md::Autolink => {
+                    if c == '>' || c == '<' || ascii_space_or_control(c) {
+                        (false, Md::Free)
+                    } else {
+                        (true, Md::Autolink)
+                    }
+                }
+            }
+        }
+
+        /// One character of a bare destination.
+        fn bare(c: char, depth: u32) -> (bool, Md) {
+            match c {
+                '\\' => (
+                    true,
+                    Md::DestBare {
+                        depth,
+                        escaped: true,
+                    },
+                ),
+                c if ascii_space_or_control(c) => (false, Md::Free),
+                '(' => (
+                    true,
+                    Md::DestBare {
+                        depth: depth + 1,
+                        escaped: false,
+                    },
+                ),
+                ')' if depth == 0 => (false, Md::Free),
+                ')' => (
+                    true,
+                    Md::DestBare {
+                        depth: depth - 1,
+                        escaped: false,
+                    },
+                ),
+                _ => (
+                    true,
+                    Md::DestBare {
+                        depth,
+                        escaped: false,
+                    },
+                ),
+            }
+        }
+
+        /// One character of the HTML / CSS reading.
+        fn html_step(state: Html, c: char) -> (bool, Html) {
+            match state {
+                Html::Free => (false, Html::Free),
+                Html::Tag { name } => match c {
+                    '>' => (false, Html::Free),
+                    '=' if !name => (false, Html::ValueBefore),
+                    c if html_space(c) || c == '/' => (false, Html::Tag { name: false }),
+                    _ => (false, Html::Tag { name }),
+                },
+                Html::ValueBefore => {
+                    if html_space(c) {
+                        (false, Html::ValueBefore)
+                    } else if c == '"' || c == '\'' {
+                        (false, Html::ValueQuoted(c))
+                    } else if c == '>' {
+                        (false, Html::Free)
+                    } else {
+                        (true, Html::ValueBare)
+                    }
+                }
+                Html::ValueQuoted(q) => {
+                    if c == q {
+                        (false, Html::Tag { name: false })
+                    } else {
+                        (true, Html::ValueQuoted(q))
+                    }
+                }
+                Html::ValueBare => {
+                    if c == '>' {
+                        (false, Html::Free)
+                    } else if html_space(c) {
+                        (false, Html::Tag { name: false })
+                    } else {
+                        (true, Html::ValueBare)
+                    }
+                }
+                Html::CssFn {
+                    depth,
+                    quote,
+                    escaped,
+                } => {
+                    let next = |depth, quote, escaped| Html::CssFn {
+                        depth,
+                        quote,
+                        escaped,
+                    };
+                    if escaped {
+                        (true, next(depth, quote, false))
+                    } else if c == '\\' {
+                        (true, next(depth, quote, true))
+                    } else if let Some(q) = quote {
+                        (true, next(depth, (c != q).then_some(q), false))
+                    } else {
+                        match c {
+                            '"' | '\'' => (true, next(depth, Some(c), false)),
+                            '(' => (true, next(depth + 1, None, false)),
+                            ')' if depth == 0 => (false, Html::Free),
+                            ')' => (true, next(depth - 1, None, false)),
+                            _ => (true, next(depth, None, false)),
+                        }
+                    }
+                }
+                Html::CssImport { quote: Some(q) } => (
+                    true,
+                    Html::CssImport {
+                        quote: (c != q).then_some(q),
+                    },
+                ),
+                // CSS allows any whitespace (line breaks too) after `@import`.
+                Html::CssImport { quote: None } => match c {
+                    ';' => (false, Html::Free),
+                    '"' | '\'' => (true, Html::CssImport { quote: Some(c) }),
+                    _ => (true, Html::CssImport { quote: None }),
+                },
+            }
+        }
+    }
+
+    /// Inputs the readings disagree on.
+    const SUPERSET_EXTRA: &[&str] = &[
+        "<img =//e/?d=[NAME_1]>",
+        "<img src =x =//e/[NAME_1]>",
+        "<img/=//e/[NAME_1]>",
+        "<img alt='a'=//e/[NAME_1]>",
+        "<a x='url(' >url(')[NAME_1]')",
+        "<a x=\"@import\" >@import '//e/;[NAME_1]';",
+        "[a](\n    ><a>[NAME_1])",
+        "[r]:\n> <a>[NAME_1] x",
+        "<!-- <a title=\" --><img src=\"//e/[NAME_1]\">",
+        "url(<img src='x)[NAME_1]'>",
+    ];
+
+    /// For every input of every table: where the old guard said URL, so
+    /// does the guard (whole and char by char).
+    #[test]
+    fn never_narrower_than_the_previous_guard() {
+        let mut inputs: Vec<String> = [
+            COMMONMARK,
+            GFM_AUTOLINKS,
+            HTML_TOKENIZER,
+            CSS_SYNTAX,
+            WHATWG_URL,
+            SUPERSET_EXTRA,
+        ]
+        .iter()
+        .flat_map(|t| t.iter())
+        .map(|c| parse_case(c).0)
+        .collect();
+        inputs.extend(saturated_cases().iter().map(|c| parse_case(c).0));
+        for t in [MD_EXACT, REF_EXACT, HTML_CSS_EXACT] {
+            inputs.extend(t.iter().map(|(input, _)| input.to_string()));
+        }
+        inputs.push(ANY_SPLIT_TEXT.to_string());
+        let mut failures = Vec::new();
+        for text in &inputs {
+            let mut old = reference::UrlGuard::default();
+            let old_mask: Vec<bool> = old
+                .split(text)
+                .iter()
+                .flat_map(|p| p.text.chars().map(|_| p.url))
+                .collect();
+            let chars: Vec<String> = text.chars().map(String::from).collect();
+            let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
+            for new_mask in [url_mask(&[text]), url_mask(&refs)] {
+                let lost: String = text
+                    .chars()
+                    .zip(old_mask.iter().zip(&new_mask))
+                    .filter(|(_, (o, n))| **o && !**n)
+                    .map(|(c, _)| c)
+                    .collect();
+                if !lost.is_empty() {
+                    failures.push(format!("{text:?}: no longer guarded {lost:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    const ANY_SPLIT_TEXT: &str = "a ![i](<https://e/?q=\\>[NAME_1]>) b <img src='x[NAME_1]'> [NAME_1]\n\
+                    > [r]: /y/[NAME_1] c\r[s]: <q r>\nurl(\"a)\" [NAME_1]) <http:x[NAME_1]> z";
+
     #[test]
     fn any_split_gives_the_same_parts() {
-        let text = "a ![i](<https://e/?q=\\>[NAME_1]>) b <img src='x[NAME_1]'> [NAME_1]\n\
-                    > [r]: /y/[NAME_1] c\r[s]: <q r>\nurl(\"a)\" [NAME_1]) <http:x[NAME_1]> z";
+        let text = ANY_SPLIT_TEXT;
         let whole = marked(&[text]);
         let chars: Vec<char> = text.chars().collect();
         for n in 1..9 {
