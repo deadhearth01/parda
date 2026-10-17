@@ -114,11 +114,22 @@ Tags follow `replace.style` (there is no separate style for intercept).
   link cannot carry your real data to another server. HTML pages and other types pass through
   unchanged.
 
+**The listener** runs inside the daemon while `enabled = true`, and only with the root certificate
+from `parda ca create` (parda never creates one on its own; without it the daemon warns "no CA" and
+does not listen). It binds `listen` (loopback only), writes the address it got to `intercept.addr` in
+the runtime folder and serves the PAC file at `http://<listen>/parda.pac`. Every change applies at
+once, without a daemon restart: `hosts`, `scope`, `unscanned` and `skip_keys` go to the running
+listener; `enabled`, `listen` or a replaced certificate start, stop or move it. The TUI dashboard
+(and the daemon's status) shows whether it listens and whether the system proxy points at it; if the system proxy
+still points at parda while nothing listens, AI sites fail to load (by design: they are never sent
+unfiltered) — run `parda intercept off` to restore your previous settings.
+
 ## Changing settings
 
 - **TUI** (`parda tui`, tab 6 *Settings*): every option above as a list. ↑↓ or the mouse wheel selects,
   Enter / Space / click changes the value, ← or right-click goes back. Options marked ↻ take effect
-  after the daemon restarts. Turning on `privacy.log_values` asks for confirmation.
+  after the daemon restarts (the AI-sites rows apply at once). Turning on `privacy.log_values` asks
+  for confirmation.
 - **Protection switch**: `p` anywhere in the TUI, a click on the header switch, or `parda off` /
   `parda on`. While off, every surface (proxy, paste-safe, `parda redact`) passes text through
   unchanged and records a warning event; stand-ins sent earlier are still restored in answers.
