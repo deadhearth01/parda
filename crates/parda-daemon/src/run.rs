@@ -107,6 +107,8 @@ struct InterceptRun {
     listen: String,
     /// The root certificate (PEM) it signs with, to notice a replaced CA.
     ca_pem: String,
+    /// `intercept.hosts` as last applied, to notice added sites.
+    hosts: Vec<String>,
     transform: Arc<EngineTransform>,
     stop: watch::Sender<bool>,
     task: JoinHandle<anyhow::Result<()>>,
@@ -471,11 +473,20 @@ impl Shared {
         let want = self.opts.proxy && config.intercept.enabled;
         let mut slot = lock(&self.intercept);
         let mut stopped = false;
-        if let Some(run) = slot.as_ref() {
+        if let Some(run) = slot.as_mut() {
             let same_ca = std::fs::read_to_string(ca_store::ca_cert_path(&self.paths))
                 .is_ok_and(|pem| pem == run.ca_pem);
             if want && run.listen == config.intercept.listen && same_ca && !run.task.is_finished() {
                 run.transform.set_config(&config.intercept);
+                let added: Vec<&str> = config
+                    .intercept
+                    .hosts
+                    .iter()
+                    .filter(|h| !run.hosts.contains(h))
+                    .map(String::as_str)
+                    .collect();
+                self.warn_if_pac_cached(&added);
+                run.hosts = config.intercept.hosts.clone();
                 return;
             }
             if let Some(run) = slot.take() {
@@ -550,6 +561,24 @@ impl Shared {
                 true,
             ));
         }
+    }
+
+    /// Sites added to `intercept.hosts` while the system proxy points at
+    /// parda: the PAC URL stays the same, so browsers and the OS that cached
+    /// it keep sending them direct (unfiltered) until they fetch it again.
+    fn warn_if_pac_cached(&self, added: &[&str]) {
+        if added.is_empty() || !matches!(sysproxy::load_state(&self.paths), Ok(Some(_))) {
+            return;
+        }
+        self.notice(intercept_notice(
+            format!(
+                "intercept: {} added — filtered once your browsers fetch the PAC file again \
+                 (restart them, or `parda intercept off` then `parda intercept on`); until then \
+                 they may still go there direct, unfiltered",
+                added.join(", ")
+            ),
+            true,
+        ));
     }
 
     /// The system proxy sends AI sites to a parda PAC on another address
@@ -636,6 +665,7 @@ impl Shared {
             addr,
             listen,
             ca_pem,
+            hosts: config.intercept.hosts.clone(),
             transform,
             stop,
             task,

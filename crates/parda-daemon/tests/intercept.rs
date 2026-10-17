@@ -521,3 +521,46 @@ async fn a_listener_moved_away_from_the_system_pac_is_flagged() {
     );
     stop(&paths, daemon).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_host_says_browsers_must_fetch_the_pac_again() {
+    let at = free_port().await;
+    let one = "[\"chat.test\"]";
+    let two = "[\"chat.test\", \"new.test\"]";
+    let (_home, paths) = home_with(&section(true, &at.to_string(), one, "allow"));
+    ca_store::create_ca(&paths, false, false).unwrap();
+    let daemon = tokio::spawn(run(paths.clone(), ALL));
+    let refetch = |st: &Value| {
+        recent(st)
+            .into_iter()
+            .filter(|e| e["summary"].as_str().unwrap().contains("fetch"))
+            .count()
+    };
+    // No system PAC set yet: nothing to fetch again.
+    listening(&status(&paths).await).expect("listening");
+    set_config(&paths, section(true, &at.to_string(), two, "allow")).await;
+    assert_eq!(refetch(&status(&paths).await), 0);
+
+    write_private(
+        &paths.data_dir.join("intercept-state.json"),
+        &format!(r#"{{"platform":"MacOs","pac_url":"http://{at}/parda.pac","saved":[]}}"#),
+    )
+    .unwrap();
+    let three = "[\"chat.test\", \"new.test\", \"third.test\"]";
+    set_config(&paths, section(true, &at.to_string(), three, "allow")).await;
+    let st = status(&paths).await;
+    assert_eq!(refetch(&st), 1, "{st}");
+    let ev = recent(&st)
+        .into_iter()
+        .find(|e| e["summary"].as_str().unwrap().contains("fetch"))
+        .unwrap();
+    let summary = ev["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("third.test") && !summary.contains("new.test"),
+        "{summary}"
+    );
+    // Removing a host needs nothing (it still reaches parda, tunnelled).
+    set_config(&paths, section(true, &at.to_string(), one, "allow")).await;
+    assert_eq!(refetch(&status(&paths).await), 1);
+    stop(&paths, daemon).await;
+}

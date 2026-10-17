@@ -119,7 +119,9 @@ from `parda ca create` (parda never creates one on its own; without it the daemo
 does not listen). It binds `listen` (loopback only), writes the address it got to `intercept.addr` in
 the runtime folder and serves the PAC file at `http://<listen>/parda.pac`. Every change applies at
 once, without a daemon restart: `hosts`, `scope`, `unscanned` and `skip_keys` go to the running
-listener; `enabled`, `listen` or a replaced certificate start, stop or move it (the daemon checks
+listener (a site *added* to `hosts` is filtered only once your browsers and the OS fetch the PAC file
+again — restart the browser, or `parda intercept off` then `parda intercept on`; until then it may go
+there direct, and the daemon says so); `enabled`, `listen` or a replaced certificate start, stop or move it (the daemon checks
 the certificate file every 2 s and before each status answer, so `parda ca create --force` needs no
 reload). `parda ca uninstall` is refused while intercept is in use (`parda intercept off` first).
 A new `listen` moves the listener, but the system proxy keeps the PAC address `parda intercept on`
