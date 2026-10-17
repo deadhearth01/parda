@@ -135,6 +135,10 @@ struct Shared {
     intercept: Mutex<Option<InterceptRun>>,
     /// Why intercept is enabled but not listening.
     intercept_error: Mutex<Option<String>>,
+    /// The CA files the last failed start saw: a check starts the listener
+    /// again once they differ (`parda ca create` after "no CA", the end of
+    /// a rotation).
+    ca_tried: Mutex<Option<ca_store::CaFiles>>,
     /// Serialises ConfigSet / Reload (write the file, then apply).
     config_lock: Mutex<()>,
     model_error: Option<String>,
@@ -225,6 +229,7 @@ impl Daemon {
                 rt: OnceLock::new(),
                 intercept: Mutex::new(None),
                 intercept_error: Mutex::new(None),
+                ca_tried: Mutex::new(None),
                 config_lock: Mutex::new(()),
                 model_error,
                 shutdown,
@@ -502,13 +507,18 @@ impl Shared {
             }
             return;
         }
+        // Read before the start, so a change made while it runs is seen as
+        // a change by the next check.
+        let tried = ca_store::CaFiles::read(&self.paths);
         match self.start_intercept(config, stopped) {
             Ok(run) => {
+                *lock(&self.ca_tried) = None;
                 *lock(&self.intercept_error) = None;
                 self.warn_if_pac_elsewhere(run.addr);
                 *slot = Some(run);
             }
             Err(why) => {
+                *lock(&self.ca_tried) = Some(tried);
                 tracing::warn!(error = %why, "intercept is not listening");
                 let mut last = lock(&self.intercept_error);
                 // Say it once, not on every reload.
@@ -522,19 +532,30 @@ impl Shared {
         }
     }
 
-    /// Whether the running listener signs with a root certificate other
-    /// than the one on disk (replaced or removed since it started).
-    fn ca_replaced(&self) -> bool {
-        lock(&self.intercept).as_ref().is_some_and(|run| {
-            std::fs::read_to_string(ca_store::ca_cert_path(&self.paths))
-                .map_or(true, |pem| pem != run.ca_pem)
-        })
+    /// Whether the CA files call for a new start: the running listener
+    /// signs with a root certificate other than the one on disk (replaced
+    /// or removed since it started), or intercept is wanted, nothing
+    /// listens, and the files changed since the start that failed.
+    fn ca_changed(&self) -> bool {
+        let files = ca_store::CaFiles::read(&self.paths);
+        match lock(&self.intercept).as_ref() {
+            Some(run) => files.cert.as_deref() != Some(run.ca_pem.as_str()),
+            None => {
+                let enabled = self
+                    .config
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .intercept
+                    .enabled;
+                self.opts.proxy && enabled && lock(&self.ca_tried).as_ref() != Some(&files)
+            }
+        }
     }
 
-    /// Restart the listener with the certificate on disk when it was
-    /// replaced (on a timer and before every status answer). Blocking.
+    /// Start or restart the listener with the CA on disk when it changed
+    /// (on a timer and before every status answer). Blocking.
     fn check_ca(&self) {
-        if !self.ca_replaced() {
+        if !self.ca_changed() {
             return;
         }
         let _serial = lock(&self.config_lock);
@@ -543,7 +564,7 @@ impl Shared {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        tracing::info!("the root certificate changed; restarting the intercept listener");
+        tracing::info!("the root certificate changed; (re)starting the intercept listener");
         self.sync_intercept(&config, false);
     }
 

@@ -8,17 +8,39 @@ use parda_ipc::Request;
 
 use super::{daemon_client, paths};
 
-/// A running daemon checks the certificate file before answering a status
-/// request (and every few seconds): ask now, so its listener signs with the
-/// new certificate at once.
+/// A running daemon checks the certificate files before answering a status
+/// request (and every few seconds): ask now, so its listener (re)starts
+/// with the new certificate at once, and say what its answer reports.
 fn tell_daemon(p: &Paths) {
     if let Ok(Some(mut c)) = daemon_client(p) {
         match c.call(Request::Status) {
-            Ok(_) => println!("the running daemon now uses this certificate"),
+            Ok(status) => println!("{}", daemon_note(&status)),
             Err(e) => {
                 println!("! could not reach the daemon ({e}); restart it to use this certificate")
             }
         }
+    }
+}
+
+/// What a daemon's status answer says about the intercept listener, right
+/// after the certificate changed.
+fn daemon_note(status: &serde_json::Value) -> String {
+    let i = &status["intercept"];
+    if let Some(addr) = i["listening"].as_str() {
+        return format!(
+            "the running daemon now uses this certificate (intercept listening on {addr})"
+        );
+    }
+    if !i["enabled"].as_bool().unwrap_or(false) {
+        return "the running daemon will use this certificate once intercept is on \
+                (`parda intercept on`)"
+            .into();
+    }
+    match i["error"].as_str() {
+        Some(why) => format!("! the running daemon is not intercepting: {why}"),
+        None => "! the running daemon is not listening for intercept (it runs without its proxy \
+                 services; restart it without --no-proxy)"
+            .into(),
     }
 }
 
@@ -145,7 +167,44 @@ pub fn status() -> anyhow::Result<()> {
 mod tests {
     use parda_daemon::{Paths, write_private};
 
-    use super::uninstall_blocker;
+    use serde_json::json;
+
+    use super::{daemon_note, uninstall_blocker};
+
+    /// Final review: `ca create` said the daemon used the certificate
+    /// whatever the daemon's status said.
+    #[test]
+    fn the_daemon_note_says_what_the_daemon_reports() {
+        let on = daemon_note(&json!({"intercept": {
+            "enabled": true, "listening": "127.0.0.1:8788", "ca": true, "error": null}}));
+        assert!(
+            on.contains("now uses this certificate") && on.contains("127.0.0.1:8788"),
+            "{on}"
+        );
+
+        let no_ca = "intercept: no CA — run `parda ca create`";
+        let broken = daemon_note(&json!({"intercept": {
+            "enabled": true, "listening": null, "ca": true, "error": no_ca}}));
+        assert!(
+            broken.starts_with("! ") && broken.contains(no_ca),
+            "{broken}"
+        );
+        assert!(!broken.contains("now uses"), "{broken}");
+
+        let no_proxy = daemon_note(&json!({"intercept": {
+            "enabled": true, "listening": null, "ca": true, "error": null}}));
+        assert!(
+            no_proxy.starts_with("! ") && no_proxy.contains("not listening"),
+            "{no_proxy}"
+        );
+
+        let off = daemon_note(&json!({"intercept": {
+            "enabled": false, "listening": null, "ca": true, "error": null}}));
+        assert!(
+            !off.starts_with('!') && off.contains("parda intercept on"),
+            "{off}"
+        );
+    }
 
     fn home(config: &str) -> (tempfile::TempDir, Paths) {
         let d = tempfile::tempdir().unwrap();

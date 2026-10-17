@@ -31,6 +31,23 @@ pub fn ca_exists(paths: &Paths) -> bool {
     ca_cert_path(paths).is_file() && ca_key_path(paths).is_file()
 }
 
+/// The CA files as they are on disk now (`None` where one is missing), to
+/// tell whether they changed since an earlier look.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaFiles {
+    pub cert: Option<String>,
+    key: Option<String>,
+}
+
+impl CaFiles {
+    pub fn read(paths: &Paths) -> Self {
+        CaFiles {
+            cert: std::fs::read_to_string(ca_cert_path(paths)).ok(),
+            key: std::fs::read_to_string(ca_key_path(paths)).ok(),
+        }
+    }
+}
+
 /// Create a new root certificate. Refuses to replace an existing one unless
 /// `force` (the old one must then be removed from the OS trust store).
 pub fn create_ca(paths: &Paths, use_keyring: bool, force: bool) -> anyhow::Result<Ca> {
@@ -49,9 +66,13 @@ pub fn create_ca(paths: &Paths, use_keyring: bool, force: bool) -> anyhow::Resul
     let (nonce, ct) = key.encrypt_aad(pem.as_bytes(), KEY_AAD);
     let mut blob = nonce;
     blob.extend_from_slice(&ct);
-    // Key first, certificate last: a crash in between leaves no certificate,
-    // so `ca_exists` stays false and `create` simply runs again.
-    let _ = std::fs::remove_file(ca_cert_path(paths));
+    // Each file is replaced in one rename (never removed first: a running
+    // daemon that looked in a gap would see no CA and stop intercept). Key
+    // first, certificate last: a reader never pairs a new certificate with
+    // the old key, and the daemon restarts its listener on the certificate
+    // changing, by which time the new key is in place. A crash in between
+    // leaves the old certificate with a key that does not match it, which
+    // `load_ca` reports; `create --force` again repairs it.
     write_private(
         &ca_key_path(paths),
         &base64::engine::general_purpose::STANDARD.encode(&blob),
@@ -133,6 +154,37 @@ mod tests {
         assert_eq!(load_ca(&p, false).unwrap().cert_pem(), first.cert_pem());
         let second = create_ca(&p, false, true).unwrap();
         assert_ne!(second.cert_pem(), first.cert_pem());
+    }
+
+    /// Final review: a forced create removed the certificate first, so a
+    /// daemon check in that gap saw no CA and stopped intercept. Readers
+    /// must always find a certificate during a rotation.
+    #[test]
+    fn a_forced_create_never_leaves_the_certificate_missing() {
+        let (_d, p) = paths();
+        create_ca(&p, false, false).unwrap();
+        let cert = ca_cert_path(&p);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (cert, done) = (cert.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut missing = 0u32;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if std::fs::read_to_string(&cert).map_or(true, |c| c.is_empty()) {
+                        missing += 1;
+                    }
+                }
+                missing
+            })
+        };
+        let mut last = String::new();
+        for _ in 0..50 {
+            last = create_ca(&p, false, true).unwrap().cert_pem();
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(reader.join().unwrap(), 0, "the certificate was missing");
+        // The last pair on disk belongs together.
+        assert_eq!(load_ca(&p, false).unwrap().cert_pem(), last);
     }
 
     #[test]

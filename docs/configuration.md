@@ -189,9 +189,10 @@ daemon restart:
   address `parda intercept on` set, so run `parda intercept on` again after changing it (the daemon,
   `parda status`, `parda intercept status`, `parda doctor` and the TUI warn that AI sites fail to load
   until you do).
-- A replaced certificate (`parda ca create --force`) restarts the listener: the daemon checks the
-  file every 2 s and before each status answer. `parda ca uninstall` is refused while intercept is in
-  use — `parda intercept off` first.
+- A new or replaced certificate (`parda ca create`, `parda ca create --force`) starts or restarts
+  the listener: the daemon checks the files every 2 s and before each status answer, and `parda ca
+  create` prints what the daemon then reports (listening, or why not). `parda ca uninstall` is
+  refused while intercept is in use — `parda intercept off` first.
 
 The TUI dashboard (and the daemon's status) shows whether it listens and whether the system proxy
 points at it; if the system proxy still points at parda while nothing listens, AI sites fail to load

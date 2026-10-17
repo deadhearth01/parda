@@ -459,6 +459,104 @@ async fn a_replaced_ca_is_picked_up_without_a_reload() {
     stop(&paths, daemon).await;
 }
 
+/// Final review: with intercept wanted but no CA at start, `parda ca
+/// create` (which pings the daemon with a status request) must start the
+/// listener; so must the timer alone. Before, nothing retried once no
+/// listener ran, and the status kept the stale "no CA" error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ca_created_while_the_daemon_runs_starts_the_listener() {
+    for ping in [true, false] {
+        let (_home, paths) = home_with(&config(
+            "enabled = true\nlisten = \"127.0.0.1:0\"\nhosts = [\"chat.test\"]\n",
+        ));
+        let daemon = tokio::spawn(run(paths.clone(), ALL));
+        let st = status(&paths).await;
+        assert_eq!(listening(&st), None, "{st}");
+        assert!(st["intercept"]["error"].as_str().unwrap().contains("no CA"));
+
+        ca_store::create_ca(&paths, false, false).unwrap();
+        let addr = if ping {
+            // What `parda ca create` does next.
+            listening(&status(&paths).await)
+        } else {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while addr_file(&paths).is_none() {
+                assert!(Instant::now() < deadline, "the timer never started it");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            listening(&status(&paths).await)
+        };
+        let st = status(&paths).await;
+        let addr = addr.unwrap_or_else(|| panic!("ping={ping}: not listening: {st}"));
+        assert!(st["intercept"]["error"].is_null(), "{st}");
+        assert_eq!(
+            refused_request(&paths, addr, "application/json", "{").await,
+            400
+        );
+        stop(&paths, daemon).await;
+    }
+}
+
+/// A certificate that is missing for a moment (seen by a status request or
+/// the timer) stops the listener; once it is back, intercept runs again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_certificate_missing_for_a_moment_does_not_stop_intercept_for_good() {
+    let (_home, paths) = home_with(&config(
+        "enabled = true\nlisten = \"127.0.0.1:0\"\nhosts = [\"chat.test\"]\n",
+    ));
+    ca_store::create_ca(&paths, false, false).unwrap();
+    let daemon = tokio::spawn(run(paths.clone(), ALL));
+    assert!(listening(&status(&paths).await).is_some());
+    let cert = ca_store::ca_cert_path(&paths);
+    let aside = cert.with_extension("pem.aside");
+    std::fs::rename(&cert, &aside).unwrap();
+    assert_eq!(listening(&status(&paths).await), None);
+    std::fs::rename(&aside, &cert).unwrap();
+    let st = status(&paths).await;
+    let addr = listening(&st).unwrap_or_else(|| panic!("not listening again: {st}"));
+    assert!(st["intercept"]["error"].is_null(), "{st}");
+    assert_eq!(
+        refused_request(&paths, addr, "application/json", "{").await,
+        400
+    );
+    stop(&paths, daemon).await;
+}
+
+/// `create --force` while the daemon checks the certificate over and over
+/// (the TUI polls status every second): the listener survives the rotation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forced_ca_rotation_racing_status_requests_keeps_intercept_on() {
+    let (_home, paths) = home_with(&config(
+        "enabled = true\nlisten = \"127.0.0.1:0\"\nhosts = [\"chat.test\"]\n",
+    ));
+    ca_store::create_ca(&paths, false, false).unwrap();
+    let daemon = tokio::spawn(run(paths.clone(), ALL));
+    assert!(listening(&status(&paths).await).is_some());
+    let stop_pings = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pinger = {
+        let (dir, stop_pings) = (paths.runtime_dir.clone(), stop_pings.clone());
+        std::thread::spawn(move || {
+            let mut c = Client::connect(&dir).unwrap();
+            while !stop_pings.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = c.call(Request::Status);
+            }
+        })
+    };
+    for _ in 0..20 {
+        ca_store::create_ca(&paths, false, true).unwrap();
+    }
+    stop_pings.store(true, std::sync::atomic::Ordering::Relaxed);
+    pinger.join().unwrap();
+    let st = status(&paths).await;
+    let addr = listening(&st).unwrap_or_else(|| panic!("intercept lost: {st}"));
+    assert_eq!(
+        refused_request(&paths, addr, "application/json", "{").await,
+        400,
+        "the newest CA signs"
+    );
+    stop(&paths, daemon).await;
+}
+
 /// A loopback port nothing listens on.
 async fn free_port() -> SocketAddr {
     TcpListener::bind("127.0.0.1:0")
