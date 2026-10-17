@@ -129,7 +129,7 @@ fn build(
         "text/plain" if documents => Box::new(PlainRestore {
             engine: engine.clone(),
             scope: scope.to_string(),
-            mode: PlainMode::Sniff(Vec::new()),
+            mode: PlainMode::Sniff(Vec::new(), 0),
         }),
         _ => Box::new(Passthrough),
     }
@@ -261,8 +261,9 @@ impl StreamTransform for TextStream {
 
 enum PlainMode {
     /// Not decided yet (leading whitespace, or the start of what may be
-    /// JSON).
-    Sniff(Vec<u8>),
+    /// JSON), and how many leading bytes are known to be a BOM or
+    /// whitespace (read once).
+    Sniff(Vec<u8>, usize),
     Text(TextStream),
     /// Starts like JSON: restored as one document or as JSON lines, or
     /// passed through, never as text.
@@ -384,9 +385,17 @@ impl StreamTransform for PlainRestore {
             PlainMode::Raw => Bytes::copy_from_slice(chunk),
             PlainMode::Text(t) => Bytes::from(t.push_bytes(chunk)),
             PlainMode::Json(j) => j.push(chunk),
-            PlainMode::Sniff(buf) => {
+            PlainMode::Sniff(buf, lead) => {
                 buf.extend_from_slice(chunk);
-                let kind = match sniff_plain(buf, false) {
+                if *lead == 0 && buf.starts_with(b"\xEF\xBB\xBF") {
+                    *lead = 3;
+                }
+                if *lead > 0 || buf.len() >= 3 || !b"\xEF\xBB\xBF".starts_with(buf) {
+                    while *lead < buf.len() && buf[*lead].is_ascii_whitespace() {
+                        *lead += 1;
+                    }
+                }
+                let kind = match sniff_plain(&buf[*lead..], false) {
                     Some(kind) => kind,
                     // Only whitespace, more than a document can be.
                     None if buf.len() > MAX_JSON_BUFFER => PlainKind::Blank,
@@ -403,7 +412,7 @@ impl StreamTransform for PlainRestore {
             PlainMode::Raw => Bytes::new(),
             PlainMode::Text(mut t) => Bytes::from(t.finish_bytes()),
             PlainMode::Json(mut j) => j.finish(),
-            PlainMode::Sniff(buf) => {
+            PlainMode::Sniff(buf, _) => {
                 let kind = sniff_plain(&buf, true).unwrap_or(PlainKind::Blank);
                 let mut out = self.decide(kind, buf);
                 out.extend_from_slice(&self.finish());
