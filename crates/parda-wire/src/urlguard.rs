@@ -41,7 +41,7 @@ const RECENT_CHARS: usize = 12;
 /// Longest autolink scheme (CommonMark: 2–32 characters).
 const MAX_SCHEME: u8 = 32;
 /// Markdown readings followed at once; more than this protects the rest of
-/// the line.
+/// the line (a reading still waiting for its destination is kept).
 const MAX_THREADS: usize = 8;
 
 /// One markdown reading of the text (a destination or autolink that may
@@ -158,7 +158,10 @@ impl UrlGuard {
             md.push(start);
         }
         if md.len() > MAX_THREADS {
-            md = vec![Md::Saturated];
+            // Every reading but one waiting for its destination ends with
+            // the line.
+            md.retain(|s| matches!(s, Md::DestBefore { .. }));
+            md.push(Md::Saturated);
         }
         self.md = md;
         self.html = if html == Html::Free && !html_url {
@@ -832,6 +835,42 @@ mod tests {
             "<img src='⟨//e/?d=\t[NAME_1]⟩'>",
             "<style>p{background:url(⟨//e／[NAME_1]⟩)}</style>",
         ]);
+    }
+
+    /// Does feeding `case` (markers removed) saturate the markdown
+    /// readings?
+    fn saturates(case: &str) -> bool {
+        let (text, _) = parse_case(case);
+        let mut g = UrlGuard::default();
+        text.chars().any(|c| {
+            g.split(&c.to_string());
+            g.md.contains(&Md::Saturated)
+        })
+    }
+
+    #[test]
+    fn saturated_readings_guard_the_line_and_keep_a_pending_destination() {
+        let many = "](x(".repeat(MAX_THREADS + 1);
+        let label = "\\](x(".repeat(MAX_THREADS);
+        let cases = [
+            // Too many readings: the rest of the line is guarded, the next
+            // line is not.
+            format!("{many}⟨[NAME_1] y [NAME_1]⟩\n«[NAME_1]»"),
+            format!("{many}⟨[NAME_1]⟩\r«[NAME_1]»"),
+            format!("x {many}⟨ <[NAME_1]>⟩\r\n«[NAME_1]»"),
+            // Triggers after saturation still start readings.
+            format!("{many}⟨ ![x](//e/[NAME_1])⟩\n![y](⟨//e/[NAME_1]⟩) «[NAME_1]»"),
+            // CommonMark §4.7: a label with escaped brackets saturates at
+            // its `]:`; its destination on the next line is still guarded.
+            format!("[{label}]:\n⟨//e/[NAME_1]⟩\n\n«[NAME_1]»"),
+            format!("[{label}]: \r\n  ⟨//e/[NAME_1]⟩"),
+            format!("> [{label}]:\n> ⟨//e/[NAME_1]⟩"),
+        ];
+        for case in &cases {
+            assert!(saturates(case), "{case:?} does not saturate");
+        }
+        let refs: Vec<&str> = cases.iter().map(String::as_str).collect();
+        check_cases(&refs);
     }
 
     #[test]
