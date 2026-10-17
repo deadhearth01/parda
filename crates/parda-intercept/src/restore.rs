@@ -4215,6 +4215,100 @@ mod tests {
         assert_eq!(last["t"], "ravi@example.com");
     }
 
+    /// Values with CR, CR CR and CRLF (an SSE reader ends a line at each).
+    const CR_VALUES: [&str; 3] = [
+        "Lotus\rTowers Pune",
+        "Flat 4\r\rdata: {\"injected\":true}",
+        "Lotus\r\nevent: pwn",
+    ];
+
+    /// An engine that knows [`CR_VALUES`]; their tags in the global scope.
+    fn cr_engine(dir: &std::path::Path) -> (Engine, Vec<String>) {
+        let mut config = parda_core::Config::default();
+        config.detect.model = "none".into();
+        let e = Engine::open(
+            parda_engine::EngineOptions {
+                config,
+                rules: parda_detect::RulesFile {
+                    term: CR_VALUES
+                        .iter()
+                        .map(|t| parda_detect::Term {
+                            text: (*t).into(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                data_dir: dir.join("data"),
+                use_keyring: false,
+            },
+            None,
+        )
+        .unwrap();
+        let tags = CR_VALUES
+            .iter()
+            .map(|v| {
+                let tag = e.redact(v, SCOPE).unwrap().text;
+                assert!(!tag.contains(['\r', '\n']), "{v:?} -> {tag:?}");
+                tag
+            })
+            .collect();
+        (e, tags)
+    }
+
+    /// Review F1: a restored value holding CR went out inside a `data:`
+    /// line, and a reader (lines end at CRLF, CR or LF) split or ended the
+    /// event there. Each piece is a `data:` line of its own.
+    #[test]
+    fn restored_line_breaks_never_split_sse_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let (e, tags) = cr_engine(dir.path());
+        for (v, tag) in CR_VALUES.iter().zip(&tags) {
+            let lf = v.replace("\r\n", "\n").replace('\r', "\n");
+            // Plain-text event data.
+            let body = format!("data: hi {tag} bye\n\ndata: [DONE]\n\n");
+            for n in [1, 3, 1000] {
+                let out = run(&e, "text/event-stream", body.as_bytes(), n);
+                let evs: Vec<(Option<String>, String)> = events(&out)
+                    .into_iter()
+                    .map(|e| (e.event, e.data))
+                    .collect();
+                assert_eq!(
+                    evs,
+                    [(None, format!("hi {lf} bye")), (None, "[DONE]".into())],
+                    "{v:?} {n}: {:?}",
+                    String::from_utf8_lossy(&out)
+                );
+            }
+            // A chatgpt.com delta stream (JSON data: escaped, kept exact).
+            let pieces = ["Note: ", tag.as_str(), " ok"];
+            let body = chatgpt_stream(&pieces);
+            for n in [1, 4, 1000] {
+                let out = run(&e, "text/event-stream", &body, n);
+                assert_eq!(events(&out).len(), events(&body).len(), "{v:?} {n}");
+                assert_eq!(chatgpt_text(&out), format!("Note: {v} ok"), "{v:?} {n}");
+            }
+            // Plain-text data of a delta stream's own events.
+            let body = sse(&[
+                (Some("delta"), format!("text {tag}")),
+                (None, "[DONE]".into()),
+            ]);
+            let out = run(&e, "text/event-stream", &body, 2);
+            let evs: Vec<(Option<String>, String)> = events(&out)
+                .into_iter()
+                .map(|e| (e.event, e.data))
+                .collect();
+            assert_eq!(
+                evs,
+                [
+                    (Some("delta".into()), format!("text {lf}")),
+                    (None, "[DONE]".into())
+                ],
+                "{v:?}"
+            );
+        }
+    }
+
     /// Split `text` at the char boundaries in `cuts` (byte offsets, any order).
     fn split_at(text: &str, cuts: &[usize]) -> Vec<String> {
         let mut at: Vec<usize> = cuts
