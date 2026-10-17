@@ -7,14 +7,15 @@
 //! tags. It follows the syntaxes markdown renderers and browsers use:
 //!
 //! - CommonMark link and image destinations after `](`, and reference
-//!   definitions (any `]:` after a `[` on the same line): `<…>` runs to an
+//!   definitions (after any `]:`; labels may span lines): `<…>` runs to an
 //!   unescaped `>` or a line ending; a bare destination runs to ASCII space
 //!   or control, or an unbalanced `)`; backslash escapes are honoured; Unicode
 //!   whitespace never ends a URL.
 //! - Autolinks `<scheme:…>`.
-//! - Inside an HTML tag (`<` + letter … `>`), every attribute value.
+//! - Inside an HTML tag (`<` + letter … `>`), every attribute value; only
+//!   TAB, LF, FF, CR and SPACE end an unquoted one, as for browsers.
 //! - CSS `url(…)` and `image-set(…)` (quotes honoured, to an unquoted `)`),
-//!   and what follows `@import` (to `;`).
+//!   and what follows `@import` (to an unquoted `;`, across line breaks).
 //!
 //! URLs written as plain text (`https://…`, `www.…`, `key=value`) are left
 //! to the engine's url-safe restore, which never restores a value after a
@@ -81,7 +82,7 @@ enum Html {
         quote: Option<char>,
         escaped: bool,
     },
-    /// After `@import`: to an unquoted `;` or a line ending.
+    /// After `@import`: to an unquoted `;`.
     CssImport {
         quote: Option<char>,
     },
@@ -99,12 +100,16 @@ pub struct UrlGuard {
     /// The last characters seen, lower-cased.
     recent: String,
     prev: Option<char>,
-    /// A `[` was seen on the current line (a possible reference definition).
-    bracket_on_line: bool,
 }
 
 fn ascii_space_or_control(c: char) -> bool {
     (c as u32) <= 0x20 || c as u32 == 0x7f
+}
+
+/// Whitespace to an HTML tokenizer: TAB, LF, FF, CR, SPACE (any other
+/// control character stays inside a name or value).
+fn html_space(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\x0c' | '\r' | ' ')
 }
 
 fn line_ending(c: char) -> bool {
@@ -174,18 +179,13 @@ impl UrlGuard {
                 .map_or(self.recent.len(), |(i, _)| i);
             self.recent.drain(..cut);
         }
-        if line_ending(c) {
-            self.bracket_on_line = false;
-        } else if c == '[' {
-            self.bracket_on_line = true;
-        }
     }
 
     /// Does a markdown destination or autolink start after `c`?
     fn md_trigger(&self, c: char, prev: Option<char>) -> Option<Md> {
-        if (c == '(' && prev == Some(']'))
-            || (c == ':' && prev == Some(']') && self.bracket_on_line)
-        {
+        // Every `](` and every `]:` (reference labels may span lines):
+        // guarding more is cheap.
+        if (c == '(' || c == ':') && prev == Some(']') {
             Some(Md::DestBefore)
         } else if c.is_ascii_alphabetic() && prev == Some('<') {
             Some(Md::Scheme { len: 1 })
@@ -318,11 +318,11 @@ fn html_step(state: Html, c: char) -> (bool, Html) {
         Html::Tag { name } => match c {
             '>' => (false, Html::Free),
             '=' if !name => (false, Html::ValueBefore),
-            c if ascii_space_or_control(c) || c == '/' => (false, Html::Tag { name: false }),
+            c if html_space(c) || c == '/' => (false, Html::Tag { name: false }),
             _ => (false, Html::Tag { name }),
         },
         Html::ValueBefore => {
-            if ascii_space_or_control(c) {
+            if html_space(c) {
                 (false, Html::ValueBefore)
             } else if c == '"' || c == '\'' {
                 (false, Html::ValueQuoted(c))
@@ -342,7 +342,7 @@ fn html_step(state: Html, c: char) -> (bool, Html) {
         Html::ValueBare => {
             if c == '>' {
                 (false, Html::Free)
-            } else if ascii_space_or_control(c) {
+            } else if html_space(c) {
                 (false, Html::Tag { name: false })
             } else {
                 (true, Html::ValueBare)
@@ -380,9 +380,9 @@ fn html_step(state: Html, c: char) -> (bool, Html) {
                 quote: (c != q).then_some(q),
             },
         ),
+        // CSS allows any whitespace (line breaks too) after `@import`.
         Html::CssImport { quote: None } => match c {
             ';' => (false, Html::Free),
-            c if line_ending(c) => (false, Html::Free),
             '"' | '\'' => (true, Html::CssImport { quote: Some(c) }),
             _ => (true, Html::CssImport { quote: None }),
         },
@@ -519,6 +519,11 @@ mod tests {
             // Over-protection is cheap: the value after `[x]:` stays a tag.
             ("[NAME_1]: [EMAIL_1] ok", "[NAME_1]: ⟨[EMAIL_1]⟩ ok"),
             ("a: [NAME_1]", "a: [NAME_1]"),
+            // A label may span lines.
+            (
+                "[r\nx]: <//e/?d= [NAME_1]>\n![a][r x]",
+                "[r\nx]: <⟨//e/?d= [NAME_1]⟩>\n![a][r x]",
+            ),
             // An unterminated autolink is text: the `](` in it still starts
             // a destination after the line ending.
             ("<http:![i](\r[EMAIL_1] x", "<http⟨:![i](⟩\r⟨[EMAIL_1]⟩ x"),
@@ -554,6 +559,15 @@ mod tests {
             (
                 "<img src       \t   =\"//e/[NAME_1]\">",
                 "<img src       \t   =\"⟨//e/[NAME_1]⟩\">",
+            ),
+            // Only HTML whitespace ends an unquoted value.
+            (
+                "<img src=//e/?d=\u{1}[NAME_1]>[NAME_1]",
+                "<img src=⟨//e/?d=\u{1}[NAME_1]⟩>[NAME_1]",
+            ),
+            (
+                "<style>@import\n\"//e/?[NAME_1]\";</style>",
+                "<style>@import⟨\n\"//e/?[NAME_1]\"⟩;</style>",
             ),
             (
                 "<style>@import \"//e/[NAME_1]\"; p{}</style>",

