@@ -232,6 +232,12 @@ enum ReqBody {
         raw: Bytes,
         value: Value,
     },
+    /// JSON values one per line (NDJSON), or one JSON value that is not an
+    /// object or array, in a body not declared as JSON.
+    JsonLines {
+        text: String,
+        lines: Vec<JsonLine>,
+    },
     /// Declared `application/x-www-form-urlencoded`.
     Form(String),
     /// Any other text: redacted as it reads literally and as it reads
@@ -301,6 +307,13 @@ impl ReqBody {
         if let Some(value) = json_container(&raw)? {
             return Ok(ReqBody::Json { raw, value });
         }
+        // So are JSON values one per line (batched telemetry, a Sentry
+        // envelope), and a lone JSON string: a server parses each line, so
+        // reading `\n9876543210` literally would miss the number.
+        if !form && let Some(lines) = json_lines(&raw)? {
+            let text = String::from_utf8(raw.to_vec()).map_err(|_| unparseable())?;
+            return Ok(ReqBody::JsonLines { text, lines });
+        }
         if !(form || typed_text || media.is_empty()) {
             return Ok(ReqBody::Opaque(raw));
         }
@@ -311,6 +324,9 @@ impl ReqBody {
             _ if form || typed_text => return Err(not_utf8()),
             _ => return Ok(ReqBody::Opaque(raw)),
         };
+        if !form && escaped_like_json(&text) {
+            return Err(unparseable());
+        }
         Ok(if form {
             ReqBody::Form(text)
         } else {
@@ -334,6 +350,46 @@ impl ReqBody {
                     Bytes::from(preserve_numbers(raw, json))
                 });
                 (out, 0)
+            }
+            ReqBody::JsonLines { text, lines } => {
+                let mut out = String::with_capacity(text.len());
+                let mut changed = false;
+                for line in lines.iter_mut() {
+                    out.push_str(&text[line.start..line.json.start]);
+                    let raw = &text[line.json.clone()];
+                    match &mut line.value {
+                        Some(value) => {
+                            let mut track = Tracking {
+                                inner: f,
+                                changed: false,
+                            };
+                            match value {
+                                // A lone string is what the user typed, as
+                                // a text body is.
+                                Value::String(t) => visit_body_text(t, rules, &mut track),
+                                _ => walk_json(value, rules, &mut track),
+                            }
+                            .map_err(|_| unparseable())?;
+                            if track.changed {
+                                changed = true;
+                                let json = serde_json::to_vec(value).unwrap_or_default();
+                                let json = preserve_numbers(raw.as_bytes(), json);
+                                out.push_str(&String::from_utf8(json).map_err(|_| unparseable())?);
+                            } else {
+                                out.push_str(raw);
+                            }
+                        }
+                        // A number or literal reads the same as text.
+                        None => {
+                            let mut t = raw.to_string();
+                            visit_body_text(&mut t, rules, f).map_err(|_| unparseable())?;
+                            changed |= t != raw;
+                            out.push_str(&t);
+                        }
+                    }
+                    out.push_str(&text[line.json.end..line.end]);
+                }
+                (changed.then(|| Bytes::from(out)), 0)
             }
             ReqBody::Form(text) => (
                 walk_form(text, rules, f)
@@ -361,7 +417,9 @@ impl ReqBody {
             ReqBody::Json { raw, .. } | ReqBody::Multipart { raw, .. } | ReqBody::Opaque(raw) => {
                 raw
             }
-            ReqBody::Form(t) | ReqBody::Text(t) => Bytes::from(t),
+            ReqBody::Form(t) | ReqBody::Text(t) | ReqBody::JsonLines { text: t, .. } => {
+                Bytes::from(t)
+            }
         }
     }
 }
@@ -386,6 +444,73 @@ fn json_container(raw: &[u8]) -> Result<Option<Value>, Refusal> {
         Err(body::JsonError::Invalid) => Ok(None),
         Err(body::JsonError::DuplicateKey) => Err(unparseable()),
     }
+}
+
+/// One line of a [`ReqBody::JsonLines`] body: byte ranges into its text
+/// (the whole line with its line break, and the JSON value in it, without
+/// surrounding whitespace). `value` is the parsed value when it holds text
+/// (a string, an object or an array); a number or literal is `None`, read
+/// as text. Blank lines have an empty `json` range and `None`.
+struct JsonLine {
+    start: usize,
+    json: std::ops::Range<usize>,
+    end: usize,
+    value: Option<Value>,
+}
+
+/// The lines of `raw` when every one that is not blank is a JSON value (and
+/// at least one is), else `None`. A key given twice is refused.
+fn json_lines(raw: &[u8]) -> Result<Option<Vec<JsonLine>>, Refusal> {
+    let Ok(text) = std::str::from_utf8(raw) else {
+        return Ok(None);
+    };
+    let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut any = false;
+    while start < text.len() {
+        let end = text[start..]
+            .find('\n')
+            .map_or(text.len(), |i| start + i + 1);
+        let from = if start == 0 { bom } else { start };
+        let line = &text[from..end];
+        let lead = line.len() - line.trim_start_matches(JSON_WS).len();
+        let body = line.trim_matches(JSON_WS);
+        let json = from + lead..from + lead + body.len();
+        let value = if body.is_empty() {
+            None
+        } else {
+            any = true;
+            match body::parse_json_unique(body.as_bytes()) {
+                Ok(v @ (Value::String(_) | Value::Array(_) | Value::Object(_))) => Some(v),
+                Ok(_) => None,
+                Err(body::JsonError::Invalid) => return Ok(None),
+                Err(body::JsonError::DuplicateKey) => return Err(unparseable()),
+            }
+        };
+        lines.push(JsonLine {
+            start,
+            json,
+            end,
+            value,
+        });
+        start = end;
+    }
+    Ok(any.then_some(lines))
+}
+
+/// Whitespace between JSON tokens.
+const JSON_WS: [char; 4] = [' ', '\t', '\n', '\r'];
+
+/// Text that starts like JSON (`{`, `[` or `"`, after a BOM and
+/// whitespace) and holds a backslash, but is not JSON: a lenient reader
+/// would decode escapes that glue a letter to the value (`\n9876543210`)
+/// when read literally, so it cannot be filtered safely.
+fn escaped_like_json(text: &str) -> bool {
+    text.trim_start_matches('\u{feff}')
+        .trim_start_matches(JSON_WS)
+        .starts_with(['{', '[', '"'])
+        && text.contains('\\')
 }
 
 /// The media type (lower-case, without parameters) and the multipart
@@ -602,6 +727,118 @@ pub(crate) mod tests {
     fn refusal(t: &EngineTransform, ct: &str, body: impl Into<Bytes>) -> Refusal {
         t.rewrite_request("chatgpt.com", "/x", &headers(ct), body.into())
             .unwrap_err()
+    }
+
+    /// Final review: JSON values one per line (NDJSON: batched telemetry, a
+    /// Sentry envelope through a site's tunnel) or a bare JSON string, posted
+    /// as text/plain or untyped, were redacted as literal text, where a JSON
+    /// escape glues its letter to the value (`\n9876543210`). Each line is
+    /// read as JSON now; text that starts like JSON, holds escapes and is
+    /// not JSON is refused.
+    #[test]
+    fn json_lines_and_json_strings_in_text_bodies_are_read_as_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path());
+        let t = transform(&e, |_| {});
+        let values = [
+            ("Phone:\n9876543210", "9876543210"),
+            ("Card:\t4111111111111111", "4111111111111111"),
+            ("PAN:\nABCDE1234F", "ABCDE1234F"),
+            ("Aadhaar:\n2345 6789 0124", "2345 6789 0124"),
+            ("Mail:\nravi@example.com", "ravi@example.com"),
+            ("Hi\nRavi Kumar", "Kumar"),
+            ("Jos\u{e9} Ravi Kumar", "Kumar"),
+        ];
+        for ct in [
+            "text/plain;charset=UTF-8",
+            "text/plain",
+            "",
+            "application/x-ndjson",
+        ] {
+            for (v, secret) in values {
+                let one = json!({"m": v}).to_string();
+                for (body, lines) in [
+                    (format!("{{\"t\":1}}\n{one}\n"), 2),
+                    (format!("{{\"t\":1}}\r\n\r\n{one}"), 2),
+                    // A bare JSON string, \u-escaped.
+                    (json_ascii(&json!(v)), 1),
+                ] {
+                    let out = rewrite(&t, "chatgpt.com", ct, Bytes::from(body.clone()));
+                    let text = String::from_utf8(out.body.to_vec()).unwrap();
+                    let parsed: Vec<Value> = text
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .map(|l| serde_json::from_str(l).unwrap_or_else(|_| panic!("{ct}: {text}")))
+                        .collect();
+                    assert_eq!(parsed.len(), lines, "{ct}: {text}");
+                    let all = parsed.iter().map(Value::to_string).collect::<String>();
+                    let decoded: String = parsed
+                        .iter()
+                        .map(|p| p.as_str().or(p["m"].as_str()).unwrap_or("").to_string())
+                        .collect();
+                    assert!(
+                        !decoded.contains(secret) && !all.contains(secret),
+                        "{ct} {v:?}: {text}"
+                    );
+                    assert!(!out.counts.is_empty(), "{ct} {v:?}: {text}");
+                    // Separators are kept.
+                    assert_eq!(
+                        text.matches('\n').count(),
+                        body.matches('\n').count(),
+                        "{ct}: {text:?}"
+                    );
+                }
+            }
+        }
+        // Text that starts like JSON and holds JSON escapes, but is not
+        // JSON: refused, never read with its escapes literally.
+        for body in [
+            "{\"t\":1}\n{\"m\":\"Phone:\\n9876543210\"\n",
+            "[\"Phone:\\n9876543210\"",
+            "\"Phone:\\n9876543210",
+        ] {
+            for ct in ["text/plain", ""] {
+                let r = refusal(&t, ct, body.to_string());
+                assert_eq!(r.status, 400, "{body}");
+                assert!(r.message.starts_with("parda_unparseable_body"), "{body}");
+            }
+        }
+        // Plain text is still text, brackets and escapes included.
+        for body in [
+            "[Draft] Ravi Kumar",
+            "{ hi } Ravi Kumar",
+            "C:\\new Ravi Kumar",
+            "9876543210",
+        ] {
+            let out = rewrite(&t, "chatgpt.com", "text/plain", Bytes::from(body));
+            let text = String::from_utf8(out.body.to_vec()).unwrap();
+            assert!(
+                !text.contains("Kumar") && !text.contains("9876543210"),
+                "{text}"
+            );
+        }
+        // A JSON number line is read as the text it is too.
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "text/plain",
+            Bytes::from("{\"t\":1}\n9876543210\n"),
+        );
+        assert!(!String::from_utf8_lossy(&out.body).contains("9876543210"));
+    }
+
+    /// `v` as JSON with every non-ASCII character `\u`-escaped.
+    fn json_ascii(v: &Value) -> String {
+        v.to_string()
+            .chars()
+            .map(|c| {
+                if c.is_ascii() {
+                    c.to_string()
+                } else {
+                    format!("\\u{:04x}", c as u32)
+                }
+            })
+            .collect()
     }
 
     #[test]
