@@ -7,7 +7,8 @@
 //! tags. It follows the syntaxes markdown renderers and browsers use:
 //!
 //! - CommonMark link and image destinations after `](`, and reference
-//!   definitions (after any `]:`; labels may span lines): `<…>` runs to an
+//!   definitions (after any `]:`; labels may span lines, and a destination
+//!   on the next line may follow block-quote `>` markers): `<…>` runs to an
 //!   unescaped `>` or a line ending; a bare destination runs to ASCII space
 //!   or control, or an unbalanced `)`; backslash escapes are honoured; Unicode
 //!   whitespace never ends a URL.
@@ -51,8 +52,9 @@ enum Md {
     Free,
     /// Too many readings at once: protect to the end of the line.
     Saturated,
-    /// After `](` or `]:`: ASCII whitespace before a destination.
-    DestBefore,
+    /// After `](` or `]:`: ASCII whitespace before a destination; after a
+    /// line ending, block-quote `>` markers too.
+    DestBefore { new_line: bool },
     /// `<…>` destination.
     DestPointy { escaped: bool },
     /// Bare destination; `depth` counts open parentheses.
@@ -186,7 +188,7 @@ impl UrlGuard {
         // Every `](` and every `]:` (reference labels may span lines):
         // guarding more is cheap.
         if (c == '(' || c == ':') && prev == Some(']') {
-            Some(Md::DestBefore)
+            Some(Md::DestBefore { new_line: false })
         } else if c.is_ascii_alphabetic() && prev == Some('<') {
             Some(Md::Scheme { len: 1 })
         } else {
@@ -224,9 +226,14 @@ fn md_step(state: Md, c: char) -> (bool, Md) {
                 (true, Md::Saturated)
             }
         }
-        Md::DestBefore => {
+        Md::DestBefore { new_line } => {
             if ascii_space_or_control(c) {
-                (false, Md::DestBefore)
+                let new_line = new_line || line_ending(c);
+                (false, Md::DestBefore { new_line })
+            } else if new_line && c == '>' {
+                // A block-quote marker (or a destination that starts
+                // with `>`): what follows may be the destination.
+                (true, Md::DestBefore { new_line })
             } else if c == '<' {
                 (false, Md::DestPointy { escaped: false })
             } else {
