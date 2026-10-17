@@ -532,6 +532,41 @@ async fn multipart_files_are_unscanned_and_blockable() {
     assert!(up2.seen().is_empty());
 }
 
+/// A WebSocket's frames are never read, so `unscanned = "block"` refuses the
+/// upgrade before anything reaches the site.
+#[tokio::test]
+async fn websocket_upgrades_are_refused_when_unscanned_is_block() {
+    let up = start_upstream(site()).await;
+    let mut parda = start_parda(
+        &up,
+        |c| c.intercept.unscanned = UnscannedMedia::Block,
+        None,
+    )
+    .await;
+    let res = parda
+        .client()
+        .get(format!("https://chatgpt.com:{}/backend-api/ws?x=1", up.port))
+        .version(http::Version::HTTP_11)
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 415);
+    assert!(
+        res.text()
+            .await
+            .unwrap()
+            .starts_with("parda_unscanned_blocked")
+    );
+    assert!(up.seen().is_empty(), "the upgrade reached the site");
+    let ev = parda.next_event().await;
+    assert_eq!(ev.status, 415);
+    assert!(ev.refused.is_some());
+}
+
 #[test]
 fn the_fake_site_answers_for_listed_hosts_only() {
     let hosts = parda_intercept::HostList::new(&SITES.map(String::from));

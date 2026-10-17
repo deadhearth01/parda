@@ -114,7 +114,12 @@ impl EngineTransform {
         if let Some(q) = query {
             walk_form(q, &rules, &mut collect).map_err(|_| unparseable())?;
         }
-        let (_, unscanned) = body.walk(&rules, &mut collect)?;
+        let (_, mut unscanned) = body.walk(&rules, &mut collect)?;
+        // An upgrade (WebSocket) tunnels its frames unread: one unscanned
+        // part, refused before the handshake leaves under "block".
+        if crate::server::is_upgrade(headers) {
+            unscanned += 1;
+        }
         if unscanned > 0 && st.unscanned == UnscannedMedia::Block {
             return Err(refusal(
                 415,

@@ -123,8 +123,10 @@ Tags follow `replace.style` (there is no separate style for intercept).
     `415 parda_unscanned_blocked`): file parts; multipart fields that are not text or JSON, are not
     UTF-8 (a declared charset other than UTF-8, or NUL bytes, as UTF-16 has), or use another
     transfer encoding (quoted-printable); bodies of other types that are not JSON (images, binary
-    data); untyped bodies that are not UTF-8 or hold NUL bytes. Headers other than `Referer` are
-    forwarded as they are, and WebSocket traffic is tunnelled without inspection.
+    data); untyped bodies that are not UTF-8 or hold NUL bytes; WebSocket (and other protocol
+    upgrade) connections, whose frames are tunnelled without inspection, so with `"block"` the
+    upgrade request is refused before it reaches the site. Headers other than `Referer` are
+    forwarded as they are.
   - *Refused, never sent unfiltered.* The message names the problem and never quotes the request.
 
     | Status and code | When |
@@ -133,7 +135,7 @@ Tags follow `replace.style` (there is no separate style for intercept).
     | `400 parda_not_utf8` | a form, `text/*` or JSON body declaring a charset other than UTF-8 or US-ASCII; a form or `text/*` body that is not UTF-8 or holds NUL bytes (UTF-16) |
     | `413 parda_body_too_large` | a body too large to filter |
     | `415 parda_unsupported_encoding` | a `content-encoding` parda cannot decode |
-    | `415 parda_unscanned_blocked` | an unscanned part while `unscanned = "block"` |
+    | `415 parda_unscanned_blocked` | an unscanned part (a file, binary data, a WebSocket upgrade) while `unscanned = "block"` |
     | `503 parda_ml_unavailable` | `detect.mode = "strict"` and the name detector failed |
     | `403 parda_blocked` | a kind whose action is `block` (the message names kinds, not values) |
     | `500 parda_internal` | anything else that went wrong while filtering |

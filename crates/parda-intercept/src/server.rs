@@ -923,7 +923,9 @@ async fn upgrade(
     out
 }
 
-fn is_upgrade(headers: &HeaderMap) -> bool {
+/// Does the request ask to switch protocols (a WebSocket)? Its frames are
+/// tunnelled raw, never read.
+pub(crate) fn is_upgrade(headers: &HeaderMap) -> bool {
     headers.contains_key(UPGRADE) && connection_tokens(headers).iter().any(|t| t == "upgrade")
 }
 
