@@ -741,29 +741,61 @@ fn restore_json_value(engine: &Engine, scope: &str, raw: &[u8], mut v: Value) ->
     changed.then(|| preserve_numbers(raw, serde_json::to_vec(&v).unwrap_or_default()))
 }
 
-/// A JSON object or array carried in a string, if `s` is one.
-fn json_container(s: &str) -> Option<Value> {
-    let t = s.trim();
-    let bracketed =
-        (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']'));
-    if !bracketed {
-        return None;
+/// What a string holds, read as JSON.
+enum JsonIn {
+    /// A JSON object or array (parsed as browsers do: a BOM, lone
+    /// surrogates).
+    Container(Value),
+    /// The start of JSON that has not ended (`{"q": "x`): more may follow.
+    Incomplete,
+    /// Clearly JSON (it reached a string or an object, see [`sniff_text`])
+    /// that cannot become one valid document (`{"a": 1,}`, a value followed
+    /// by another).
+    Invalid,
+    Text,
+}
+
+fn json_in(s: &str) -> JsonIn {
+    let t = s.trim_start_matches('\u{feff}').trim();
+    if !t.starts_with(['{', '[']) {
+        return JsonIn::Text;
     }
-    serde_json::from_str::<Value>(t)
-        .ok()
-        .filter(|v| v.is_object() || v.is_array())
+    if let Ok(v) = parda_wire::body::parse_json(t.as_bytes())
+        && (v.is_object() || v.is_array())
+    {
+        return JsonIn::Container(v);
+    }
+    match json_start(t) {
+        JsonStart::Clear => JsonIn::Incomplete,
+        JsonStart::Broken => JsonIn::Invalid,
+        // A value that ended, then more: lines of JSON, or text after a
+        // value that was clearly JSON.
+        JsonStart::Closed(at, clear) => match after_value(&t[at..]) {
+            Some(PlainKind::Text) if !clear => JsonIn::Text,
+            _ => JsonIn::Invalid,
+        },
+        // Brackets and numbers only, or prose (`[NAME_1] said`).
+        JsonStart::Open | JsonStart::Not => JsonIn::Text,
+    }
 }
 
 /// Restore one whole string value in place. JSON inside it is restored at
-/// its own level (so a real value is escaped where it lands); in text, tags
-/// inside URLs stay tags. Returns whether it changed.
+/// its own level (so a real value is escaped where it lands), and a string
+/// that is clearly JSON but does not parse is left alone, never restored as
+/// text; in text, tags inside URLs stay tags. Returns whether it changed.
 fn restore_string(engine: &Engine, scope: &str, s: &mut String, depth: usize) -> bool {
     if s.is_empty() {
         return false;
     }
-    if depth < MAX_NESTED_JSON
-        && let Some(mut inner) = json_container(s)
-    {
+    let inner = if depth < MAX_NESTED_JSON {
+        json_in(s)
+    } else {
+        JsonIn::Text
+    };
+    if let JsonIn::Incomplete | JsonIn::Invalid = inner {
+        return false;
+    }
+    if let JsonIn::Container(mut inner) = inner {
         let mut changed = false;
         leaves(&mut inner, &mut |t: &mut String| {
             changed |= restore_string(engine, scope, t, depth + 1);
@@ -1917,7 +1949,13 @@ impl Events {
         });
         track.used = *uses;
         let whole_json = matches!(track.kind, Kind::Auto) || (track.kind == Kind::Patch && fresh);
-        if whole_json && json_container(s).is_some() {
+        let whole = if whole_json { json_in(s) } else { JsonIn::Text };
+        if let JsonIn::Invalid = whole {
+            // Clearly JSON that can never parse: left alone, never restored
+            // as text.
+            return false;
+        }
+        if let JsonIn::Container(_) = whole {
             // A JSON document in a string, sent whole: restored at its own
             // level, never spliced into as text. A patch path's appends that
             // follow go on as JSON text.
@@ -2567,6 +2605,51 @@ mod tests {
         let mut keys: Vec<&str> = ev.tracks.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["\u{1}m/0", "\u{1}m0", "\u{1}n"]);
+    }
+
+    /// Review finding: JSON carried in a string is parsed as browsers parse
+    /// it (lone surrogates, a BOM) and restored at its own level; one that
+    /// looks like JSON but does not parse passes through, never restored as
+    /// text over its encoded form.
+    #[test]
+    fn json_in_strings_restore_at_their_level_or_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let q = quoted_tag(&e);
+        let lone = format!("{{\"t\":\"\\ud800 {q}\"}}");
+        let broken = format!("{{\"t\":\"{q}\",}}");
+        let lines = format!("{{\"t\":\"{q}\"}}\n{{\"u\":1}}");
+        let doc = json!({"a": lone, "b": broken, "c": "[NAME_1] and [NAME_1]",
+                         "d": "[1] [NAME_1]", "e": lines});
+        for (ct, body) in [
+            ("application/json", doc.to_string()),
+            ("text/plain", doc.to_string()),
+            (
+                "text/event-stream",
+                String::from_utf8(sse(&[(None, doc.to_string())])).unwrap(),
+            ),
+        ] {
+            for n in [1, 4, 1000] {
+                let out = run(&e, ct, body.as_bytes(), n);
+                let v: Value = match ct {
+                    "text/event-stream" => serde_json::from_str(&datas(&out)[0]).unwrap(),
+                    _ => serde_json::from_slice(&out).unwrap(),
+                };
+                let inner: Value =
+                    parda_wire::body::parse_json(v["a"].as_str().unwrap().as_bytes())
+                        .unwrap_or_else(|err| panic!("{ct} {n}: {err:?}: {}", v["a"]));
+                assert_eq!(inner["t"], format!("\u{fffd} {QUOTED}"), "{ct} {n}");
+                assert_eq!(v["b"], broken, "{ct} {n}");
+                assert_eq!(v["c"], "Ravi Kumar and Ravi Kumar", "{ct} {n}");
+                assert_eq!(v["d"], "[1] Ravi Kumar", "{ct} {n}");
+                assert_eq!(v["e"], lines, "{ct} {n}");
+            }
+        }
+        // A whole body that is clearly JSON but does not parse goes out as
+        // it came (JSON lines are restored line by line).
+        for ct in ["application/json", "text/plain"] {
+            assert_eq!(run(&e, ct, broken.as_bytes(), 3), broken.as_bytes(), "{ct}");
+        }
     }
 
     #[test]
