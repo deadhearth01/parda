@@ -104,8 +104,11 @@ Tags follow `replace.style` (there is no separate style for intercept).
     post JSON as `text/plain`, as a form, or as `application/octet-stream`). So is a body (not
     declared as a form) of JSON values one per line (NDJSON: batched telemetry, a Sentry envelope),
     and one that is a lone JSON string: each line is read as JSON, so an escape such as
-    `\n9876543210` cannot hide a number. A text or untyped body that starts like JSON (`{`, `[`,
-    `"`) and holds a backslash but is not JSON is refused. A text or untyped body
+    `\n9876543210` cannot hide a number. Such a body also keeps the readings a text body gets: its
+    strings and keys are read decoded as a form too (`+` is a space), and its numbers as text (a
+    number found this way becomes a JSON string holding its tag). A text or untyped body that
+    starts like JSON (`{`, `[`, `"`) and holds a backslash but is not JSON (or JSON lines) is
+    refused. A text or untyped body
     written in form encoding (`prompt=Ravi+Kumar&mail=ravi%40example.com`) is read as a form, so `+`
     and `%40` cannot hide a name or an e-mail.
   - *URLs inside strings.* The query of every `http(s)://` link in any of these strings is decoded,

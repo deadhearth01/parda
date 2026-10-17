@@ -35,7 +35,7 @@ pub fn json_string(s: &mut String, f: Visit<'_>) {
 }
 
 /// Byte ranges of the number literals of a JSON text, outside strings.
-fn number_tokens(json: &[u8]) -> Vec<(usize, usize)> {
+pub fn number_tokens(json: &[u8]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
     let mut in_string = false;

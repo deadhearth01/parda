@@ -286,7 +286,19 @@ pub(crate) struct Malformed;
 
 /// Visit every text in a JSON document: its strings and its object keys.
 pub(crate) fn walk_json(v: &mut Value, rules: &Rules<'_>, f: Visit<'_>) -> Result<(), Malformed> {
-    walk_value(v, None, false, 0, rules, f)
+    walk_value(v, None, false, 0, Reading::Nested, rules, f)
+}
+
+/// [`walk_json`] for JSON in a body not declared as JSON (a JSON line of a
+/// text body): its strings and keys may also be read as a server reads the
+/// whole body, decoded as a form (see [`Reading::Body`]). JSON inside its
+/// strings is read as nested JSON.
+pub(crate) fn walk_json_body(
+    v: &mut Value,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<(), Malformed> {
+    walk_value(v, None, false, 0, Reading::Body, rules, f)
 }
 
 /// `skipped`: the value sits under an identifier key (its strings and arrays
@@ -296,6 +308,7 @@ fn walk_value(
     key: Option<&str>,
     skipped: bool,
     depth: usize,
+    reading: Reading,
     rules: &Rules<'_>,
     f: Visit<'_>,
 ) -> Result<(), Malformed> {
@@ -305,21 +318,21 @@ fn walk_value(
             key.is_some_and(is_content_key),
             skipped,
             depth,
-            Reading::Nested,
+            reading,
             rules,
             f,
         ),
         Value::Array(items) => items
             .iter_mut()
-            .try_for_each(|x| walk_value(x, key, skipped, depth, rules, f)),
+            .try_for_each(|x| walk_value(x, key, skipped, depth, reading, rules, f)),
         Value::Object(map) => {
             // Keys are text too (`{"Ravi Kumar": …}`). A changed key is
             // renamed after the walk, so both passes see the same order.
             let mut renamed = Vec::new();
             for (k, x) in map.iter_mut() {
                 let mut new_key = k.clone();
-                visit_key(&mut new_key, rules, f);
-                walk_value(x, Some(k), rules.skip_key(k), depth, rules, f)?;
+                visit_key(&mut new_key, reading, rules, f);
+                walk_value(x, Some(k), rules.skip_key(k), depth, reading, rules, f)?;
                 if new_key != *k {
                     renamed.push((k.clone(), new_key));
                 }
@@ -370,7 +383,7 @@ pub(crate) fn visit_body_text(
 /// either looks like an identifier itself or is a known protocol key (the
 /// built-in identifier and content keys, the site's and `skip_keys`).
 /// Anything else is text, so a name used as a key reaches the model.
-fn visit_key(k: &mut String, rules: &Rules<'_>, f: Visit<'_>) {
+fn visit_key(k: &mut String, reading: Reading, rules: &Rules<'_>, f: Visit<'_>) {
     if k.trim().is_empty() {
         return;
     }
@@ -380,7 +393,7 @@ fn visit_key(k: &mut String, rules: &Rules<'_>, f: Visit<'_>) {
     } else {
         Tier::Text
     };
-    visit_views(k, tier, Reading::Nested, f);
+    visit_views(k, tier, reading, f);
 }
 
 /// How a string may be read by whoever receives it.
@@ -700,7 +713,15 @@ fn nested_json(
         inner: f,
         changed: false,
     };
-    walk_value(&mut inner, None, false, depth + 1, rules, &mut track)?;
+    walk_value(
+        &mut inner,
+        None,
+        false,
+        depth + 1,
+        Reading::Nested,
+        rules,
+        &mut track,
+    )?;
     if track.changed {
         let out = parda_wire::walk::preserve_numbers(s.as_bytes(), inner.to_string().into_bytes());
         *s = String::from_utf8(out)
@@ -839,7 +860,7 @@ fn walk_form_at(
         };
         let key = decode_component(k_raw);
         let mut new_key = key.clone();
-        visit_key(&mut new_key, rules, f);
+        visit_key(&mut new_key, Reading::Nested, rules, f);
         let mut value = decode_component(v_raw);
         let before = value.clone();
         visit_at(

@@ -11,7 +11,7 @@ use http::header::CONTENT_TYPE;
 use parda_core::{INTERCEPT_SCOPE_PER_HOST, InterceptConfig, UnscannedMedia};
 use parda_engine::{Engine, EngineError};
 use parda_wire::body::{self, BodyError};
-use parda_wire::walk::preserve_numbers;
+use parda_wire::walk::{number_tokens, preserve_numbers};
 use serde_json::Value;
 
 use crate::hosts::HostList;
@@ -20,7 +20,7 @@ use crate::sites;
 use crate::transform::RequestOutcome;
 use crate::walk::{
     Found, Rules, Sink, Tier, Tracking, Visit, utf8_charset, visit_body_text, walk_form, walk_json,
-    walk_multipart,
+    walk_json_body, walk_multipart,
 };
 use crate::{BodyTransform, Refusal, StreamTransform};
 
@@ -233,7 +233,10 @@ enum ReqBody {
         value: Value,
     },
     /// JSON values one per line (NDJSON), or one JSON value that is not an
-    /// object or array, in a body not declared as JSON.
+    /// object or array, in a body not declared as JSON. Besides each line
+    /// read as JSON, the readings a text body gets are kept (R8.2): strings
+    /// and keys are also read decoded as a form, and numbers as the text
+    /// they are, so a value survives no reading.
     JsonLines {
         text: String,
         lines: Vec<JsonLine>,
@@ -367,13 +370,20 @@ impl ReqBody {
                                 // A lone string is what the user typed, as
                                 // a text body is.
                                 Value::String(t) => visit_body_text(t, rules, &mut track),
-                                _ => walk_json(value, rules, &mut track),
+                                _ => walk_json_body(value, rules, &mut track),
                             }
                             .map_err(|_| unparseable())?;
-                            if track.changed {
+                            // Read literally, the body's numbers are text.
+                            let numbers = visit_numbers(raw, rules, &mut *track.inner)?;
+                            if track.changed || !numbers.is_empty() {
                                 changed = true;
-                                let json = serde_json::to_vec(value).unwrap_or_default();
-                                let json = preserve_numbers(raw.as_bytes(), json);
+                                let json = if track.changed {
+                                    let json = serde_json::to_vec(value).unwrap_or_default();
+                                    preserve_numbers(raw.as_bytes(), json)
+                                } else {
+                                    raw.as_bytes().to_vec()
+                                };
+                                let json = replace_numbers(json, &numbers)?;
                                 out.push_str(&String::from_utf8(json).map_err(|_| unparseable())?);
                             } else {
                                 out.push_str(raw);
@@ -497,6 +507,49 @@ fn json_lines(raw: &[u8]) -> Result<Option<Vec<JsonLine>>, Refusal> {
         start = end;
     }
     Ok(any.then_some(lines))
+}
+
+/// Visit the number literals of the JSON text `raw` as text (as a server
+/// that reads the body literally sees them); returns the changed ones: the
+/// index among the literals and the new text.
+fn visit_numbers(
+    raw: &str,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<Vec<(usize, String)>, Refusal> {
+    let mut changed = Vec::new();
+    for (i, (a, b)) in number_tokens(raw.as_bytes()).into_iter().enumerate() {
+        let mut t = raw[a..b].to_string();
+        visit_body_text(&mut t, rules, f).map_err(|_| unparseable())?;
+        if t != raw[a..b] {
+            changed.push((i, t));
+        }
+    }
+    Ok(changed)
+}
+
+/// Put the changed number literals of [`visit_numbers`] into `json` (the
+/// same document, its numbers in the same order): bare when the new text is
+/// a JSON number, else as a JSON string (a tag), so the line still parses.
+fn replace_numbers(json: Vec<u8>, changed: &[(usize, String)]) -> Result<Vec<u8>, Refusal> {
+    if changed.is_empty() {
+        return Ok(json);
+    }
+    let tokens = number_tokens(&json);
+    let mut out = Vec::with_capacity(json.len());
+    let mut last = 0;
+    for (i, text) in changed {
+        // Never: redaction rewrites only strings, and numbers keep their order.
+        let &(a, b) = tokens.get(*i).ok_or_else(unparseable)?;
+        out.extend_from_slice(&json[last..a]);
+        match serde_json::from_str::<Value>(text) {
+            Ok(Value::Number(_)) => out.extend_from_slice(text.as_bytes()),
+            _ => out.extend_from_slice(Value::String(text.clone()).to_string().as_bytes()),
+        }
+        last = b;
+    }
+    out.extend_from_slice(&json[last..]);
+    Ok(out)
 }
 
 /// Whitespace between JSON tokens.
@@ -825,6 +878,48 @@ pub(crate) mod tests {
             Bytes::from("{\"t\":1}\n9876543210\n"),
         );
         assert!(!String::from_utf8_lossy(&out.body).contains("9876543210"));
+    }
+
+    /// R8.2 (scan on 21de04b): JSON lines in a body not declared as JSON were
+    /// only walked line by line, dropping the readings a text body gets: the
+    /// whole body read literally (a number in a JSON line is text to a
+    /// server that reads the body as text) and decoded as a form (`+` is a
+    /// space). Those readings are kept as well: a value survives none, and
+    /// is counted once.
+    #[test]
+    fn json_lines_in_undeclared_bodies_keep_the_whole_body_readings() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path());
+        let t = transform(&e, |_| {});
+        for ct in ["text/plain", "", "application/x-ndjson"] {
+            for (body, secret) in [
+                // Literally `2345+6789+0124` is no Aadhaar number; decoded
+                // as a form it is.
+                ("{\"t\":1}\n{\"m\":\"id 2345+6789+0124 x\"}\n", "6789"),
+                ("{\"t\":1}\n{\"m\":\"call 98765+43210 now\"}\n", "43210"),
+                ("\"hi\"\n{\"note\":\"card 4111+1111+1111+1111 x\"}", "4111"),
+                ("{\"t\":1}\n{\"id 2345+6789+0124\":1}\n", "6789"),
+                // Numbers are text read literally.
+                ("{\"t\":1}\n{\"phone\":9876543210}\n", "9876543210"),
+                ("[1]\n[\"x\", 9876543210, 2.5]\n", "9876543210"),
+                // Found by the JSON walk: tagged there, not again.
+                ("{\"t\":1}\n{\"m\":\"Hi\\nRavi Kumar\"}\n", "Kumar"),
+            ] {
+                let out = rewrite(&t, "chatgpt.com", ct, Bytes::from(body));
+                let text = String::from_utf8(out.body.to_vec()).unwrap();
+                assert!(!text.contains(secret), "{ct}: {text}");
+                assert_eq!(out.counts.values().sum::<u32>(), 1, "{ct}: {text}");
+                // Each line still parses (a number became a string).
+                for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                    serde_json::from_str::<Value>(line).unwrap_or_else(|_| panic!("{ct}: {text}"));
+                }
+            }
+            // Nothing found in any reading: the exact bytes go on.
+            let body = "{\"t\":1}\n{\"m\":\"hello there\", \"n\": 1.50e3}\n";
+            let out = rewrite(&t, "chatgpt.com", ct, Bytes::from(body));
+            assert_eq!(out.body, body, "{ct}");
+            assert!(out.counts.is_empty(), "{ct}");
+        }
     }
 
     /// `v` as JSON with every non-ASCII character `\u`-escaped.
