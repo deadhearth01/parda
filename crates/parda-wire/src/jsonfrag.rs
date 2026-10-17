@@ -7,9 +7,12 @@
 //! break cannot be pasted in verbatim. Each string value is decoded, run
 //! through its own [`StreamRestorer`], and what it changed is re-encoded;
 //! text it left alone goes out exactly as it came (escapes included), as do
-//! keys and everything outside strings. Escapes split across fragments are
-//! held until complete. Text that stops being JSON (prose after a bracket)
-//! passes through unrestored from there on.
+//! keys and everything outside strings. An escape that is not JSON (`\q`)
+//! is text whose backslash goes out escaped (`\\q`): a lone backslash
+//! before a restored span would escape its first char. Escapes split across
+//! fragments are held until complete; a forced flush inside one sends the
+//! rest of that value as it comes, unrestored. Text that stops being JSON
+//! (prose after a bracket) passes through unrestored from there on.
 
 use std::collections::VecDeque;
 
@@ -62,6 +65,10 @@ enum State {
     Key { escaped: bool },
     /// Inside a string value: decoded and restored.
     Value,
+    /// The rest of a string value after a forced flush went out inside an
+    /// escape: copied verbatim (unrestored), so the escape is completed by
+    /// the bytes that complete it in the input. `escaped` after a backslash.
+    Verbatim { escaped: bool },
 }
 
 /// What may come next outside strings (to notice text that is not JSON).
@@ -157,6 +164,14 @@ impl JsonFragRestorer {
                     };
                 }
                 State::Value => self.value(c, &mut out),
+                State::Verbatim { escaped } => {
+                    out.push(c);
+                    self.state = match (escaped, c) {
+                        (false, '\\') => State::Verbatim { escaped: true },
+                        (false, '"') => State::Outside,
+                        _ => State::Verbatim { escaped: false },
+                    };
+                }
             }
         }
         if matches!(self.state, State::Value) {
@@ -180,18 +195,26 @@ impl JsonFragRestorer {
             if let Some((_, h)) = self.high.take() {
                 raw.push_str(&h);
             }
-            raw.push_str(&std::mem::take(&mut self.escape));
             self.emit(&mut out);
             // The value goes on: keep its restorer (and whatever context it
             // tracks, such as a URL guard's state).
             let r = self.restorer.get_or_insert_with(|| (self.new_value)());
             let tail = r.finish();
             self.reconcile(&tail, 0, &mut out);
-            // Incomplete escapes are re-emitted as they came.
-            if let Some(r) = self.restorer.as_mut() {
+            // Incomplete escapes are re-emitted as they came; what completes
+            // them follows as it comes, and so does the rest of the value
+            // (restored text after a lone `\` would be escaped by it).
+            let partial = std::mem::take(&mut self.escape);
+            if !partial.is_empty() {
+                self.restorer = None;
+                self.state = State::Verbatim {
+                    escaped: partial == "\\",
+                };
+            } else if let Some(r) = self.restorer.as_mut() {
                 r.skip(&raw);
             }
             out.push_str(&raw);
+            out.push_str(&partial);
         }
         out
     }
@@ -295,9 +318,7 @@ impl JsonFragRestorer {
             if self.escape.starts_with("\\u") && !c.is_ascii_hexdigit() {
                 self.lone_high();
                 let text = std::mem::take(&mut self.escape);
-                for ch in text.chars() {
-                    self.literal_char(ch);
-                }
+                self.invalid_escape(&text);
             } else {
                 self.escape.push(c);
                 self.escape_progress();
@@ -330,6 +351,23 @@ impl JsonFragRestorer {
         self.dec.push(c);
         self.raw.push_str(s);
         self.raw_lens.push_back(s.len());
+    }
+
+    /// An escape that is not JSON (`\q`, `\uzz`): text, its backslash a
+    /// backslash. The backslash's raw text is the escaped `\\`, never a
+    /// lone `\`: reused before a restored span, a lone one would escape
+    /// the first char of it (R7).
+    fn invalid_escape(&mut self, text: &str) {
+        let rest = match text.strip_prefix('\\') {
+            Some(rest) => {
+                self.decoded('\\', "\\\\");
+                rest
+            }
+            None => text,
+        };
+        for ch in rest.chars() {
+            self.literal_char(ch);
+        }
     }
 
     /// A decoded char with its whole raw text.
@@ -376,9 +414,7 @@ impl JsonFragRestorer {
                 }
                 None => {
                     self.lone_high();
-                    for ch in raw.chars() {
-                        self.literal_char(ch);
-                    }
+                    self.invalid_escape(&raw);
                 }
             }
             return;
@@ -395,10 +431,7 @@ impl JsonFragRestorer {
             'r' => '\r',
             't' => '\t',
             _ => {
-                // Not valid JSON; keep the text as it came.
-                for ch in raw.chars() {
-                    self.literal_char(ch);
-                }
+                self.invalid_escape(&raw);
                 return;
             }
         };
@@ -482,6 +515,8 @@ mod tests {
     use serde_json::{Value, json};
 
     const ADDR: &str = "Flat 4\\B, \"Lotus\"\nPune";
+    /// A value that starts with a quote: escaped, it starts with `\"`.
+    const QUOTED: &str = "\"Lotus\" Towers, Pune";
 
     fn engine(dir: &std::path::Path) -> Engine {
         let mut config = Config::default();
@@ -494,10 +529,16 @@ mod tests {
                         name: "Ravi Kumar".into(),
                         ..Default::default()
                     }],
-                    term: vec![Term {
-                        text: ADDR.into(),
-                        ..Default::default()
-                    }],
+                    term: vec![
+                        Term {
+                            text: ADDR.into(),
+                            ..Default::default()
+                        },
+                        Term {
+                            text: QUOTED.into(),
+                            ..Default::default()
+                        },
+                    ],
                     ..Default::default()
                 },
                 data_dir: dir.to_path_buf(),
@@ -723,8 +764,9 @@ mod tests {
         let e = engine(dir.path());
         let name = e.redact("Ravi Kumar", "global").unwrap().text;
         // Non-ASCII (or non-hex) where hex digits belong: `&e[2..6]` used to
-        // cut a char in half. The bad escape goes out as it came and the
-        // document after it is still restored.
+        // cut a char in half. The bad escape is text: it goes out as it
+        // came but for its backslash, escaped (R7), and the document after
+        // it is still restored.
         for bad in [
             "\\uabc\u{e9}",
             "\\uaa\u{20ac}",
@@ -739,7 +781,97 @@ mod tests {
             let text = format!("{{\"a\": \"x{bad}y\", \"b\": \"{name}\"}}");
             for n in 1..8 {
                 let out = run(&e, &text, n);
-                assert_eq!(out, text.replace(&name, "Ravi Kumar"), "{bad} {n}");
+                let want = format!("{{\"a\": \"x\\{bad}y\", \"b\": \"Ravi Kumar\"}}");
+                assert_eq!(out, want, "{bad} {n}");
+                let v: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+                assert_eq!(v["a"], format!("x{bad}y"), "{bad} {n}");
+            }
+        }
+    }
+
+    /// The structure of JSON-like text: everything outside strings (but
+    /// whitespace) and one `S` per string, where a backslash in a string
+    /// always takes the next char with it (as JSON readers find string ends).
+    fn skeleton(text: &str) -> String {
+        let (mut out, mut in_str, mut esc) = (String::new(), false, false);
+        for c in text.chars() {
+            if in_str {
+                match (esc, c) {
+                    (true, _) => esc = false,
+                    (false, '\\') => esc = true,
+                    (false, '"') => in_str = false,
+                    _ => {}
+                }
+            } else if c == '"' {
+                in_str = true;
+                out.push('S');
+            } else if !c.is_ascii_whitespace() {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// R7 (automated scan on jsonfrag.rs): a lone `\` from an invalid escape
+    /// was kept as raw text and could end the text reused before a restored
+    /// span, escaping the first char of it (`a\` + `\"Lotus…` reads `a\\`
+    /// then a closing quote): the value got out of its string. Split at
+    /// every byte, with and without a forced flush at the split, the output
+    /// is valid JSON holding exactly the document's keys (or, after a
+    /// flush inside an escape, the value's rest goes out as it came: the
+    /// same structure as the input), never a value outside its string.
+    #[test]
+    fn invalid_escapes_never_let_a_value_out_of_its_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path());
+        let name = e.redact("Ravi Kumar", "global").unwrap().text;
+        let quoted = e.redact(QUOTED, "global").unwrap().text;
+        let addr = e.redact(ADDR, "global").unwrap().text;
+        let invalid = [
+            "\\", "\\q", "\\u", "\\u1", "\\u12", "\\u123", "\\uzz", "\\\u{e9}",
+        ];
+        let valid = ["\\n", "\\\\", "\\\"", "\\u0041", "\\ud83d\\ude00", ""];
+        for (tag, value) in [(&quoted, QUOTED), (&addr, ADDR), (&name, "Ravi Kumar")] {
+            for (bad, is_valid) in invalid
+                .iter()
+                .map(|b| (b, false))
+                .chain(valid.iter().map(|b| (b, true)))
+            {
+                let text = format!("{{\"partial_json\": \"a{bad}{tag}\", \"b\": \"{name}\"}}");
+                let decoded: String = if is_valid {
+                    serde_json::from_str::<String>(&format!("\"{bad}\"")).unwrap()
+                } else {
+                    // An invalid escape is text: its backslash a backslash.
+                    bad.to_string()
+                };
+                for split in (0..=text.len()).filter(|&i| text.is_char_boundary(i)) {
+                    for forced in [false, true] {
+                        let mut r = JsonFragRestorer::new(e.clone(), "global");
+                        let mut out = r.push(&text[..split]);
+                        if forced {
+                            out.push_str(&r.finish());
+                        }
+                        out.push_str(&r.push(&text[split..]));
+                        out.push_str(&r.finish());
+                        let at = format!("{bad:?} {tag} split {split} forced {forced}: {out}");
+                        assert_eq!(skeleton(&out), skeleton(&text), "{at}");
+                        let parsed = serde_json::from_str::<Value>(&out);
+                        if !forced || is_valid {
+                            let v = parsed.unwrap_or_else(|err| panic!("{err}: {at}"));
+                            let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+                            keys.sort();
+                            assert_eq!(keys, ["b", "partial_json"], "{at}");
+                            let got = v["partial_json"].as_str().unwrap();
+                            let restored = format!("a{decoded}{value}");
+                            let unrestored = format!("a{decoded}{tag}");
+                            assert!(got == restored || (forced && got == unrestored), "{at}");
+                        } else if let Ok(v) = parsed {
+                            let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+                            keys.sort();
+                            assert_eq!(keys, ["b", "partial_json"], "{at}");
+                        }
+                    }
+                }
             }
         }
     }
