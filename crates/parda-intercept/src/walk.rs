@@ -898,6 +898,20 @@ struct PartHeaders {
     encoding: Option<String>,
 }
 
+/// Whether the `charset` parameter of `content_type` is absent, UTF-8 or
+/// US-ASCII (anything else cannot be read as UTF-8 text).
+pub(crate) fn utf8_charset(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .skip(1)
+        .filter_map(|p| p.split_once('='))
+        .filter(|(k, _)| k.trim().eq_ignore_ascii_case("charset"))
+        .all(|(_, v)| {
+            let v = v.trim().trim_matches('"').to_ascii_lowercase();
+            matches!(v.as_str(), "utf-8" | "utf8" | "us-ascii")
+        })
+}
+
 fn part_headers(headers: &str) -> PartHeaders {
     let mut part = PartHeaders::default();
     for line in headers.split("\r\n") {
@@ -1067,7 +1081,8 @@ pub(crate) fn walk_multipart(
         out.extend_from_slice(&body[pos..content_start]);
         let part = part_headers(&headers);
         let texty = part.content_type.as_deref().is_none_or(|t| {
-            t.starts_with("text/") || t.starts_with("application/json") || t.contains("+json")
+            (t.starts_with("text/") || t.starts_with("application/json") || t.contains("+json"))
+                && utf8_charset(t)
         });
         let base64 = part.encoding.as_deref() == Some("base64");
         let identity = part
@@ -1081,7 +1096,9 @@ pub(crate) fn walk_multipart(
             base64_decode(content).and_then(|d| String::from_utf8(d).ok())
         } else {
             std::str::from_utf8(content).ok().map(str::to_string)
-        };
+        }
+        // NULs: another charset (UTF-16) read as UTF-8.
+        .filter(|t| !t.contains('\0'));
         match text {
             Some(text) => {
                 let mut value = text.clone();

@@ -19,7 +19,7 @@ use crate::server::MAX_REQUEST_BODY;
 use crate::sites;
 use crate::transform::RequestOutcome;
 use crate::walk::{
-    Found, Rules, Sink, Tier, Tracking, Visit, visit_body_text, walk_form, walk_json,
+    Found, Rules, Sink, Tier, Tracking, Visit, utf8_charset, visit_body_text, walk_form, walk_json,
     walk_multipart,
 };
 use crate::{BodyTransform, Refusal, StreamTransform};
@@ -262,6 +262,24 @@ impl ReqBody {
             return Ok(ReqBody::Empty);
         }
         let (media, boundary) = media_type(headers);
+        let form = media == "application/x-www-form-urlencoded";
+        let typed_text = media.starts_with("text/");
+        let not_utf8 = || {
+            refusal(
+                400,
+                "parda_not_utf8",
+                "the request body is not UTF-8 text, so parda could not filter it; it was not sent",
+            )
+        };
+        // A body declared in another charset (UTF-16 of ASCII text is valid
+        // UTF-8, NULs interleaved) cannot be read as text here.
+        let declared = headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if (is_json(&media) || form || typed_text) && !utf8_charset(declared) {
+            return Err(not_utf8());
+        }
         if is_json(&media) {
             let value = body::parse_json_unique(&raw).map_err(|_| unparseable())?;
             return Ok(ReqBody::Json { raw, value });
@@ -278,23 +296,15 @@ impl ReqBody {
         if let Some(value) = json_container(&raw)? {
             return Ok(ReqBody::Json { raw, value });
         }
-        let form = media == "application/x-www-form-urlencoded";
-        let typed_text = media.starts_with("text/");
         if !(form || typed_text || media.is_empty()) {
             return Ok(ReqBody::Opaque(raw));
         }
-        let Ok(text) = String::from_utf8(raw.to_vec()) else {
-            // A form or text in another charset cannot be filtered; an
-            // untyped body that is not UTF-8 is binary data.
-            if form || typed_text {
-                return Err(refusal(
-                    400,
-                    "parda_not_utf8",
-                    "the request body is not UTF-8 text, so parda could not filter it; it was \
-                     not sent",
-                ));
-            }
-            return Ok(ReqBody::Opaque(raw));
+        // A form or text in another charset (or holding NULs, as UTF-16
+        // does) cannot be filtered; an untyped body like that is binary data.
+        let text = match String::from_utf8(raw.to_vec()) {
+            Ok(text) if !text.contains('\0') => text,
+            _ if form || typed_text => return Err(not_utf8()),
+            _ => return Ok(ReqBody::Opaque(raw)),
         };
         Ok(if form {
             ReqBody::Form(text)
@@ -994,6 +1004,72 @@ pub(crate) mod tests {
         // An untyped binary body is not text: forwarded, counted unscanned.
         let out = rewrite(&t, "chatgpt.com", "", Bytes::from_static(b"\x89PNG\xff"));
         assert_eq!(out.unscanned, 1);
+    }
+
+    fn utf16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    /// Review finding (fix round 1b): a declared charset other than UTF-8
+    /// (UTF-16 of ASCII text is valid UTF-8, NULs interleaved) is refused
+    /// for text, form and JSON bodies; text and form bodies holding NUL
+    /// bytes are too; a multipart field in another charset or holding NULs
+    /// is counted unscanned; an untyped body with NULs is binary.
+    #[test]
+    fn declared_charsets_other_than_utf8_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        let text = utf16le("hello Ravi Kumar, mail ravi@example.com");
+        let form = utf16le("q=Ravi+Kumar&m=ravi%40example.com");
+        for (ct, body) in [
+            ("text/plain; charset=utf-16le", &text),
+            ("text/plain;charset=\"UTF-16\"", &text),
+            ("application/x-www-form-urlencoded; charset=utf-16le", &form),
+            (
+                "application/json; charset=utf-16",
+                &utf16le("{\"a\":\"Ravi Kumar\"}"),
+            ),
+            ("text/plain", &text),
+            ("application/x-www-form-urlencoded", &form),
+            ("text/plain; charset=iso-8859-1", &b"Ravi Kumar".to_vec()),
+        ] {
+            let r = refusal(&t, ct, Bytes::copy_from_slice(body));
+            assert_eq!(r.status, 400, "{ct}: {}", r.message);
+            assert!(
+                r.message.starts_with("parda_not_utf8"),
+                "{ct}: {}",
+                r.message
+            );
+        }
+        // UTF-8 and US-ASCII are text.
+        for ct in ["text/plain; charset=UTF-8", "text/plain; charset=us-ascii"] {
+            let out = rewrite(&t, "chatgpt.com", ct, Bytes::from_static(b"hi Ravi Kumar"));
+            assert_eq!(out.counts.get("Person"), Some(&1), "{ct}");
+        }
+        // Untyped, with NULs: binary, forwarded and counted unscanned.
+        let out = rewrite(&t, "chatgpt.com", "", Bytes::from(text.clone()));
+        assert_eq!((out.unscanned, out.body.as_ref()), (1, text.as_slice()));
+        // Multipart text fields in UTF-16 (declared or not) are unscanned.
+        for part_ct in ["text/plain; charset=utf-16le", "text/plain"] {
+            let mut mp = format!(
+                "--BB\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\
+                 Content-Type: {part_ct}\r\n\r\n"
+            )
+            .into_bytes();
+            mp.extend(utf16le("Ravi Kumar ravi@example.com"));
+            mp.extend_from_slice(b"\r\n--BB--\r\n");
+            let out = rewrite(
+                &t,
+                "chatgpt.com",
+                "multipart/form-data; boundary=BB",
+                Bytes::from(mp.clone()),
+            );
+            assert_eq!(
+                (out.unscanned, out.body.as_ref()),
+                (1, mp.as_slice()),
+                "{part_ct}"
+            );
+        }
     }
 
     /// Reviewer probe (M1): serde keeps the last of two equal keys, so the
