@@ -34,7 +34,8 @@
 //! the same path carries it on, or, at a stop event or the end of the
 //! stream, it is flushed into that held event. No event is invented.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::ops::Bound;
 
 use bytes::Bytes;
 use parda_engine::{Engine, StreamRestorer};
@@ -62,6 +63,20 @@ const TEXT_KEY: &str = "\u{0}text";
 const MAX_NESTED_JSON: usize = 4;
 /// Keys whose streamed values are fragments of a JSON document.
 const JSON_DELTA_KEYS: &[&str] = &["partial_json", "arguments"];
+/// The longest restorer key (event name, `index` and JSON path): a leaf
+/// with a longer one is restored on its own, without a stream restorer.
+const MAX_KEY_LEN: usize = 512;
+/// New stream restorers one item may start, at most (its other new leaves
+/// are restored on their own).
+const MAX_NEW_TRACKS: usize = 1024;
+/// Stream restorers kept for a stream before the longest-unused ones that
+/// hold nothing back are dropped (down to half).
+const MAX_TRACKS: usize = 4096;
+/// Bytes of previous values kept for snapshot detection, at most (then the
+/// longest-unused tracks that hold nothing back are dropped, down to half).
+const MAX_RETAINED: usize = 16 * 1024 * 1024;
+/// The longest `index` value that is part of a restorer key.
+const MAX_INDEX_LEN: usize = 32;
 
 /// A rewriter for one response body of type `content_type`.
 pub(crate) fn for_content_type(
@@ -1236,36 +1251,66 @@ fn pointer_mut<'a>(v: &'a mut Value, path: &[Seg]) -> Option<&'a mut Value> {
     Some(cur)
 }
 
-/// The paths of every string leaf of `v`, in document order.
-fn leaf_paths(v: &Value, path: &mut Vec<Seg>, out: &mut Vec<Vec<Seg>>) {
-    match v {
-        Value::String(_) => out.push(path.clone()),
-        Value::Array(items) => {
-            for (i, x) in items.iter().enumerate() {
-                path.push(Seg::Index(i));
-                leaf_paths(x, path, out);
-                path.pop();
-            }
+/// Where a leaf sits, while its restorer key is being built.
+#[derive(Clone, Copy)]
+enum LeafAt<'a> {
+    Json(&'a [Seg]),
+    Data,
+}
+
+impl LeafAt<'_> {
+    fn to_leaf(self) -> Leaf {
+        match self {
+            LeafAt::Json(path) => Leaf::Json(path.to_vec()),
+            LeafAt::Data => Leaf::Data,
         }
-        Value::Object(map) => {
-            for (k, x) in map {
-                path.push(Seg::Key(k.clone()));
-                leaf_paths(x, path, out);
-                path.pop();
-            }
-        }
-        _ => {}
     }
 }
 
-fn render_path(path: &[Seg]) -> String {
-    path.iter()
-        .map(|s| match s {
-            Seg::Key(k) => k.clone(),
-            Seg::Index(i) => i.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+/// A restorer key built while walking a JSON value: a root, then the
+/// path's steps (`~` and `/` escaped as in a JSON pointer), `/`-separated.
+/// Past [`MAX_KEY_LEN`] it stops growing (and is never used).
+struct KeyBuf {
+    key: String,
+    root_len: usize,
+    /// Whether the first step needs a `/` after the root.
+    root_sep: bool,
+}
+
+impl KeyBuf {
+    fn new(root: String, root_sep: bool) -> Self {
+        KeyBuf {
+            root_len: root.len(),
+            key: root,
+            root_sep,
+        }
+    }
+
+    fn too_long(&self) -> bool {
+        self.key.len() > MAX_KEY_LEN
+    }
+
+    /// Add one step; returns the length to truncate back to.
+    fn push(&mut self, step: &str) -> usize {
+        let len = self.key.len();
+        if self.too_long() {
+            return len;
+        }
+        if len > self.root_len || self.root_sep {
+            self.key.push('/');
+        }
+        for c in step.chars() {
+            match c {
+                '~' => self.key.push_str("~0"),
+                '/' => self.key.push_str("~1"),
+                c => self.key.push(c),
+            }
+            if self.too_long() {
+                break;
+            }
+        }
+        len
+    }
 }
 
 /// How a key's successive values relate.
@@ -1293,8 +1338,11 @@ struct Track {
     /// The last raw text pushed (what the restorer may be holding back is a
     /// suffix of it).
     recent: String,
-    /// The item (sequence number) and leaf that hold this key's latest text.
+    /// While text is held back: the item (sequence number) and leaf that
+    /// hold this key's latest text.
     last: Option<(u64, Leaf)>,
+    /// When it was last used (for dropping idle tracks).
+    used: u64,
 }
 
 /// Keep the last `max` bytes of `s` (at a character boundary).
@@ -1327,7 +1375,8 @@ fn held_tag_is_complete(engine: &Engine, scope: &str, track: &Track) -> bool {
 struct Events {
     engine: Engine,
     scope: String,
-    tracks: HashMap<String, Track>,
+    /// Keyed so that a path and everything under it are one range.
+    tracks: BTreeMap<String, Track>,
     /// Keys holding text back.
     pending: HashSet<String>,
     /// Items held back, oldest first; the first has sequence `first_seq`.
@@ -1339,6 +1388,17 @@ struct Events {
     /// chatgpt.com delta encoding: the last patch path and operation.
     last_p: String,
     last_o: Option<String>,
+    /// Pushes so far (the clock of [`Track::used`]).
+    uses: u64,
+    /// Bytes of `prev_raw` and `prev_out` over all tracks.
+    retained: usize,
+    /// Tracks kept before dropping idle ones.
+    track_limit: usize,
+    /// New tracks started by the item being processed.
+    new_in_item: usize,
+    /// Tracks looked at by [`Events::reset`] (tests check the work done).
+    #[cfg(test)]
+    reset_visits: usize,
 }
 
 fn is_patch_event(v: &Value) -> bool {
@@ -1513,16 +1573,6 @@ fn patch_key(p: &str) -> String {
     format!("\u{1}{p}")
 }
 
-fn join_key(key: &str, rel: &str) -> String {
-    if rel.is_empty() {
-        key.to_string()
-    } else if key == "\u{1}" {
-        format!("{key}{rel}")
-    } else {
-        format!("{key}/{rel}")
-    }
-}
-
 fn is_stop(item: &Item, json: Option<&Value>) -> bool {
     item.data == "[DONE]"
         || matches!(item.name(), "done" | "message_stop" | "content_block_stop")
@@ -1542,7 +1592,7 @@ impl Events {
         Events {
             engine: engine.clone(),
             scope: scope.to_string(),
-            tracks: HashMap::new(),
+            tracks: BTreeMap::new(),
             pending: HashSet::new(),
             queue: VecDeque::new(),
             first_seq: 0,
@@ -1550,12 +1600,19 @@ impl Events {
             current: Vec::new(),
             last_p: String::new(),
             last_o: None,
+            uses: 0,
+            retained: 0,
+            track_limit: MAX_TRACKS,
+            new_in_item: 0,
+            #[cfg(test)]
+            reset_visits: 0,
         }
     }
 
     /// Restore one item; returns the items ready to go out, in order.
     fn on_item(&mut self, mut item: Item) -> Vec<Item> {
         let seq = self.first_seq + self.queue.len() as u64;
+        self.new_in_item = 0;
         let looks_json = looks_like_json(&item.data);
         // Parsed as browsers do (a BOM, lone surrogates); JSON-looking data
         // that still does not parse goes out as it came, never restored as
@@ -1577,7 +1634,7 @@ impl Events {
                 && item.data != "[DONE]" =>
             {
                 let mut data = item.data.clone();
-                changed = self.push(TEXT_KEY, seq, Leaf::Data, &mut data, Kind::Delta);
+                changed = self.push(TEXT_KEY, seq, LeafAt::Data, &mut data, Kind::Delta);
                 item.text = Some(data);
             }
             None => {}
@@ -1590,6 +1647,7 @@ impl Events {
         item.changed |= changed;
         self.queued_bytes += item.data.len();
         self.queue.push_back(item);
+        self.evict();
         if !self.pending.is_empty()
             && self.queue.len() < MAX_HELD_EVENTS
             && self.queued_bytes < MAX_HELD_BYTES
@@ -1617,27 +1675,77 @@ impl Events {
         if is_patch_event(v) {
             return self.patch_event(seq, v);
         }
-        let index = v.get("index").map(Value::to_string).unwrap_or_default();
+        // A top-level `index` tells parallel blocks apart; only a short one
+        // is part of the key.
+        let index = match v.get("index") {
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::String(i)) if i.len() <= MAX_INDEX_LEN => format!("{i:?}"),
+            _ => String::new(),
+        };
         let delta = matches!(
             v.get("type").and_then(Value::as_str),
             Some("content_block_delta" | "completion")
         );
-        let prefix = format!("{name}|{index}|");
-        let mut paths = Vec::new();
-        leaf_paths(v, &mut Vec::new(), &mut paths);
-        let mut changed = false;
-        for path in paths {
-            let kind = match path.last() {
-                Some(Seg::Key(k)) if JSON_DELTA_KEYS.contains(&k.as_str()) => Kind::JsonDelta,
-                _ if delta => Kind::Delta,
-                _ => Kind::Auto,
-            };
-            let key = format!("{prefix}{}", render_path(&path));
-            if let Some(Value::String(s)) = pointer_mut(v, &path) {
-                changed |= self.push(&key, seq, Leaf::Json(path), s, kind);
+        let kind = move |last: Option<&str>| match last {
+            Some(k) if JSON_DELTA_KEYS.contains(&k) => Kind::JsonDelta,
+            _ if delta => Kind::Delta,
+            _ => Kind::Auto,
+        };
+        let mut key = KeyBuf::new(format!("{name}|{index}|"), false);
+        self.walk(seq, v, &mut key, &mut Vec::new(), &kind)
+    }
+
+    /// Restore the string leaves under `v`, whose restorer key is `key` and
+    /// whose place in the item is `path` (both as they came on return);
+    /// `kind` tells a leaf's kind from its last key. A leaf whose key is
+    /// too long, or that would start a track past the item's share, is
+    /// restored on its own.
+    fn walk(
+        &mut self,
+        seq: u64,
+        v: &mut Value,
+        key: &mut KeyBuf,
+        path: &mut Vec<Seg>,
+        kind: &dyn Fn(Option<&str>) -> Kind,
+    ) -> bool {
+        match v {
+            Value::String(s) => {
+                let last = match path.last() {
+                    Some(Seg::Key(k)) => Some(k.as_str()),
+                    _ => None,
+                };
+                let kind = kind(last);
+                if key.too_long()
+                    || (self.new_in_item >= MAX_NEW_TRACKS && !self.tracks.contains_key(&key.key))
+                {
+                    return restore_string(&self.engine, &self.scope, s, 0);
+                }
+                self.push(&key.key, seq, LeafAt::Json(path), s, kind)
             }
+            Value::Array(items) => {
+                let mut changed = false;
+                for (i, x) in items.iter_mut().enumerate() {
+                    let len = key.push(&i.to_string());
+                    path.push(Seg::Index(i));
+                    changed |= self.walk(seq, x, key, path, kind);
+                    path.pop();
+                    key.key.truncate(len);
+                }
+                changed
+            }
+            Value::Object(map) => {
+                let mut changed = false;
+                for (k, x) in map.iter_mut() {
+                    let len = key.push(k);
+                    path.push(Seg::Key(k.clone()));
+                    changed |= self.walk(seq, x, key, path, kind);
+                    path.pop();
+                    key.key.truncate(len);
+                }
+                changed
+            }
+            _ => false,
         }
-        changed
     }
 
     /// chatgpt.com delta encoding: `{"p": path, "o": op, "v": value}`,
@@ -1699,63 +1807,98 @@ impl Events {
     }
 
     fn apply_op(&mut self, seq: u64, base: Vec<Seg>, p: &str, op: &str, v: &mut Value) -> bool {
-        let key = patch_key(p);
+        let root = patch_key(p);
         if matches!(op, "add" | "replace" | "set") {
             // A new value replaces the old one (and everything under it).
             // Any other op (`append`, or one parda does not know, such as
             // `truncate`) keeps the text's state.
-            self.reset(&key, seq);
+            self.reset(&root, seq);
         }
-        match v {
-            Value::String(s) => self.push(&key, seq, Leaf::Json(base), s, Kind::Patch),
-            Value::Object(_) | Value::Array(_) => {
-                let mut paths = Vec::new();
-                leaf_paths(v, &mut Vec::new(), &mut paths);
-                let mut changed = false;
-                for rel in paths {
-                    let k = join_key(&key, &render_path(&rel));
-                    let mut full = base.clone();
-                    full.extend(rel.iter().cloned());
-                    if let Some(Value::String(s)) = pointer_mut(v, &rel) {
-                        changed |= self.push(&k, seq, Leaf::Json(full), s, Kind::Patch);
-                    }
-                }
-                changed
+        let mut key = KeyBuf::new(root, !p.is_empty());
+        let mut path = base;
+        self.walk(seq, v, &mut key, &mut path, &|_| Kind::Patch)
+    }
+
+    /// Flush and forget `key` and every key under it (a range of keys:
+    /// only those are looked at).
+    fn reset(&mut self, key: &str, seq: u64) {
+        let mut keys: Vec<String> = Vec::new();
+        if key == "\u{1}" {
+            // The root patch path: every patch path.
+            keys.extend(
+                self.tracks
+                    .range::<str, _>((Bound::Included("\u{1}"), Bound::Excluded("\u{2}")))
+                    .map(|(k, _)| k.clone()),
+            );
+        } else {
+            if self.tracks.contains_key(key) {
+                keys.push(key.to_string());
             }
-            _ => false,
+            // `key/…`: from `key/` up to `key0` (`0` follows `/`).
+            let (lo, hi) = (format!("{key}/"), format!("{key}0"));
+            keys.extend(
+                self.tracks
+                    .range::<str, _>((Bound::Included(lo.as_str()), Bound::Excluded(hi.as_str())))
+                    .map(|(k, _)| k.clone()),
+            );
+        }
+        #[cfg(test)]
+        {
+            self.reset_visits += keys.len();
+        }
+        for k in keys {
+            self.flush_key(&k, seq);
+            self.drop_track(&k);
         }
     }
 
-    /// Flush and forget `key` and every key under it.
-    fn reset(&mut self, key: &str, seq: u64) {
-        let under = format!("{key}/");
-        let keys: Vec<String> = self
-            .tracks
-            .keys()
-            .filter(|k| {
-                if key == "\u{1}" {
-                    k.starts_with(key)
-                } else {
-                    *k == key || k.starts_with(&under)
-                }
-            })
-            .cloned()
-            .collect();
-        for k in keys {
-            self.flush_key(&k, seq);
-            self.tracks.remove(&k);
+    /// Forget one track.
+    fn drop_track(&mut self, key: &str) {
+        self.pending.remove(key);
+        if let Some(t) = self.tracks.remove(key) {
+            self.retained -= t.prev_raw.len() + t.prev_out.len();
         }
+    }
+
+    /// Keep the stream's state bounded: past [`MAX_TRACKS`] tracks (or
+    /// [`MAX_RETAINED`] bytes of previous values), drop the longest-unused
+    /// tracks that hold nothing back, down to half. A dropped track starts
+    /// afresh if its key comes back.
+    fn evict(&mut self) {
+        if self.tracks.len() <= self.track_limit && self.retained <= MAX_RETAINED {
+            return;
+        }
+        let mut idle: Vec<(u64, String)> = self
+            .tracks
+            .iter()
+            .filter(|(k, t)| t.restorer.pending_len() == 0 && !self.pending.contains(*k))
+            .map(|(k, t)| (t.used, k.clone()))
+            .collect();
+        idle.sort_unstable();
+        for (_, k) in idle {
+            if self.tracks.len() <= MAX_TRACKS / 2 && self.retained <= MAX_RETAINED / 2 {
+                break;
+            }
+            self.drop_track(&k);
+        }
+        self.track_limit = MAX_TRACKS.max(2 * self.tracks.len());
     }
 
     /// Restore `s` (the value of `key` in item `seq`, at `leaf`) in place.
-    fn push(&mut self, key: &str, seq: u64, leaf: Leaf, s: &mut String, kind: Kind) -> bool {
+    fn push(&mut self, key: &str, seq: u64, leaf: LeafAt<'_>, s: &mut String, kind: Kind) -> bool {
+        self.uses += 1;
         let Events {
             engine,
             scope,
             tracks,
+            uses,
+            new_in_item,
             ..
         } = self;
         let fresh = !tracks.contains_key(key);
+        if fresh {
+            *new_in_item += 1;
+        }
         // JSON text arriving in pieces is restored with JSON escaping, never
         // as plain text; under a key parda does not know (or a patch path)
         // the text's start tells which it is.
@@ -1770,7 +1913,9 @@ impl Events {
             prev_out: String::new(),
             recent: String::new(),
             last: None,
+            used: *uses,
         });
+        track.used = *uses;
         let whole_json = matches!(track.kind, Kind::Auto) || (track.kind == Kind::Patch && fresh);
         if whole_json && json_container(s).is_some() {
             // A JSON document in a string, sent whole: restored at its own
@@ -1809,13 +1954,16 @@ impl Events {
             track.restorer.push(&raw)
         };
         if track.kind == Kind::Auto {
+            self.retained -= track.prev_raw.len() + track.prev_out.len();
             track.prev_raw.clone_from(&raw);
             track.prev_out.clone_from(&out);
+            self.retained += track.prev_raw.len() + track.prev_out.len();
         }
-        track.last = Some((seq, leaf));
         if track.restorer.pending_len() > 0 {
+            track.last = Some((seq, leaf.to_leaf()));
             self.pending.insert(key.to_string());
         } else {
+            track.last = None;
             self.pending.remove(key);
         }
         let changed = out != raw;
@@ -1837,6 +1985,7 @@ impl Events {
         }
         if track.kind == Kind::Auto {
             track.prev_out.push_str(&tail);
+            self.retained += tail.len();
         }
         let Some((seq, leaf)) = track.last.clone() else {
             return;
@@ -2308,6 +2457,116 @@ mod tests {
         let text = chatgpt_text(&run(&e, "text/event-stream", &body, 7));
         let v: Value = serde_json::from_str(&text).unwrap_or_else(|err| panic!("{err}: {text}"));
         assert_eq!(v["content"], want);
+    }
+
+    fn data_item(data: String) -> Item {
+        Item::sse(SseEvent::new(None, data))
+    }
+
+    /// Review finding: one item with thousands of leaves under a long key
+    /// (or a large `index` value) made a restorer key and a path per leaf,
+    /// each copying that key: memory and work grew with leaves x key length.
+    /// Keys stay short and their number per item bounded; the item still
+    /// goes out as it came, its tags restored.
+    #[test]
+    fn many_leaves_under_a_long_key_take_bounded_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let long = "K".repeat(20_000);
+        let mut inner = serde_json::Map::new();
+        for i in 0..3000 {
+            inner.insert(format!("{i}"), json!("a"));
+        }
+        inner.insert("tag".into(), json!("[NAME_1]"));
+        let mut idx = serde_json::Map::new();
+        for i in 0..3000 {
+            idx.insert(format!("k{i}"), json!("a"));
+        }
+        for doc in [
+            json!({ long.clone(): Value::Object(inner.clone()) }),
+            json!({"index": Value::Object(idx), "t": "[NAME_1]"}),
+        ] {
+            let data = doc.to_string();
+            let mut ev = Events::new(&e, SCOPE);
+            let out = ev.on_item(data_item(data.clone()));
+            let out: Vec<Bytes> = out
+                .into_iter()
+                .chain(ev.finish())
+                .map(Item::render)
+                .collect();
+            let got: Value = serde_json::from_str(&datas(&out.concat())[0]).unwrap();
+            let want: Value =
+                serde_json::from_str(&data.replace("[NAME_1]", "Ravi Kumar")).unwrap();
+            assert_eq!(got, want);
+            let key_bytes: usize = ev.tracks.keys().map(String::len).sum();
+            assert!(
+                key_bytes <= 1024 * 1024 && ev.tracks.len() <= 4096,
+                "{} tracks, {key_bytes} key bytes",
+                ev.tracks.len()
+            );
+        }
+    }
+
+    /// Review finding: tracks were kept for the whole stream (each Auto
+    /// track with copies of its last value), and every add/replace op
+    /// looked at every track. State stays bounded and resets look only at
+    /// the keys under the path.
+    #[test]
+    fn stream_state_stays_bounded_and_resets_are_cheap() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        // Many distinct keys (small values), then a few large values: the
+        // number of tracks and the bytes of previous values kept are
+        // bounded, and every event still goes out as it came.
+        let small = "y".repeat(100);
+        let large = "z".repeat(1024 * 1024);
+        let mut ev = Events::new(&e, SCOPE);
+        for i in 0..20_012 {
+            let value = if i < 20_000 { &small } else { &large };
+            let data = json!({ format!("k{i}"): value }).to_string();
+            let out = ev.on_item(data_item(data.clone()));
+            let out: Vec<Bytes> = out.into_iter().map(Item::render).collect();
+            assert_eq!(datas(&out.concat()), [data]);
+            if i % 1000 == 0 || i >= 20_000 {
+                let retained: usize = ev
+                    .tracks
+                    .values()
+                    .map(|t| t.prev_raw.len() + t.prev_out.len())
+                    .sum();
+                assert_eq!(retained, ev.retained, "event {i}");
+            }
+            assert!(
+                ev.tracks.len() <= 8192 && ev.retained <= 16 * 1024 * 1024,
+                "event {i}: {} tracks, {} bytes",
+                ev.tracks.len(),
+                ev.retained
+            );
+        }
+        // chatgpt.com adds at distinct paths: each reset looks at the keys
+        // under its path only.
+        let mut ev = Events::new(&e, SCOPE);
+        let n = 5000;
+        for i in 0..n {
+            let data = json!({"p": format!("/m/{i}"), "o": "add", "v": "x"}).to_string();
+            let _ = ev.on_item(data_item(data));
+        }
+        assert!(
+            ev.reset_visits <= 4 * n,
+            "{} tracks looked at",
+            ev.reset_visits
+        );
+        // A reset still forgets the path and everything under it, and only
+        // that.
+        let mut ev = Events::new(&e, SCOPE);
+        for p in ["/m", "/m/0", "/m/0/a", "/m0", "/n"] {
+            let data = json!({"p": p, "o": "append", "v": "x"}).to_string();
+            let _ = ev.on_item(data_item(data));
+        }
+        let data = json!({"p": "/m", "o": "add", "v": {"0": "y"}}).to_string();
+        let _ = ev.on_item(data_item(data));
+        let mut keys: Vec<&str> = ev.tracks.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["\u{1}m/0", "\u{1}m0", "\u{1}n"]);
     }
 
     #[test]
