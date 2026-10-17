@@ -117,19 +117,25 @@ Tags follow `replace.style` (there is no separate style for intercept).
 **The listener** runs inside the daemon while `enabled = true`, and only with the root certificate
 from `parda ca create` (parda never creates one on its own; without it the daemon warns "no CA" and
 does not listen). It binds `listen` (loopback only), writes the address it got to `intercept.addr` in
-the runtime folder and serves the PAC file at `http://<listen>/parda.pac`. Every change applies at
-once, without a daemon restart: `hosts`, `scope`, `unscanned` and `skip_keys` go to the running
-listener (a site *added* to `hosts` is filtered only once your browsers and the OS fetch the PAC file
-again — restart the browser, or `parda intercept off` then `parda intercept on`; until then it may go
-there direct, and the daemon says so); `enabled`, `listen` or a replaced certificate start, stop or move it (the daemon checks
-the certificate file every 2 s and before each status answer, so `parda ca create --force` needs no
-reload). `parda ca uninstall` is refused while intercept is in use (`parda intercept off` first).
-A new `listen` moves the listener, but the system proxy keeps the PAC address `parda intercept on`
-set: run `parda intercept on` again after changing it (the daemon, `parda status`, `parda intercept
-status`, `parda doctor` and the TUI warn that AI sites fail to load until you do). The TUI dashboard
-(and the daemon's status) shows whether it listens and whether the system proxy points at it; if the system proxy
-still points at parda while nothing listens, AI sites fail to load (by design: they are never sent
-unfiltered) — run `parda intercept off` to restore your previous settings.
+the runtime folder and serves the PAC file at `http://<listen>/parda.pac`. Changes apply without a
+daemon restart:
+
+- `hosts`, `scope`, `unscanned` and `skip_keys` go to the running listener. A site *added* to
+  `hosts` is filtered only once your browsers and the OS fetch the PAC file again (restart the
+  browser, or `parda intercept off` then `parda intercept on`); until then it may go there direct,
+  and the daemon warns about it.
+- `enabled` starts or stops the listener. `listen` moves it — but the system proxy keeps the PAC
+  address `parda intercept on` set, so run `parda intercept on` again after changing it (the daemon,
+  `parda status`, `parda intercept status`, `parda doctor` and the TUI warn that AI sites fail to load
+  until you do).
+- A replaced certificate (`parda ca create --force`) restarts the listener: the daemon checks the
+  file every 2 s and before each status answer. `parda ca uninstall` is refused while intercept is in
+  use — `parda intercept off` first.
+
+The TUI dashboard (and the daemon's status) shows whether it listens and whether the system proxy
+points at it; if the system proxy still points at parda while nothing listens, AI sites fail to load
+(by design: they are never sent unfiltered) — run `parda intercept off` to restore your previous
+settings.
 
 ## Changing settings
 
