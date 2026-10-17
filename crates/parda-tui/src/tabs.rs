@@ -448,6 +448,14 @@ fn intercept_line(it: &Value) -> Option<Line<'static>> {
     let warn = Style::default().fg(Color::Yellow);
     let bad = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     let (msg, style) = match (it["listening"].as_str(), it["error"].as_str()) {
+        (Some(addr), _) if pac_set && it["pac_matches"].as_bool() == Some(false) => (
+            format!(
+                "on · {addr} · system proxy points at {} — AI sites fail to load; run parda \
+                 intercept on",
+                it["pac"].as_str().unwrap_or_default()
+            ),
+            bad,
+        ),
         (Some(addr), _) if pac_set => (
             format!("on · {addr} · system proxy set"),
             Style::default().fg(INTERCEPT),
@@ -1149,6 +1157,11 @@ mod tests {
                 json!({"enabled": false, "listening": null, "ca": true, "error": null,
                        "pac": "http://127.0.0.1:8788/parda.pac"}),
                 "OFF but the system proxy",
+            ),
+            (
+                json!({"enabled": true, "listening": "127.0.0.1:9999", "ca": true, "error": null,
+                       "pac": "http://127.0.0.1:8788/parda.pac", "pac_matches": false}),
+                "sites fail to load; run parda intercept on",
             ),
         ] {
             st["intercept"] = intercept;

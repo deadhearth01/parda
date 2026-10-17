@@ -573,6 +573,13 @@ impl App {
 /// What switching intercept on did, from the daemon's answer.
 fn intercept_message(it: &Value) -> String {
     match (it["listening"].as_str(), it["error"].as_str()) {
+        (Some(addr), _) if it["pac"].is_string() && it["pac_matches"].as_bool() == Some(false) => {
+            format!(
+                "intercept listening on {addr}, but the system proxy points at {} — AI sites \
+                 fail to load; run `parda intercept on` again",
+                it["pac"].as_str().unwrap_or_default()
+            )
+        }
         (Some(addr), _) if it["pac"].is_string() => format!("intercept listening on {addr}"),
         (Some(addr), _) => format!(
             "intercept listening on {addr} — run `parda intercept on` to send AI sites through it"
@@ -600,6 +607,13 @@ mod intercept_message_tests {
         assert_eq!(
             intercept_message(&failed),
             "saved, but not listening — intercept: no CA"
+        );
+        let moved = json!({"listening": "127.0.0.1:9999", "pac": "http://127.0.0.1:8788/parda.pac",
+                           "pac_matches": false});
+        let m = intercept_message(&moved);
+        assert!(
+            m.contains("127.0.0.1:9999") && m.contains("parda intercept on"),
+            "{m}"
         );
         // An older daemon says nothing about it.
         assert_eq!(intercept_message(&json!(null)), "saved and applied");

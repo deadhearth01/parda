@@ -454,3 +454,66 @@ async fn a_replaced_ca_is_picked_up_without_a_reload() {
     );
     stop(&paths, daemon).await;
 }
+
+/// A loopback port nothing listens on.
+async fn free_port() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listener_moved_away_from_the_system_pac_is_flagged() {
+    let at = free_port().await;
+    let pac_url = format!("http://{at}/parda.pac");
+    let (_home, paths) = home_with(&section(true, &at.to_string(), "[\"chat.test\"]", "allow"));
+    ca_store::create_ca(&paths, false, false).unwrap();
+    // `parda intercept on` pointed the system at this address.
+    write_private(
+        &paths.data_dir.join("intercept-state.json"),
+        &format!(r#"{{"platform":"MacOs","pac_url":"{pac_url}","saved":[]}}"#),
+    )
+    .unwrap();
+    let daemon = tokio::spawn(run(paths.clone(), ALL));
+    let st = status(&paths).await;
+    assert_eq!(listening(&st), Some(at));
+    assert_eq!(st["intercept"]["pac_matches"], true);
+    let moved = |st: &Value| {
+        recent(st).into_iter().find(|e| {
+            e["level"] == "warn"
+                && e["summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("parda intercept on")
+        })
+    };
+    assert!(moved(&st).is_none(), "{st}");
+
+    // intercept.listen changes live; the system still fetches the old PAC.
+    let other = free_port().await;
+    let res = set_config(
+        &paths,
+        section(true, &other.to_string(), "[\"chat.test\"]", "allow"),
+    )
+    .await;
+    assert_eq!(res["intercept"]["listening"], other.to_string());
+    assert_eq!(res["intercept"]["pac_matches"], false);
+    let st = status(&paths).await;
+    assert_eq!(st["intercept"]["pac_matches"], false);
+    let warn = moved(&st).expect("a warning event");
+    let summary = warn["summary"].as_str().unwrap();
+    assert!(
+        summary.contains(&pac_url) && summary.contains(&other.to_string()),
+        "{summary}"
+    );
+
+    // No PAC set: nothing to compare.
+    std::fs::remove_file(paths.data_dir.join("intercept-state.json")).unwrap();
+    assert_eq!(
+        status(&paths).await["intercept"]["pac_matches"],
+        Value::Null
+    );
+    stop(&paths, daemon).await;
+}

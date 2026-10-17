@@ -85,6 +85,29 @@ pub fn is_parda_pac(url: &str, pac_url: &str) -> bool {
     path == "parda.pac" && matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
+/// Whether the parda PAC at `url` is served by a listener bound to `addr`:
+/// same port, and the same loopback address (`localhost` matches either).
+/// A PAC left on an old port makes AI sites fail to load.
+pub fn pac_points_at(url: &str, addr: std::net::SocketAddr) -> bool {
+    let Some(authority) = url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.strip_suffix("/parda.pac"))
+    else {
+        return false;
+    };
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return false;
+    };
+    if port.parse::<u16>().ok() != Some(addr.port()) {
+        return false;
+    }
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return addr.ip().is_loopback();
+    }
+    host.parse::<std::net::IpAddr>().ok() == Some(addr.ip())
+}
+
 /// A setting that already points at parda is not an "original" setting.
 fn forget_ours(mut s: Saved, pac_url: &str) -> Saved {
     if s.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url)) {
@@ -1011,6 +1034,20 @@ mod tests {
                 .is_empty()
         );
         assert!(writes(&os).is_empty(), "{:?}", os.calls);
+    }
+
+    #[test]
+    fn a_pac_points_at_the_listener_only_with_its_port_and_address() {
+        let at = |u: &str, a: &str| pac_points_at(u, a.parse().unwrap());
+        assert!(at(PAC, "127.0.0.1:8788"));
+        assert!(!at(PAC, "127.0.0.1:9999"), "another port");
+        assert!(at("http://localhost:8788/parda.pac", "127.0.0.1:8788"));
+        assert!(at("http://localhost:8788/parda.pac", "[::1]:8788"));
+        assert!(at("http://[::1]:8788/parda.pac", "[::1]:8788"));
+        assert!(!at("http://[::1]:8788/parda.pac", "127.0.0.1:8788"));
+        assert!(!at("http://127.0.0.1/parda.pac", "127.0.0.1:80"), "no port");
+        assert!(!at("http://corp:8788/parda.pac", "127.0.0.1:8788"));
+        assert!(!at("http://127.0.0.1:8788/other.pac", "127.0.0.1:8788"));
     }
 
     #[test]

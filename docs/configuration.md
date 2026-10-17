@@ -121,7 +121,10 @@ the runtime folder and serves the PAC file at `http://<listen>/parda.pac`. Every
 once, without a daemon restart: `hosts`, `scope`, `unscanned` and `skip_keys` go to the running
 listener; `enabled`, `listen` or a replaced certificate start, stop or move it (the daemon checks
 the certificate file every 2 s and before each status answer, so `parda ca create --force` needs no
-reload). `parda ca uninstall` is refused while intercept is in use (`parda intercept off` first). The TUI dashboard
+reload). `parda ca uninstall` is refused while intercept is in use (`parda intercept off` first).
+A new `listen` moves the listener, but the system proxy keeps the PAC address `parda intercept on`
+set: run `parda intercept on` again after changing it (the daemon, `parda status`, `parda intercept
+status`, `parda doctor` and the TUI warn that AI sites fail to load until you do). The TUI dashboard
 (and the daemon's status) shows whether it listens and whether the system proxy points at it; if the system proxy
 still points at parda while nothing listens, AI sites fail to load (by design: they are never sent
 unfiltered) — run `parda intercept off` to restore your previous settings.

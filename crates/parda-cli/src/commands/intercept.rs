@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use anyhow::{Context, anyhow, bail};
 use parda_core::Config;
 use parda_daemon::ca_store::{ca_cert_path, ca_exists};
-use parda_daemon::sysproxy::{self, Platform, Runner, Saved, SystemRunner};
+use parda_daemon::sysproxy::{self, Current, Platform, Runner, Saved, SystemRunner};
 use parda_daemon::{Paths, cert_trust, load_config, write_private};
 use parda_ipc::Request;
 use serde_json::Value;
@@ -416,6 +416,43 @@ fn known_pac(paths: &Paths, config: &Config) -> String {
         .unwrap_or_default()
 }
 
+/// Settings that send AI sites to a parda PAC the listener at `listening`
+/// does not serve (another port: `intercept.listen` changed after `on`), as
+/// `(target, url)`. Empty when nothing listens (that has its own warning).
+fn served_elsewhere(
+    platform: Platform,
+    now: &[Current],
+    listening: Option<&str>,
+) -> Vec<(String, String)> {
+    let Some(addr) = listening.and_then(|a| a.parse::<SocketAddr>().ok()) else {
+        return Vec::new();
+    };
+    now.iter()
+        .filter(|c| c.parda)
+        .filter_map(|c| {
+            let url = c.url.as_deref()?;
+            (!sysproxy::pac_points_at(url, addr))
+                .then(|| (target_label(platform, &c.target), url.to_string()))
+        })
+        .collect()
+}
+
+/// The warning for [`served_elsewhere`].
+fn elsewhere_warning(elsewhere: &[(String, String)], listening: &str) -> String {
+    let urls: std::collections::BTreeSet<&str> =
+        elsewhere.iter().map(|(_, u)| u.as_str()).collect();
+    format!(
+        "{} use {}, but parda listens on {listening} — AI sites fail to load; run `parda \
+         intercept on` again",
+        elsewhere
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        urls.into_iter().collect::<Vec<_>>().join(", ")
+    )
+}
+
 const FAIL_TO_LOAD: &str = "AI sites will fail to load — start the daemon or run `parda \
                             intercept off`";
 
@@ -455,9 +492,11 @@ pub fn status(cx: &mut Ctx) -> anyhow::Result<()> {
     }
     let pac = known_pac(cx.paths, &config);
     let mut pointed = false;
+    let mut elsewhere = Vec::new();
     match sysproxy::inspect(cx.runner, cx.platform, &pac) {
         Ok(now) => {
             pointed = now.iter().any(|c| c.parda);
+            elsewhere = served_elsewhere(cx.platform, &now, listening.as_deref());
             writeln!(
                 cx.out,
                 "system proxy: {}",
@@ -509,6 +548,9 @@ pub fn status(cx: &mut Ctx) -> anyhow::Result<()> {
     if pointed && listening.is_none() {
         writeln!(cx.out, "! {FAIL_TO_LOAD}")?;
     }
+    if let (false, Some(addr)) = (elsewhere.is_empty(), &listening) {
+        writeln!(cx.out, "! {}", elsewhere_warning(&elsewhere, addr))?;
+    }
     Ok(())
 }
 
@@ -555,6 +597,12 @@ pub fn doctor_checks(
                 .collect()
         })
         .unwrap_or_default();
+    let intercept = daemon_status.map(|s| &s["intercept"]);
+    let listening = intercept.and_then(|i| i["listening"].as_str());
+    let elsewhere = now
+        .as_ref()
+        .map(|v| served_elsewhere(platform, v, listening))
+        .unwrap_or_default();
     let in_use = enabled || !pointed.is_empty();
 
     let (ca, line) = certificate_line(paths, runner, platform);
@@ -565,8 +613,6 @@ pub fn doctor_checks(
     };
     add(ca_level, "certificate", line);
 
-    let intercept = daemon_status.map(|s| &s["intercept"]);
-    let listening = intercept.and_then(|i| i["listening"].as_str());
     match (enabled, intercept, listening) {
         (false, _, _) => add(
             Level::Info,
@@ -605,6 +651,11 @@ pub fn doctor_checks(
                 "{} send AI sites to parda but nothing listens: {FAIL_TO_LOAD}",
                 pointed.join(", ")
             ),
+        ),
+        Ok(_) if !elsewhere.is_empty() => add(
+            Level::Warn,
+            "system proxy",
+            elsewhere_warning(&elsewhere, listening.unwrap_or_default()),
         ),
         Ok(_) if !pointed.is_empty() => add(
             Level::Ok,
@@ -720,6 +771,8 @@ mod tests {
         config: Config,
         error: Option<String>,
         sets: usize,
+        /// Where its listener is.
+        addr: &'static str,
     }
 
     impl FakeDaemon {
@@ -728,6 +781,7 @@ mod tests {
                 config,
                 error: None,
                 sets: 0,
+                addr: "127.0.0.1:8788",
             }
         }
 
@@ -735,7 +789,7 @@ mod tests {
             let on = self.config.intercept.enabled;
             json!({
                 "enabled": on,
-                "listening": (on && self.error.is_none()).then_some("127.0.0.1:8788"),
+                "listening": (on && self.error.is_none()).then_some(self.addr),
                 "ca": true,
                 "error": if on { self.error.clone() } else { None },
                 "pac": null,
@@ -1179,6 +1233,36 @@ mod tests {
         let up = checks(&p, &mut os, Some(&running));
         assert!(up.iter().all(|c| c.level != Level::Warn), "{up:?}");
         assert!(up.iter().any(|c| c.detail.contains("trusted")), "{up:?}");
+    }
+
+    #[test]
+    fn status_and_doctor_flag_a_system_pac_on_another_port_than_the_listener() {
+        let (_d, p) = home_with_ca();
+        let mut os = Mac::new(true);
+        let mut daemon = FakeDaemon::new(load_config(&p).unwrap());
+        exec(&p, &mut os, Some(&mut daemon), on).0.unwrap();
+        // intercept.listen moved to 9999 afterwards; the system still uses 8788.
+        daemon.addr = "127.0.0.1:9999";
+        let (r, out) = exec(&p, &mut os, Some(&mut daemon), status);
+        r.unwrap();
+        assert!(
+            out.contains("! ") && out.contains("127.0.0.1:9999") && out.contains("fail to load"),
+            "{out}"
+        );
+        assert!(out.contains("parda intercept on"), "{out}");
+        let st = daemon.call(Request::Status).unwrap();
+        let c = checks(&p, &mut os, Some(&st));
+        let warn = c
+            .iter()
+            .find(|c| c.level == Level::Warn && c.what == "system proxy")
+            .unwrap_or_else(|| panic!("{c:?}"));
+        assert!(
+            warn.detail.contains("8788")
+                && warn.detail.contains("9999")
+                && warn.detail.contains("parda intercept on"),
+            "{warn:?}"
+        );
+        assert!(os.writes().iter().all(|w| !w.contains("9999")));
     }
 
     #[test]

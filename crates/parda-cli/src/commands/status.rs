@@ -109,6 +109,11 @@ fn intercept_line(i: &serde_json::Value) -> Option<String> {
             i["enabled"].as_bool() == Some(true),
             i["listening"].as_str(),
         ) {
+            (_, Some(addr)) if pac && i["pac_matches"].as_bool() == Some(false) => format!(
+                "listening on {addr}, but the system proxy points at {} — AI sites fail to \
+                 load; run `parda intercept on` again",
+                i["pac"].as_str().unwrap_or_default()
+            ),
             (_, Some(addr)) if pac => format!("on, filtering AI sites on {addr}"),
             (_, Some(addr)) => format!(
                 "listening on {addr}, but the system proxy is not set — `parda intercept on`"
@@ -181,5 +186,17 @@ mod tests {
         let stale =
             intercept_line(&json!({"enabled": false, "listening": null, "pac": pac})).unwrap();
         assert!(stale.contains("parda intercept off"), "{stale}");
+        let moved = intercept_line(&json!({"enabled": true, "listening": "127.0.0.1:9999",
+                                           "pac": pac, "pac_matches": false}))
+        .unwrap();
+        assert!(
+            moved.contains(pac) && moved.contains("127.0.0.1:9999"),
+            "{moved}"
+        );
+        assert!(
+            moved.contains("fail to load") && moved.contains("parda intercept on"),
+            "{moved}"
+        );
+        assert!(!moved.contains("filtering"), "{moved}");
     }
 }

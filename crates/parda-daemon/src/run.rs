@@ -492,6 +492,7 @@ impl Shared {
         match self.start_intercept(config, stopped) {
             Ok(run) => {
                 *lock(&self.intercept_error) = None;
+                self.warn_if_pac_elsewhere(run.addr);
                 *slot = Some(run);
             }
             Err(why) => {
@@ -542,6 +543,24 @@ impl Shared {
                     "intercept: the system proxy still sends AI sites to parda ({}) but \
                      nothing is listening — they will fail to load until intercept is on \
                      again; `parda intercept off` restores your previous settings",
+                    state.pac_url
+                ),
+                true,
+            ));
+        }
+    }
+
+    /// The system proxy sends AI sites to a parda PAC on another address
+    /// than this listener (`intercept.listen` changed after `parda intercept
+    /// on`): nothing serves it, so they fail to load. Say so.
+    fn warn_if_pac_elsewhere(&self, addr: SocketAddr) {
+        if let Ok(Some(state)) = sysproxy::load_state(&self.paths)
+            && !sysproxy::pac_points_at(&state.pac_url, addr)
+        {
+            self.emit(intercept_notice(
+                format!(
+                    "intercept: the system proxy still points at {} but parda now listens on \
+                     {addr} — AI sites fail to load; run `parda intercept on` again",
                     state.pac_url
                 ),
                 true,
@@ -634,23 +653,31 @@ impl Shared {
         run.task
     }
 
-    /// `"intercept"` in the status: listener address, CA present, and why
-    /// it is not listening.
+    /// `"intercept"` in the status: listener address, CA present, why it is
+    /// not listening, the PAC `parda intercept on` set and whether this
+    /// listener serves it.
     fn intercept_status(&self, config: &Config) -> Value {
         let listening = lock(&self.intercept)
             .as_ref()
             .filter(|r| !r.task.is_finished())
-            .map(|r| r.addr.to_string());
+            .map(|r| r.addr);
         let pac = sysproxy::load_state(&self.paths)
             .ok()
             .flatten()
             .map(|s| s.pac_url);
+        // Whether the system PAC is served by this listener (null when
+        // either is missing).
+        let pac_matches = match (&pac, listening) {
+            (Some(url), Some(addr)) => Some(sysproxy::pac_points_at(url, addr)),
+            _ => None,
+        };
         json!({
             "enabled": config.intercept.enabled,
-            "listening": listening,
+            "listening": listening.map(|a| a.to_string()),
             "ca": ca_store::ca_exists(&self.paths),
             "error": *lock(&self.intercept_error),
             "pac": pac,
+            "pac_matches": pac_matches,
         })
     }
 }
