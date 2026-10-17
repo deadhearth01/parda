@@ -2987,6 +2987,7 @@ dependencies = [
  "parda-detect",
  "parda-engine",
  "ruzstd",
+ "serde",
  "serde_json",
  "tempfile",
 ]
