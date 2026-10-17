@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
-use crate::events::{self, Activity, emit, intercept_notice};
+use crate::events::{self, Activity, emit, intercept_notice, notify};
 use crate::paths::{Paths, load_config, load_rules, write_private};
 use crate::{ca_store, sysproxy};
 
@@ -456,8 +456,10 @@ fn bind_loopback(listen: &str, retry: bool) -> Result<std::net::TcpListener, Str
 }
 
 impl Shared {
-    fn emit(&self, e: Event) {
-        emit(&self.events, &self.activity, e);
+    /// A daemon notice: on the feed and in the recent history, never in the
+    /// activity totals.
+    fn notice(&self, e: Event) {
+        notify(&self.events, &self.activity, e);
     }
 
     /// Make the intercept listener match `config`: start it, restart it (a
@@ -500,7 +502,7 @@ impl Shared {
                 let mut last = lock(&self.intercept_error);
                 // Say it once, not on every reload.
                 if last.as_deref() != Some(why.as_str()) {
-                    self.emit(intercept_notice(why.clone(), true));
+                    self.notice(intercept_notice(why.clone(), true));
                     *last = Some(why);
                     drop(last);
                     self.warn_if_pac_set();
@@ -538,7 +540,7 @@ impl Shared {
     /// listens: say so (they fail to load rather than go out unfiltered).
     fn warn_if_pac_set(&self) {
         if let Ok(Some(state)) = sysproxy::load_state(&self.paths) {
-            self.emit(intercept_notice(
+            self.notice(intercept_notice(
                 format!(
                     "intercept: the system proxy still sends AI sites to parda ({}) but \
                      nothing is listening — they will fail to load until intercept is on \
@@ -557,7 +559,7 @@ impl Shared {
         if let Ok(Some(state)) = sysproxy::load_state(&self.paths)
             && !sysproxy::pac_points_at(&state.pac_url, addr)
         {
-            self.emit(intercept_notice(
+            self.notice(intercept_notice(
                 format!(
                     "intercept: the system proxy still points at {} but parda now listens on \
                      {addr} — AI sites fail to load; run `parda intercept on` again",
@@ -626,7 +628,7 @@ impl Shared {
             }
         }));
         tracing::info!(%addr, sites, "intercept listening");
-        self.emit(intercept_notice(
+        self.notice(intercept_notice(
             format!("intercept: listening on {addr} for {sites} AI site(s)"),
             false,
         ));
@@ -646,7 +648,7 @@ impl Shared {
         run.stop.send_replace(true);
         remove_addr_file(&self.paths.intercept_addr_file(), run.addr);
         tracing::info!(addr = %run.addr, "intercept stopped");
-        self.emit(intercept_notice(
+        self.notice(intercept_notice(
             format!("intercept: stopped listening on {}", run.addr),
             false,
         ));

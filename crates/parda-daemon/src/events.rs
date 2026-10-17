@@ -77,6 +77,16 @@ impl Activity {
         a.last_event_ms = Some(e.ts_ms);
     }
 
+    /// Keep a notice for clients that connect later without counting it as
+    /// activity (a listener starting is not a request, nor a warning about one).
+    pub fn remember(&self, e: &Event) {
+        let mut a = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        a.recent.push_back(e.clone());
+        while a.recent.len() > RECENT_EVENTS {
+            a.recent.pop_front();
+        }
+    }
+
     pub fn snapshot(&self) -> Value {
         let a = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut lat: Vec<u64> = a.latencies.iter().copied().collect();
@@ -99,6 +109,13 @@ impl Activity {
 /// Record an event and broadcast it to subscribers.
 pub fn emit(tx: &broadcast::Sender<Event>, activity: &Activity, e: Event) {
     activity.record(&e);
+    let _ = tx.send(e);
+}
+
+/// Broadcast a notice (such as [`intercept_notice`]) and keep it in the
+/// recent history, without adding it to the per-surface totals.
+pub fn notify(tx: &broadcast::Sender<Event>, activity: &Activity, e: Event) {
+    activity.remember(&e);
     let _ = tx.send(e);
 }
 
@@ -173,7 +190,7 @@ pub fn from_intercept(ev: &InterceptEvent, paused: bool) -> Event {
 }
 
 /// A notice from the intercept listener itself (started, stopped, cannot
-/// start).
+/// start); send it with [`notify`], it is not intercepted traffic.
 pub fn intercept_notice(summary: impl Into<String>, warn: bool) -> Event {
     let mut e = Event::now("intercept", summary);
     if warn {
@@ -270,6 +287,18 @@ mod tests {
         assert_eq!(s["latency_ms"]["p50"], 9);
         assert_eq!(s["latency_ms"]["max"], 100);
         assert_eq!(s["recent"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn notices_are_kept_for_late_clients_but_not_counted() {
+        let a = Activity::default();
+        let (tx, mut rx) = broadcast::channel(4);
+        notify(&tx, &a, intercept_notice("intercept: no CA", true));
+        assert_eq!(rx.try_recv().unwrap().summary, "intercept: no CA");
+        let s = a.snapshot();
+        assert_eq!(s["surfaces"], json!({}), "{s}");
+        assert_eq!(s["recent"].as_array().unwrap().len(), 1);
+        assert_eq!(s["last_event_ms"], Value::Null);
     }
 
     #[test]

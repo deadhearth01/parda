@@ -240,7 +240,9 @@ async fn daemon_runs_the_intercept_listener_with_an_existing_ca() {
         !all.contains("Ravi") && !all.contains("secret-query"),
         "{all}"
     );
+    // Only the request counts: the "listening" notice is not activity.
     assert_eq!(st["activity"]["surfaces"]["intercept"]["warnings"], 1);
+    assert_eq!(st["activity"]["surfaces"]["intercept"]["events"], 1);
 
     stop(&paths, daemon).await;
     assert!(addr_file(&paths).is_none(), "intercept.addr removed");
@@ -271,6 +273,8 @@ async fn without_a_ca_intercept_does_not_listen_and_says_why() {
         "{warn}"
     );
     assert!(addr_file(&paths).is_none());
+    // A notice, not intercepted traffic: no intercept totals.
+    assert_eq!(st["activity"]["surfaces"]["intercept"], Value::Null, "{st}");
     // Never created implicitly.
     assert!(!ca_store::ca_exists(&paths));
 
