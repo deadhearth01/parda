@@ -265,11 +265,17 @@ impl StreamTransform for PlainRestore {
                 Bytes::from(out)
             }
             PlainMode::Sniff(buf) => {
-                buf.extend_from_slice(chunk);
-                let first = buf
+                // What is held is whitespace: only the new bytes are read.
+                let first = chunk
                     .iter()
-                    .position(|b| !b.is_ascii_whitespace() && !b"\xef\xbb\xbf".contains(b));
-                match first.map(|i| buf[i]) {
+                    .find(|b| !b.is_ascii_whitespace() && !b"\xef\xbb\xbf".contains(b));
+                buf.extend_from_slice(chunk);
+                match first {
+                    None if buf.len() > MAX_JSON_BUFFER => {
+                        let out = std::mem::take(buf);
+                        self.mode = PlainMode::Raw;
+                        Bytes::from(out)
+                    }
                     None => Bytes::new(),
                     Some(b'{' | b'[') => {
                         let held = std::mem::take(buf);
@@ -521,47 +527,83 @@ struct Frames {
     engine: Engine,
     scope: String,
     cap: usize,
+    /// Bytes not yet sent; consumed ones are dropped once per push.
     buf: Vec<u8>,
     prefix_done: bool,
+    /// The frame being read, once its length is known.
+    frame: Option<FrameScan>,
     /// Gave up on framing: the rest passes through.
     raw: bool,
 }
 
-/// How many bytes of `bytes` hold exactly `units` UTF-16 code units.
-enum Utf16Prefix {
-    Bytes(usize),
+/// How far a frame's payload has been measured: every byte is read once,
+/// whatever the chunking.
+#[derive(Debug, Clone, Copy)]
+struct FrameScan {
+    digits: usize,
+    /// The payload length in UTF-16 code units.
+    units: usize,
+    /// Payload bytes measured so far (whole characters).
+    bytes: usize,
+    /// UTF-16 code units in them.
+    counted: usize,
+}
+
+/// Where measuring a payload got to.
+#[derive(Debug, PartialEq, Eq)]
+enum Measure {
+    /// The payload is this many bytes.
+    Done(usize),
     /// More bytes are needed.
     Need,
     /// Not valid (bad UTF-8, or the count ends inside a character).
     Invalid,
 }
 
-fn utf16_prefix(bytes: &[u8], units: usize) -> Utf16Prefix {
-    let (text, rest_invalid) = match std::str::from_utf8(bytes) {
-        Ok(t) => (t, false),
-        Err(e) => (
-            std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or_default(),
-            e.error_len().is_some(),
-        ),
-    };
-    let mut count = 0;
-    for (i, c) in text.char_indices() {
-        if count == units {
-            return Utf16Prefix::Bytes(i);
+impl FrameScan {
+    /// Count on through `payload` (the frame's payload bytes received so
+    /// far), reading only bytes not measured before and no further than the
+    /// frame can reach (a UTF-16 code unit is at most 4 UTF-8 bytes).
+    fn measure(&mut self, payload: &[u8]) -> Measure {
+        loop {
+            if self.counted == self.units {
+                return Measure::Done(self.bytes);
+            }
+            let new = &payload[self.bytes..];
+            let reach = (self.units - self.counted)
+                .saturating_mul(4)
+                .saturating_add(4);
+            let window = &new[..new.len().min(reach)];
+            let (text, invalid) = match std::str::from_utf8(window) {
+                Ok(t) => (t, false),
+                Err(e) => (
+                    std::str::from_utf8(&window[..e.valid_up_to()]).unwrap_or_default(),
+                    e.error_len().is_some(),
+                ),
+            };
+            for c in text.chars() {
+                self.counted += c.len_utf16();
+                self.bytes += c.len_utf8();
+                if self.counted == self.units {
+                    return Measure::Done(self.bytes);
+                }
+                if self.counted > self.units {
+                    return Measure::Invalid;
+                }
+            }
+            if invalid {
+                return Measure::Invalid;
+            }
+            if window.len() == new.len() {
+                // All received bytes read (a character may be incomplete).
+                return Measure::Need;
+            }
         }
-        count += c.len_utf16();
-        if count > units {
-            return Utf16Prefix::Invalid;
-        }
-    }
-    if count == units {
-        Utf16Prefix::Bytes(text.len())
-    } else if rest_invalid {
-        Utf16Prefix::Invalid
-    } else {
-        Utf16Prefix::Need
     }
 }
+
+/// At most this many digits in a frame length.
+const MAX_FRAME_DIGITS: usize = 12;
 
 impl Frames {
     fn new(engine: &Engine, scope: &str, cap: usize) -> Self {
@@ -571,6 +613,7 @@ impl Frames {
             cap,
             buf: Vec::new(),
             prefix_done: false,
+            frame: None,
             raw: false,
         }
     }
@@ -581,48 +624,85 @@ impl Frames {
         }
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
+        let used = self.frames(&mut out);
+        if self.raw {
+            out.extend_from_slice(&self.buf[used..]);
+            self.buf = Vec::new();
+        } else {
+            self.buf.drain(..used);
+        }
+        out
+    }
+
+    /// Restore every complete frame of `buf` into `out`; returns how many
+    /// bytes of `buf` were used (sets `raw` on giving up).
+    fn frames(&mut self, out: &mut Vec<u8>) -> usize {
+        let mut at = 0;
         loop {
+            let rest = &self.buf[at..];
             if !self.prefix_done {
                 // `)]}'` and its line ending.
-                match self.buf.iter().position(|&b| b == b'\n') {
+                match rest.iter().take(65).position(|&b| b == b'\n') {
                     Some(i) => {
-                        out.extend(self.buf.drain(..=i));
+                        out.extend_from_slice(&rest[..=i]);
+                        at += i + 1;
                         self.prefix_done = true;
                         continue;
                     }
-                    None if self.buf.len() > 64 => return self.give_up(out),
-                    None => return out,
+                    None if rest.len() > 64 => return self.give_up(at),
+                    None => return at,
                 }
             }
-            let ws = self
-                .buf
-                .iter()
-                .take_while(|b| b.is_ascii_whitespace())
-                .count();
-            out.extend(self.buf.drain(..ws));
-            if self.buf.is_empty() {
-                return out;
-            }
-            let digits = self.buf.iter().take_while(|b| b.is_ascii_digit()).count();
-            if digits == 0 || digits > 12 {
-                return self.give_up(out);
-            }
-            if digits == self.buf.len() {
-                return out;
-            }
-            let Ok(units) = std::str::from_utf8(&self.buf[..digits])
-                .unwrap_or("")
-                .parse::<usize>()
-            else {
-                return self.give_up(out);
+            let scan = match self.frame {
+                Some(scan) => scan,
+                None => {
+                    let ws = rest.iter().take_while(|b| b.is_ascii_whitespace()).count();
+                    out.extend_from_slice(&rest[..ws]);
+                    at += ws;
+                    let rest = &rest[ws..];
+                    if rest.is_empty() {
+                        return at;
+                    }
+                    let digits = rest
+                        .iter()
+                        .take(MAX_FRAME_DIGITS + 1)
+                        .take_while(|b| b.is_ascii_digit())
+                        .count();
+                    if digits == 0 || digits > MAX_FRAME_DIGITS {
+                        return self.give_up(at);
+                    }
+                    if digits == rest.len() {
+                        return at;
+                    }
+                    let Ok(units) = std::str::from_utf8(&rest[..digits])
+                        .unwrap_or("")
+                        .parse::<usize>()
+                    else {
+                        return self.give_up(at);
+                    };
+                    FrameScan {
+                        digits,
+                        units,
+                        bytes: 0,
+                        counted: 0,
+                    }
+                }
             };
-            let n = match utf16_prefix(&self.buf[digits..], units) {
-                Utf16Prefix::Bytes(n) => n,
-                Utf16Prefix::Need if self.buf.len() <= self.cap => return out,
-                _ => return self.give_up(out),
-            };
-            let frame: Vec<u8> = self.buf.drain(..digits + n).collect();
-            out.extend(self.restore_frame(&frame, digits));
+            let mut scan = scan;
+            let rest = &self.buf[at..];
+            match scan.measure(&rest[scan.digits..]) {
+                Measure::Done(n) => {
+                    let frame = &rest[..scan.digits + n];
+                    out.extend(self.restore_frame(frame, scan.digits));
+                    at += scan.digits + n;
+                    self.frame = None;
+                }
+                Measure::Need if rest.len() <= self.cap => {
+                    self.frame = Some(scan);
+                    return at;
+                }
+                _ => return self.give_up(at),
+            }
         }
     }
 
@@ -648,13 +728,15 @@ impl Frames {
         out
     }
 
-    fn give_up(&mut self, mut out: Vec<u8>) -> Vec<u8> {
-        out.append(&mut self.buf);
+    /// Stop framing: what is left of `buf` from `at` on passes as it came.
+    fn give_up(&mut self, at: usize) -> usize {
         self.raw = true;
-        out
+        self.frame = None;
+        at
     }
 
     fn finish(&mut self) -> Vec<u8> {
+        self.frame = None;
         std::mem::take(&mut self.buf)
     }
 }
@@ -728,18 +810,27 @@ impl StreamTransform for NdjsonRestore {
         }
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(i) = self.buf[self.scanned..].iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..self.scanned + i + 1).collect();
+        // Lines are taken from `start` on; the buffer is shifted once.
+        let mut start = 0;
+        while let Some(i) = self.buf[start + self.scanned..]
+            .iter()
+            .position(|&b| b == b'\n')
+        {
+            let end = start + self.scanned + i + 1;
+            let line = self.buf[start..end].to_vec();
+            start = end;
             self.scanned = 0;
             if line.len() > self.cap {
                 render_all(self.events.finish(), &mut out);
                 out.extend(line);
-                out.append(&mut self.buf);
+                out.extend_from_slice(&self.buf[start..]);
+                self.buf = Vec::new();
                 self.raw = true;
                 return Bytes::from(out);
             }
             render_all(self.events.on_item(Item::line(line)), &mut out);
         }
+        self.buf.drain(..start);
         self.scanned = self.buf.len();
         if self.buf.len() > self.cap {
             render_all(self.events.finish(), &mut out);
@@ -1872,6 +1963,33 @@ mod tests {
     }
 
     #[test]
+    fn frame_lengths_are_measured_once_and_exactly() {
+        let scan = |units| FrameScan {
+            digits: 0,
+            units,
+            bytes: 0,
+            counted: 0,
+        };
+        // "é😀a" is 1 + 2 + 1 UTF-16 units in 2 + 4 + 1 bytes; whatever
+        // follows the frame is never read past.
+        let payload = "é😀a".to_string() + &"x".repeat(1000) + "\u{ff}";
+        let p = payload.as_bytes();
+        assert_eq!(scan(4).measure(p), Measure::Done(7));
+        assert_eq!(scan(0).measure(p), Measure::Done(0));
+        // A count that ends inside a surrogate pair.
+        assert_eq!(scan(2).measure(p), Measure::Invalid);
+        // Byte by byte, then far past the frame in one go.
+        let mut s = scan(4);
+        for n in 0..p.len().min(7) {
+            assert_eq!(s.measure(&p[..n]), Measure::Need, "{n}");
+        }
+        assert_eq!(s.measure(p), Measure::Done(7));
+        // Longer than what has arrived; then invalid UTF-8 inside it.
+        assert_eq!(scan(5000).measure(p), Measure::Need);
+        assert_eq!(scan(5000).measure(b"ab\xffcd"), Measure::Invalid);
+    }
+
+    #[test]
     fn google_frames_are_restored_with_recomputed_lengths() {
         let dir = tempfile::tempdir().unwrap();
         let e = tagged(dir.path());
@@ -1986,6 +2104,105 @@ mod tests {
                 "{ct}"
             );
         }
+    }
+
+    /// Run `body` through a rewriter for `ct` in chunks of `n` bytes,
+    /// failing as soon as it takes longer than `limit` (work that grows with
+    /// the square of the body never finishes in time).
+    fn run_within(
+        e: &Engine,
+        ct: &str,
+        body: &[u8],
+        n: usize,
+        limit: std::time::Duration,
+    ) -> Vec<u8> {
+        let started = std::time::Instant::now();
+        let mut t = for_content_type(e, SCOPE, ct);
+        let mut out = Vec::new();
+        for (i, c) in body.chunks(n).enumerate() {
+            out.extend_from_slice(&t.push(c));
+            if i % 1024 == 0 {
+                assert!(
+                    started.elapsed() < limit,
+                    "{ct}: {} of {} bytes after {:?}",
+                    i * n,
+                    body.len(),
+                    started.elapsed()
+                );
+            }
+        }
+        out.extend_from_slice(&t.finish());
+        assert!(started.elapsed() < limit, "{ct}: {:?}", started.elapsed());
+        out
+    }
+
+    /// Scan finding on 06da9ce: an item just under the 16 MiB cap, pushed in
+    /// small chunks, must not be rescanned from its start on every chunk
+    /// (newline and blank-line search, UTF-16 counting); nor may a large
+    /// chunk holding many small items be shifted once per item.
+    #[test]
+    fn large_items_in_small_chunks_take_linear_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        // Generous: linear work takes about ten seconds per case
+        // unoptimised; quadratic work takes hours.
+        let limit = std::time::Duration::from_secs(120);
+        let size = MAX_ITEM_BYTES - 64 * 1024;
+        let unit = "aé😀 b";
+        let filler = unit.repeat(size / unit.len());
+        let text = format!("{filler} [NAME_1]");
+        let want = format!("{filler} Ravi Kumar");
+        let doc = json!({"t": &text}).to_string();
+        let restored_doc = json!({"t": &want}).to_string();
+        let cases = [
+            (
+                "text/event-stream",
+                format!("data: {doc}\n\n"),
+                format!("data: {restored_doc}\n\n"),
+            ),
+            (
+                "application/x-ndjson",
+                format!("{doc}\n"),
+                format!("{restored_doc}\n"),
+            ),
+            ("application/json", doc.clone(), restored_doc.clone()),
+            (
+                "application/json",
+                format!(")]}}'\n{}", frame(&format!("[[\"wrb.fr\",{doc}]]"))),
+                format!(
+                    ")]}}'\n{}",
+                    frame(&format!("[[\"wrb.fr\",{restored_doc}]]"))
+                ),
+            ),
+            (
+                "text/plain",
+                format!("{}[NAME_1]", " ".repeat(size)),
+                format!("{}Ravi Kumar", " ".repeat(size)),
+            ),
+        ];
+        for (ct, body, want) in cases {
+            let out = run_within(&e, ct, body.as_bytes(), 256, limit);
+            assert!(out == want.as_bytes(), "{ct}: not restored exactly");
+        }
+        // Many small items in one large chunk (distinct values: identical
+        // ones would read as cumulative snapshots).
+        let (mut nd, mut nd_want, mut i) = (String::new(), String::new(), 0);
+        while nd.len() < size {
+            nd.push_str(&format!("{{\"t\":\"[NAME_1] {i}\"}}\n"));
+            nd_want.push_str(&format!("{{\"t\":\"Ravi Kumar {i}\"}}\n"));
+            i += 1;
+        }
+        let out = run_within(&e, "application/x-ndjson", nd.as_bytes(), nd.len(), limit);
+        assert!(
+            out == nd_want.as_bytes(),
+            "ndjson lines not restored exactly"
+        );
+        let one = frame("[[\"wrb.fr\",\"[NAME_1]\"]]");
+        let body = format!(")]}}'\n{}", one.repeat(size / one.len()));
+        let out = run_within(&e, "application/json", body.as_bytes(), body.len(), limit);
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(frames(&out).len(), size / one.len());
+        assert!(!out.contains("[NAME_1]"));
     }
 
     #[test]
