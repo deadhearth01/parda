@@ -94,6 +94,26 @@ fn forget_ours(mut s: Saved, pac_url: &str) -> Saved {
     s
 }
 
+/// Keep `now` as `target`'s original, unless an earlier `on` saved one and
+/// the setting still points at parda (`ours`). A setting someone changed
+/// while parda was on (a VPN's PAC, auto-proxy switched off) is the new
+/// original: `off` must put *that* back, not the one from before.
+fn remember(saved: &mut Vec<Saved>, target: &str, ours: bool, now: Saved) {
+    match saved.iter_mut().find(|s| s.target == target) {
+        Some(_) if ours => {}
+        Some(s) => *s = now,
+        None => saved.push(now),
+    }
+}
+
+/// [`remember`] for the single Windows / GNOME entry (whose `target` is
+/// not a fixed name).
+fn remember_only(saved: &mut Vec<Saved>, ours: bool, now: Saved) {
+    if saved.is_empty() || !ours {
+        *saved = vec![now];
+    }
+}
+
 // ---------- macOS ----------
 
 /// Network services as `(name, enabled)`. A name listed twice (two
@@ -232,8 +252,9 @@ fn gnome_set(r: &mut dyn Runner, mode: &str, url: &str) -> anyhow::Result<()> {
 // ---------- public API ----------
 
 /// Point the system at `pac_url`. The original settings are saved first; an
-/// existing state file (from an earlier `on`, or a crash) keeps its originals,
-/// and services enabled since then are added to it. If any change fails,
+/// existing state file (from an earlier `on`, or a crash) keeps its originals
+/// for settings that still point at parda, takes the current value of those
+/// changed since (by the user or a VPN), and adds services enabled since then. If any change fails,
 /// everything done so far is rolled back before the error is returned.
 pub fn enable(
     r: &mut dyn Runner,
@@ -259,27 +280,27 @@ pub fn enable(
                 bail!("no enabled network service found (networksetup -listallnetworkservices)");
             }
             for svc in &services {
-                if !state.saved.iter().any(|s| &s.target == svc) {
-                    state.saved.push(forget_ours(mac_get(r, svc)?, pac_url));
-                }
+                let now = mac_get(r, svc)?;
+                let ours =
+                    now.enabled && now.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url));
+                remember(&mut state.saved, svc, ours, forget_ours(now, pac_url));
             }
             targets = services;
         }
         Platform::Windows => {
-            if state.saved.is_empty() {
-                state.saved.push(forget_ours(win_get(r), pac_url));
-            }
+            let now = win_get(r);
+            let ours = now.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url));
+            remember_only(&mut state.saved, ours, forget_ours(now, pac_url));
         }
         Platform::Linux => {
-            if state.saved.is_empty() {
-                let mut s = gnome_get(r)?;
-                if s.target == "auto" && s.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url))
-                {
-                    s.target = "none".into();
-                    s.url = None;
-                }
-                state.saved.push(s);
+            let mut now = gnome_get(r)?;
+            let ours = now.target == "auto"
+                && now.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url));
+            if ours {
+                now.target = "none".into();
+                now.url = None;
             }
+            remember_only(&mut state.saved, ours, now);
         }
     }
     save_state(paths, &state)?;
@@ -714,6 +735,64 @@ mod tests {
             None,
             "an old parda PAC is not an original"
         );
+    }
+
+    #[test]
+    fn on_again_after_an_outside_change_saves_that_change_for_off() {
+        let (_d, p) = paths();
+        let mut os = mac();
+        enable(&mut os, &p, Platform::MacOs, PAC).unwrap();
+        // A VPN client points Thunderbolt Bridge at its own PAC; the user
+        // switches iPhone USB's auto-proxy off; Wi-Fi stays parda's.
+        os.mac.get_mut("Thunderbolt Bridge").unwrap().0 = Some("http://vpn/new.pac".into());
+        os.mac.get_mut("iPhone USB").unwrap().1 = false;
+        enable(&mut os, &p, Platform::MacOs, PAC).unwrap();
+        assert_eq!(os.mac["Thunderbolt Bridge"].0.as_deref(), Some(PAC));
+        let r = disable(&mut os, &p).unwrap().unwrap();
+        assert_eq!(r.restored.len(), 3, "{r:?}");
+        assert_eq!(
+            os.mac["Thunderbolt Bridge"],
+            (Some("http://vpn/new.pac".into()), true, true),
+            "the VPN's PAC is back, not the one from before the first on"
+        );
+        assert!(!os.mac["iPhone USB"].1, "switched off as the user left it");
+        assert!(!os.mac["Wi-Fi"].1, "Wi-Fi's original (no proxy) kept");
+    }
+
+    #[test]
+    fn on_again_after_an_outside_change_on_windows_and_gnome() {
+        let (_d, p) = paths();
+        let mut os = Os {
+            win: Some("http://corp/w.pac".into()),
+            ..Default::default()
+        };
+        enable(&mut os, &p, Platform::Windows, PAC).unwrap();
+        os.win = Some("http://vpn/w.pac".into());
+        enable(&mut os, &p, Platform::Windows, PAC).unwrap();
+        disable(&mut os, &p).unwrap().unwrap();
+        assert_eq!(os.win.as_deref(), Some("http://vpn/w.pac"));
+
+        let (_d, p) = paths();
+        let mut os = Os {
+            gnome: ("none".into(), String::new()),
+            ..Default::default()
+        };
+        enable(&mut os, &p, Platform::Linux, PAC).unwrap();
+        os.gnome = ("manual".into(), String::new());
+        enable(&mut os, &p, Platform::Linux, PAC).unwrap();
+        disable(&mut os, &p).unwrap().unwrap();
+        assert_eq!(os.gnome.0, "manual");
+
+        // Still parda's on the second on: the original stays.
+        let (_d, p) = paths();
+        let mut os = Os {
+            win: Some("http://corp/w.pac".into()),
+            ..Default::default()
+        };
+        enable(&mut os, &p, Platform::Windows, PAC).unwrap();
+        enable(&mut os, &p, Platform::Windows, PAC).unwrap();
+        disable(&mut os, &p).unwrap().unwrap();
+        assert_eq!(os.win.as_deref(), Some("http://corp/w.pac"));
     }
 
     #[test]
