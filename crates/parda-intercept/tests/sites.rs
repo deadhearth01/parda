@@ -43,9 +43,37 @@ fn gemini_frame(json: &str) -> String {
     format!("{}{payload}", payload.encode_utf16().count())
 }
 
-/// The fake site: chatgpt.com, claude.ai and Gemini endpoints.
+/// The fake site: chatgpt.com, claude.ai, Gemini, DeepSeek and Meta AI
+/// endpoints; anything else echoes the request body as text.
 fn site() -> Responder {
     Arc::new(|seen: &Seen| match seen.path.as_str() {
+        // An echo as a stream (chatgpt's other send endpoint, or any site).
+        "/backend-api/f/conversation" | "/echo/stream" => Reply::new(
+            "text/event-stream",
+            vec![format!("data: echo: {}\n\n", seen.text())],
+        ),
+        // DeepSeek-shaped: a delta stream, the tag split across events.
+        "/api/v0/chat/completion" => Reply::new(
+            "text/event-stream; charset=utf-8",
+            sse_body(&[
+                (None, json!({"v": "Hi [NA"})),
+                (None, json!({"v": "ME_1]"})),
+                (Some("close"), json!({"click_behavior": "none"})),
+            ]),
+        ),
+        // Meta AI GraphQL: one JSON document, or several values (one per
+        // line) when the query asks for a stream.
+        "/api/graphql/" if seen.text().contains("\"stream\":true") => Reply::new(
+            "application/json",
+            vec![
+                format!("{}\n", json!({"seq": 1, "delta": "Hi [NAME_1]"})),
+                format!("{}\n", json!({"seq": 2, "delta": " bye"})),
+            ],
+        ),
+        "/api/graphql/" => Reply::new(
+            "application/json",
+            vec![json!({"data": {"node": {"text": "Hi [NAME_1]"}}}).to_string()],
+        ),
         "/backend-api/conversation" => Reply::new("text/event-stream; charset=utf-8", {
             let mut v = sse_body(&[
                 (Some("delta_encoding"), json!("v1")),
@@ -384,8 +412,8 @@ async fn query_strings_compressed_bodies_and_refusals() {
         .unwrap();
     assert_eq!(
         res.text().await.unwrap(),
-        "echo: {\"message\":\"I am Ravi Kumar\"}",
-        "the echo of the tag is restored on the way back"
+        "echo: {\"message\":\"I am [NAME_1]\"}",
+        "another site's answer is restored only when it streams"
     );
 
     // Unparseable JSON never leaves.
@@ -517,18 +545,21 @@ async fn a_tag_issued_for_one_site_is_not_restored_for_another() {
     let up = start_upstream(site()).await;
     let parda = start_parda(&up, |_| {}, None).await;
     let c = parda.client();
-    let post = |host: &str, body: &str| {
-        c.post(format!("https://{host}:{}/echo", up.port))
+    let post = |url: String, body: &str| {
+        c.post(url)
             .header("content-type", "text/plain")
             .body(body.to_string())
             .send()
     };
+    let data = |body: &[u8]| -> String { events(body).iter().map(|e| e.data.clone()).collect() };
     // chatgpt.com gets [NAME_1] for Ravi Kumar, and its echo comes back real.
-    let res = post("chatgpt.com", "I am Ravi Kumar").await.unwrap();
-    assert_eq!(res.text().await.unwrap(), "echo: I am Ravi Kumar");
-    // claude.ai answering with that tag gets nothing back.
-    let res = post("claude.ai", "[NAME_1]").await.unwrap();
-    assert_eq!(res.text().await.unwrap(), "echo: [NAME_1]");
+    let chatgpt = format!("https://chatgpt.com:{}/backend-api/f/conversation", up.port);
+    let res = post(chatgpt, "I am Ravi Kumar").await.unwrap();
+    assert_eq!(data(&res.bytes().await.unwrap()), "echo: I am Ravi Kumar");
+    // Another site streaming that tag back gets nothing.
+    let other = format!("https://example.com:{}/echo/stream", up.port);
+    let res = post(other, "[NAME_1]").await.unwrap();
+    assert_eq!(data(&res.bytes().await.unwrap()), "echo: [NAME_1]");
     let seen = up.seen();
     assert_eq!(seen[0].text(), "I am [NAME_1]");
     assert_eq!(seen[1].text(), "[NAME_1]");
@@ -544,18 +575,16 @@ async fn shared_pages_are_never_restored() {
     let parda = start_parda(&up, |_| {}, None).await;
     let c = parda.client();
     let base = format!("https://chatgpt.com:{}", up.port);
-    // The user's own send issues the tags.
+    // The user's own send issues the tags, and its answer is restored.
     let res = c
-        .post(format!("{base}/echo"))
+        .post(format!("{base}/backend-api/f/conversation"))
         .header("content-type", "text/plain")
         .body("Ravi Kumar, ravi@example.com")
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        res.text().await.unwrap(),
-        "echo: Ravi Kumar, ravi@example.com"
-    );
+    let evs = events(&res.bytes().await.unwrap());
+    assert_eq!(evs[0].data, "echo: Ravi Kumar, ravi@example.com");
     // A page someone else wrote, full of those tags, stays tags.
     let res = c
         .get(format!("{base}/backend-api/share/6f1c2a9e"))
@@ -564,6 +593,18 @@ async fn shared_pages_are_never_restored() {
         .unwrap();
     let v: Value = res.json().await.unwrap();
     assert_eq!(v["text"], "Hi [NAME_1] [EMAIL_1]");
+    // So does the answer to a POST that is not a send (a GPT, a file):
+    // the site echoes the tag it got, and the tag stays.
+    for path in ["/backend-api/gizmos/g-1", "/echo"] {
+        let res = c
+            .post(format!("{base}{path}"))
+            .header("content-type", "text/plain")
+            .body("Ravi Kumar")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.text().await.unwrap(), "echo: [NAME_1]", "{path}");
+    }
     // The user's own history is restored.
     let res = c
         .get(format!("{base}/backend-api/conversation/{CONV}"))
@@ -572,4 +613,120 @@ async fn shared_pages_are_never_restored() {
         .unwrap();
     let v: Value = res.json().await.unwrap();
     assert_eq!(v["title"], "Note to Ravi Kumar");
+}
+
+#[tokio::test]
+async fn other_sites_get_back_streamed_answers_to_sends_only() {
+    let up = start_upstream(site()).await;
+    let parda = start_parda(&up, |_| {}, None).await;
+    let c = parda.client();
+
+    // DeepSeek: the streamed answer to the user's send is restored, the
+    // tag split across events.
+    let ds = format!(
+        "https://chat.deepseek.com:{}/api/v0/chat/completion",
+        up.port
+    );
+    let text = |body: &[u8]| -> String {
+        events(body)
+            .iter()
+            .filter_map(|e| serde_json::from_str::<Value>(&e.data).ok())
+            .filter_map(|v| v["v"].as_str().map(String::from))
+            .collect()
+    };
+    let res = c
+        .post(&ds)
+        .json(&json!({"prompt": "I am Ravi Kumar"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(text(&res.bytes().await.unwrap()), "Hi Ravi Kumar");
+    // The same stream answering a GET keeps its tags.
+    let res = c.get(&ds).send().await.unwrap();
+    assert_eq!(text(&res.bytes().await.unwrap()), "Hi [NAME_1]");
+
+    // Meta AI GraphQL: a JSON document keeps its tags, even for a POST
+    // (it may be anybody's content)...
+    let meta = format!("https://meta.ai:{}/api/graphql/", up.port);
+    let res = c
+        .post(&meta)
+        .json(&json!({"variables": {"message": "I am Ravi Kumar"}}))
+        .send()
+        .await
+        .unwrap();
+    let v: Value = res.json().await.unwrap();
+    assert_eq!(v["data"]["node"]["text"], "Hi [NAME_1]");
+    // ...while values streamed one per line under a JSON type are an
+    // answer being written: restored.
+    let res = c
+        .post(&meta)
+        .json(&json!({"variables": {"message": "Ravi Kumar again"}, "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    let body = res.text().await.unwrap();
+    let deltas: Vec<Value> = body
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(deltas[0]["delta"], "Hi Ravi Kumar", "{body}");
+    assert_eq!(deltas[1]["delta"], " bye", "{body}");
+
+    let seen = up.seen();
+    assert_eq!(seen.len(), 4);
+    assert!(
+        seen[0].text().contains("I am [NAME_1]"),
+        "{}",
+        seen[0].text()
+    );
+    assert!(
+        seen[2].text().contains("I am [NAME_1]"),
+        "{}",
+        seen[2].text()
+    );
+    assert!(
+        seen[3].text().contains("[NAME_1] again"),
+        "{}",
+        seen[3].text()
+    );
+}
+
+/// Reviewer probe (I4): a page opened as `chatgpt.com/?q=<prompt>` would
+/// send the real prompt in the `Referer` of every later request, undoing the
+/// query redaction. Listed hosts get the referrer without query or fragment.
+#[tokio::test]
+async fn referer_loses_its_query_and_fragment() {
+    let up = start_upstream(site()).await;
+    let parda = start_parda(&up, |_| {}, None).await;
+    let c = parda.client();
+    let base = format!("https://chatgpt.com:{}", up.port);
+    for (referer, want) in [
+        (
+            "https://chatgpt.com/?q=Ravi%20Kumar%20ravi%40example.com#frag",
+            "https://chatgpt.com/",
+        ),
+        ("https://chatgpt.com/c/x#Ravi", "https://chatgpt.com/c/x"),
+        (
+            "https://other.example/a?b=Ravi+Kumar",
+            "https://other.example/a",
+        ),
+        ("https://chatgpt.com/c/x", "https://chatgpt.com/c/x"),
+    ] {
+        c.get(format!("{base}/echo"))
+            .header("referer", referer)
+            .send()
+            .await
+            .unwrap();
+        c.post(format!("{base}/echo"))
+            .header("referer", referer)
+            .header("content-type", "text/plain")
+            .body("hi")
+            .send()
+            .await
+            .unwrap();
+        let seen = up.seen();
+        for s in &seen[seen.len() - 2..] {
+            assert_eq!(s.referer.as_deref(), Some(want), "{} {referer}", s.method);
+        }
+    }
 }

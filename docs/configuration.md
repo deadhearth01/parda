@@ -51,7 +51,8 @@ hosts = ["chatgpt.com", "chat.openai.com", "claude.ai", "gemini.google.com", "co
          "perplexity.ai", "chat.deepseek.com", "chat.mistral.ai", "grok.com", "meta.ai", "poe.com"]
 scope = "per-host"                 # each site its own scope; or a fixed name, e.g. "global"
 unscanned = "allow"                # allow | block — file uploads and binary bodies
-skip_keys = []                     # extra JSON / form keys never changed, e.g. ["trace_tag"]
+skip_keys = []                     # extra identifier keys, e.g. ["trace_tag"]: identifier-shaped
+                                   # values under them skip only the name model (rules still apply)
 
 [privacy]
 log_values = false
@@ -94,25 +95,83 @@ Tags follow `replace.style` (there is no separate style for intercept).
   that were issued for text sent to that same site — never names you sent to another site, the
   clipboard or the agent proxy. Any other value is a fixed scope shared by every site (`global` also
   shares tags with the clipboard and the agent proxy).
-- **Requests**: every string is checked. JSON string values are redacted; identifier fields — keys
-  such as `id`, `*_id`, `*Id`, `uuid`, `model`, `token`, `nonce`, `timestamp`, `parent*`, `client_*`,
-  `type`, `role`, `status` (plus `skip_keys` and a built-in list per site), and values that look like
-  identifiers (UUIDs, long hex or base64 strings, links to the site itself) — skip only the name
-  model, and only when the value is identifier-shaped (up to 64 characters of `A-Z a-z 0-9 _ . : / +
-  = -`). The dictionary and rule tiers still see them, so an e-mail, phone number, Aadhaar or key is
-  redacted wherever it sits; a value with a space or an `@` is redacted under any key. JSON carried
-  inside a string (Gemini's `f.req`) is opened and filtered, four levels deep; deeper, it is filtered
-  as plain text. Form bodies, query strings and `text/plain` bodies are filtered; multipart text fields
-  are filtered and file parts count as unscanned. Compressed bodies are decoded first. A body that
-  claims to be JSON but is not is refused (`400 parda_unparseable_body`) rather than sent unfiltered.
-  In `detect.mode = "strict"` a failed name detector refuses the send (`503`); a `block` action
-  refuses it with `403`.
-- **Answers**: JSON, NDJSON, server-sent-event streams and plain text get the real values back,
-  including tags split across stream events. Real values only land inside JSON strings (escaped as
-  JSON) or plain text. **A tag inside a URL is never restored** — in `http(s)://…` links, markdown
-  link and image targets, `href=` / `src=` values and CSS `url(…)` — so a prompt-injected image or
-  link cannot carry your real data to another server. HTML pages and other types pass through
-  unchanged.
+- **Requests** to a listed site:
+  - *What is read.* Every JSON string value and every JSON object key, at any depth (a key that holds
+    a name is renamed where it stands). Form and query-string values, keys and value-less pieces
+    (`?Ravi%20Kumar`). Text bodies. Multipart text fields, including base64-encoded ones. Compressed
+    bodies are decoded first.
+  - *Whatever the content type says.* A body that is a JSON object or array is read as JSON (sites
+    post JSON as `text/plain`, as a form, or as `application/octet-stream`). A text or untyped body
+    written in form encoding (`prompt=Ravi+Kumar&mail=ravi%40example.com`) is read as a form, so `+`
+    and `%40` cannot hide a name or an e-mail.
+  - *URLs inside strings.* The query of every `http(s)://` link in any of these strings is decoded,
+    filtered with the same rules and encoded again (telemetry often carries the page URL, prompt
+    included).
+  - *Identifiers.* Keys such as `id`, `*_id`, `*Id`, `uuid`, `model`, `token`, `nonce`,
+    `timestamp`, `parent*`, `client_*`, `type`, `role`, `status` (plus `skip_keys` and a built-in
+    list per site), and values that look like identifiers (UUIDs, long hex or base64 strings, links
+    to the site itself), skip only the name model, and only when the value is identifier-shaped (up
+    to 64 characters of `A-Z a-z 0-9 _ . : / + = -`). The dictionary and rule tiers still see them,
+    so an e-mail, phone number, Aadhaar or key is redacted wherever it sits; a value with a space or
+    an `@` is redacted under any key.
+  - *JSON inside a string* (Gemini's `f.req`) is opened and filtered, four levels deep; deeper, it
+    is filtered as plain text.
+  - *`Referer`.* Its query and fragment are removed. A page opened with the prompt in its address
+    (`chatgpt.com/?q=…`, `perplexity.ai/search?q=…`) would otherwise send the prompt again with
+    every request it makes.
+  - *Not read, counted as unscanned* (with `unscanned = "block"` the request is refused,
+    `415 parda_unscanned_blocked`): file parts; multipart fields that are not text or JSON, are not
+    UTF-8 (a declared charset other than UTF-8, or NUL bytes, as UTF-16 has), or use another
+    transfer encoding (quoted-printable); bodies of other types that are not JSON (images, binary
+    data); untyped bodies that are not UTF-8 or hold NUL bytes. Headers other than `Referer` are
+    forwarded as they are, and WebSocket traffic is tunnelled without inspection.
+  - *Refused, never sent unfiltered.* The message names the problem and never quotes the request.
+
+    | Status and code | When |
+    |---|---|
+    | `400 parda_unparseable_body` | a body typed as JSON that is not JSON; a JSON key given twice (anywhere, JSON inside strings, forms and queries included); two keys that redaction would make the same; a multipart body without a boundary, that does not split as RFC 2046 says, or whose preamble or epilogue holds the boundary |
+    | `400 parda_not_utf8` | a form, `text/*` or JSON body declaring a charset other than UTF-8 or US-ASCII; a form or `text/*` body that is not UTF-8 or holds NUL bytes (UTF-16) |
+    | `413 parda_body_too_large` | a body too large to filter |
+    | `415 parda_unsupported_encoding` | a `content-encoding` parda cannot decode |
+    | `415 parda_unscanned_blocked` | an unscanned part while `unscanned = "block"` |
+    | `503 parda_ml_unavailable` | `detect.mode = "strict"` and the name detector failed |
+    | `403 parda_blocked` | a kind whose action is `block` (the message names kinds, not values) |
+    | `500 parda_internal` | anything else that went wrong while filtering |
+
+- **Answers** get the real values back only where they are the user's own:
+  - *chatgpt.com, chat.openai.com, claude.ai, gemini.google.com:* only the answers to sending a
+    message (chatgpt `/backend-api/conversation` and `/backend-api/f/conversation`; claude
+    `…/chat_conversations/*/completion` and `…/retry_completion`; Gemini `StreamGenerate`), and the
+    user's own history (chatgpt `GET /backend-api/conversation/*` and `/backend-api/conversations`;
+    claude `GET /api/organizations/*/chat_conversations[/*]`). Gemini history comes from
+    `batchexecute`, which is never restored, so **old Gemini chats show tags**.
+  - *Every other listed site:* only answers to a `POST` that stream (server-sent events, NDJSON, or
+    several JSON values in a row). A single JSON document, a text body or anything a `GET` returns
+    keeps its tags.
+  - Shared conversations, GPT or bot descriptions and public pages therefore keep their tags: a
+    page someone else wrote cannot make your browser show (or send on) your real values. Paths are
+    matched decoded once, case-insensitively, without the query; a path with an empty, `.` or `..`
+    segment, an encoded `/`, `%` or `\`, a `;` or a control character matches nothing.
+  - *Formats.* JSON, NDJSON, server-sent-event streams, Google's `)]}'` frames (lengths recomputed)
+    and plain text, including tags split across stream events. Real values only land inside JSON
+    strings (escaped as JSON) or plain text; data that looks like JSON but does not parse passes
+    through with its tags. A streamed text is JSON text once it reaches a string or an object
+    (`{"`, `["`), not because it starts with a bracket (`[NAME_1] said`, `[1] see` are text); JSON
+    text that turns into prose goes on unrestored. HTML pages and other types pass through
+    unchanged. A single event, line or frame larger than 16 MiB passes through, with the rest of
+    that answer, unrestored.
+  - **A tag inside a URL is never restored**, so a prompt-injected image or link cannot carry your
+    real data to another server. URLs are read as markdown renderers and browsers read them:
+    markdown link and image targets (`](…)`, `](<…>)`, backslash escapes, spaces in `<…>`) and
+    reference definitions (`[r]: …`, also inside quotes and lists), autolinks (`<https:…>`,
+    `www.…`), every attribute value inside an HTML tag, and CSS `url(…)`, `image-set(…)` and
+    `@import`. On top of that, a tag is never restored when the text before it, back to the last
+    ASCII space or line break, holds any of `/ ? = & % \ : @`, follows `www.` or is longer than
+    2 KiB, so `key=[NAME_1]` and `path/[NAME_1]` keep their tags too. Unicode spaces never end a
+    URL.
+- **Known limit.** parda filters what reaches the listed hosts over the network. The site's own page
+  scripts see what you type before it is sent, and anything they send to other (unlisted) hosts,
+  such as third-party analytics, is not filtered.
 
 **The listener** runs inside the daemon while `enabled = true`, and only with the root certificate
 from `parda ca create` (parda never creates one on its own; without it the daemon warns "no CA" and

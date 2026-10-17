@@ -31,10 +31,12 @@ use tokio::sync::broadcast;
 pub const T: Duration = Duration::from_secs(10);
 
 /// The names the fake site answers for.
-pub const SITES: [&str; 4] = [
+pub const SITES: [&str; 6] = [
     "chatgpt.com",
     "claude.ai",
     "gemini.google.com",
+    "chat.deepseek.com",
+    "meta.ai",
     "example.com",
 ];
 
@@ -46,6 +48,7 @@ pub struct Seen {
     pub query: Option<String>,
     pub content_type: Option<String>,
     pub content_encoding: Option<String>,
+    pub referer: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -104,6 +107,7 @@ async fn handle(
         query: req.uri().query().map(str::to_string),
         content_type: header("content-type"),
         content_encoding: header("content-encoding"),
+        referer: header("referer"),
         body: Vec::new(),
     };
     s.body = req.into_body().collect().await.unwrap().to_bytes().to_vec();

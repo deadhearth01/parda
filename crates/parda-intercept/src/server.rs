@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::header::{
     ACCEPT_ENCODING, ALLOW, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_TYPE, HOST, ORIGIN, UPGRADE, X_CONTENT_TYPE_OPTIONS,
+    CONTENT_TYPE, HOST, ORIGIN, REFERER, UPGRADE, X_CONTENT_TYPE_OPTIONS,
 };
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
@@ -646,6 +646,7 @@ async fn forward(
     );
 
     let mut headers = end_to_end(&parts.headers);
+    strip_referer(&mut headers);
     headers.remove(HOST);
     headers.remove(CONTENT_LENGTH);
     headers.remove(CONTENT_ENCODING);
@@ -707,7 +708,9 @@ async fn forward(
         None,
         outcome.unscanned,
     );
-    let stream = res.bytes_stream();
+    let stream = res
+        .bytes_stream()
+        .map(|r| r.map_err(|e| BoxError::from(e.without_url())));
     let body = if still_encoded {
         passthrough(stream)
     } else {
@@ -715,7 +718,7 @@ async fn forward(
             stream,
             state
                 .transform
-                .response_stream_for(&parts.method, &target.host, &path, &content_type),
+                .response_stream(&parts.method, &target.host, &path, &content_type),
         )
     };
     let mut out = Response::new(body);
@@ -771,46 +774,60 @@ fn refuse(
 
 /// Stream `upstream` through `rewriter`, chunk by chunk, then flush it. The
 /// rewriter runs on the blocking pool (restoring may read the vault or wait
-/// on the engine's locks); the stream stays incremental.
+/// on the engine's locks); the stream stays incremental. When the upstream
+/// fails, what the rewriter holds goes out first, then the error.
 fn transformed(
-    upstream: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    upstream: impl Stream<Item = Result<Bytes, BoxError>> + Send + 'static,
     rewriter: Box<dyn StreamTransform>,
 ) -> Body {
     if rewriter.is_passthrough() {
         return passthrough(upstream);
     }
+    enum State<S> {
+        Running(S, Box<dyn StreamTransform>),
+        /// The upstream failed after the held text went out.
+        Failed(BoxError),
+        Done,
+    }
     let failed = || BoxError::from("parda intercept: failed to rewrite the response");
     let frames = futures::stream::unfold(
-        Some((Box::pin(upstream), rewriter)),
+        State::Running(Box::pin(upstream), rewriter),
         move |state| async move {
-            let (mut upstream, rewriter) = state?;
-            let mut rewriter = Some(rewriter);
+            let (mut upstream, mut rw) = match state {
+                State::Running(upstream, rw) => (upstream, rw),
+                State::Failed(e) => return Some((Err(e), State::Done)),
+                State::Done => return None,
+            };
             loop {
-                let chunk = upstream.next().await;
-                let mut rw = rewriter.take()?;
-                match chunk {
+                match upstream.next().await {
                     Some(Ok(chunk)) => {
-                        let Ok((rw, out)) = tokio::task::spawn_blocking(move || {
+                        let Ok((back, out)) = tokio::task::spawn_blocking(move || {
                             let out = rw.push(&chunk);
                             (rw, out)
                         })
                         .await
                         else {
-                            return Some((Err(failed()), None));
+                            return Some((Err(failed()), State::Done));
                         };
+                        rw = back;
                         if !out.is_empty() {
-                            return Some((Ok(Frame::data(out)), Some((upstream, rw))));
+                            return Some((Ok(Frame::data(out)), State::Running(upstream, rw)));
                         }
-                        rewriter = Some(rw);
                     }
                     Some(Err(e)) => {
-                        return Some((Err(BoxError::from(e.without_url())), None));
+                        let Ok(out) = tokio::task::spawn_blocking(move || rw.finish()).await else {
+                            return Some((Err(e), State::Done));
+                        };
+                        if out.is_empty() {
+                            return Some((Err(e), State::Done));
+                        }
+                        return Some((Ok(Frame::data(out)), State::Failed(e)));
                     }
                     None => {
                         let Ok(out) = tokio::task::spawn_blocking(move || rw.finish()).await else {
-                            return Some((Err(failed()), None));
+                            return Some((Err(failed()), State::Done));
                         };
-                        return (!out.is_empty()).then(|| (Ok(Frame::data(out)), None));
+                        return (!out.is_empty()).then(|| (Ok(Frame::data(out)), State::Done));
                     }
                 }
             }
@@ -820,11 +837,8 @@ fn transformed(
 }
 
 /// Stream `upstream` unchanged.
-fn passthrough(upstream: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static) -> Body {
-    BodyExt::boxed_unsync(StreamBody::new(upstream.map(|r| {
-        r.map(Frame::data)
-            .map_err(|e| BoxError::from(e.without_url()))
-    })))
+fn passthrough(upstream: impl Stream<Item = Result<Bytes, BoxError>> + Send + 'static) -> Body {
+    BodyExt::boxed_unsync(StreamBody::new(upstream.map(|r| r.map(Frame::data))))
 }
 
 /// A WebSocket (or other) upgrade on a listed host: relay the handshake,
@@ -838,6 +852,7 @@ async fn upgrade(
 ) -> Response<Body> {
     let client_side = hyper::upgrade::on(&mut req);
     let mut headers = end_to_end(req.headers());
+    strip_referer(&mut headers);
     headers.remove(HOST);
     headers.remove(CONTENT_LENGTH);
     headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
@@ -879,7 +894,10 @@ async fn upgrade(
         );
         let mut out_headers = end_to_end(res.headers());
         out_headers.remove(CONTENT_LENGTH);
-        let mut out = Response::new(passthrough(res.bytes_stream()));
+        let mut out = Response::new(passthrough(
+            res.bytes_stream()
+                .map(|r| r.map_err(|e| BoxError::from(e.without_url()))),
+        ));
         *out.status_mut() = status;
         *out.headers_mut() = out_headers;
         return out;
@@ -919,6 +937,27 @@ fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
         .map(|t| t.trim().to_ascii_lowercase())
         .filter(|t| !t.is_empty())
         .collect()
+}
+
+/// Cut the query and fragment off every `Referer`. A page opened with the
+/// prompt in its URL (`chatgpt.com/?q=…`, `claude.ai/new?q=…`) would
+/// otherwise send that text, unredacted, with every later request it makes.
+fn strip_referer(headers: &mut HeaderMap) {
+    let values: Vec<HeaderValue> = headers.get_all(REFERER).iter().cloned().collect();
+    if values.is_empty() {
+        return;
+    }
+    headers.remove(REFERER);
+    for v in values {
+        let b = v.as_bytes();
+        let cut = b
+            .iter()
+            .position(|&c| c == b'?' || c == b'#')
+            .unwrap_or(b.len());
+        if let Ok(v) = HeaderValue::from_bytes(&b[..cut]) {
+            headers.append(REFERER, v);
+        }
+    }
 }
 
 /// `headers` without hop-by-hop headers (fixed list plus any named in
@@ -1086,6 +1125,80 @@ mod tests {
         .await
         .expect("read_body must give up on its own");
         assert_eq!(r.unwrap_err(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    /// Holds everything until the end (like a restorer holding events
+    /// behind a possible tag).
+    struct HoldAll(Vec<u8>);
+
+    impl StreamTransform for HoldAll {
+        fn push(&mut self, chunk: &[u8]) -> Bytes {
+            self.0.extend_from_slice(chunk);
+            Bytes::new()
+        }
+        fn finish(&mut self) -> Bytes {
+            Bytes::from(std::mem::take(&mut self.0))
+        }
+    }
+
+    /// Review finding (fix round 1b): an upstream error mid-stream first
+    /// sends what the rewriter holds, then the error.
+    #[tokio::test]
+    async fn an_upstream_error_sends_what_was_held_first() {
+        let upstream = futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"data: a\n\n")),
+            Ok(Bytes::from_static(b"data: b\n\n")),
+            Err(BoxError::from("connection reset")),
+            Ok(Bytes::from_static(b"never")),
+        ]);
+        let mut body = transformed(upstream, Box::new(HoldAll(Vec::new())));
+        let mut data = Vec::new();
+        let mut error = None;
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(f) => data.extend_from_slice(f.data_ref().unwrap()),
+                Err(e) => {
+                    error = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        assert_eq!(data, b"data: a\n\ndata: b\n\n");
+        assert_eq!(error.as_deref(), Some("connection reset"));
+        assert!(body.frame().await.is_none());
+    }
+
+    #[test]
+    fn referers_lose_query_and_fragment() {
+        let mut h = HeaderMap::new();
+        h.append(
+            REFERER,
+            HeaderValue::from_static("https://chatgpt.com/?q=Ravi#x"),
+        );
+        h.append(
+            REFERER,
+            HeaderValue::from_static("https://a.example/p#Ravi?y"),
+        );
+        h.append(REFERER, HeaderValue::from_static("https://a.example/p"));
+        h.insert(ORIGIN, HeaderValue::from_static("https://chatgpt.com"));
+        strip_referer(&mut h);
+        let got: Vec<_> = h
+            .get_all(REFERER)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "https://chatgpt.com/",
+                "https://a.example/p",
+                "https://a.example/p"
+            ]
+        );
+        assert_eq!(h.get(ORIGIN).unwrap(), "https://chatgpt.com");
+        let mut none = HeaderMap::new();
+        strip_referer(&mut none);
+        assert!(none.is_empty());
     }
 
     #[test]

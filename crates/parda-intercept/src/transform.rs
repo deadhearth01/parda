@@ -41,27 +41,17 @@ pub trait BodyTransform: Send + Sync + 'static {
         body: Bytes,
     ) -> Result<Bytes, Refusal>;
 
-    /// A fresh rewriter for one response body (identity-encoded).
+    /// A fresh rewriter for one response body (identity-encoded): the
+    /// answer to a `method` request for `path` (no query) on `host`. The
+    /// method and path decide whose content it is: an engine-backed
+    /// transform restores only the user's own sends and history.
     fn response_stream(
-        &self,
-        host: &str,
-        path: &str,
-        content_type: &str,
-    ) -> Box<dyn StreamTransform>;
-
-    /// [`BodyTransform::response_stream`] for the answer to a request made
-    /// with `method`. The server calls this one; the default ignores the
-    /// method.
-    fn response_stream_for(
         &self,
         method: &http::Method,
         host: &str,
         path: &str,
         content_type: &str,
-    ) -> Box<dyn StreamTransform> {
-        let _ = method;
-        self.response_stream(host, path, content_type)
-    }
+    ) -> Box<dyn StreamTransform>;
 
     /// [`BodyTransform::request`] plus what it did, for the event feed. The
     /// default reports no counts; engine-backed transforms override it.
@@ -155,7 +145,13 @@ pub(crate) mod tests_support {
             Ok(body)
         }
 
-        fn response_stream(&self, _: &str, _: &str, _: &str) -> Box<dyn StreamTransform> {
+        fn response_stream(
+            &self,
+            _: &http::Method,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Box<dyn StreamTransform> {
             Box::new(Identity)
         }
     }

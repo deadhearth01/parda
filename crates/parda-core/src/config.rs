@@ -237,8 +237,10 @@ pub struct InterceptConfig {
     /// Request parts parda cannot read (file uploads, binary bodies):
     /// forwarded with a warning (`allow`) or refused (`block`).
     pub unscanned: UnscannedMedia,
-    /// Extra JSON / form keys whose values are never changed (identifiers a
-    /// site needs verbatim), on top of the built-in identifier keys.
+    /// Extra JSON / form keys that hold identifiers, on top of the built-in
+    /// identifier keys: identifier-shaped values under them skip only the
+    /// name model; the dictionary and rule tiers still apply (an e-mail
+    /// under such a key is still redacted).
     pub skip_keys: Vec<String>,
 }
 

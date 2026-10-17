@@ -18,7 +18,10 @@ use crate::hosts::HostList;
 use crate::server::MAX_REQUEST_BODY;
 use crate::sites;
 use crate::transform::RequestOutcome;
-use crate::walk::{Rules, Tier, Visit, walk_form, walk_json, walk_multipart};
+use crate::walk::{
+    Found, Rules, Sink, Tier, Tracking, Visit, utf8_charset, visit_body_text, walk_form, walk_json,
+    walk_multipart,
+};
 use crate::{BodyTransform, Refusal, StreamTransform};
 
 /// The settings one request uses (a snapshot of `[intercept]`).
@@ -107,14 +110,9 @@ impl EngineTransform {
         let mut body = ReqBody::prepare(headers, body)?;
 
         // Pass 1: collect the texts (identifiers skip only the ML model).
-        let mut texts = Vec::new();
-        let mut rules_only = Vec::new();
-        let mut collect = |s: &mut String, tier: Tier| {
-            texts.push(s.clone());
-            rules_only.push(tier == Tier::Identifier);
-        };
+        let mut collect = Collect::default();
         if let Some(q) = query {
-            walk_form(q, &rules, &mut collect);
+            walk_form(q, &rules, &mut collect).map_err(|_| unparseable())?;
         }
         let (_, unscanned) = body.walk(&rules, &mut collect)?;
         if unscanned > 0 && st.unscanned == UnscannedMedia::Block {
@@ -127,6 +125,7 @@ impl EngineTransform {
                 ),
             ));
         }
+        let Collect { texts, rules_only } = collect;
         if texts.is_empty() {
             return Ok(RequestOutcome {
                 body: body.into_bytes(),
@@ -140,30 +139,84 @@ impl EngineTransform {
             .engine
             .redact_many_tiered(&refs, &rules_only, &st.scope_for(host))
             .map_err(engine_refusal)?;
-        let mut counts = BTreeMap::new();
-        for r in &reds {
-            for (k, n) in r.counts() {
-                *counts.entry(k).or_insert(0) += n;
-            }
-        }
 
         // Pass 2: write the results back, in the same order.
-        let mut results = reds.into_iter().map(|r| r.text);
-        let mut assign = |s: &mut String, _: Tier| {
-            if let Some(t) = results.next() {
-                *s = t;
-            }
+        let mut assign = Assign {
+            results: reds.into_iter(),
+            found: Vec::new(),
+            counts: BTreeMap::new(),
         };
-        let target = query
-            .and_then(|q| walk_form(q, &rules, &mut assign))
-            .map(|q| format!("{path}?{q}"));
+        let target = match query {
+            Some(q) => walk_form(q, &rules, &mut assign)
+                .map_err(|_| unparseable())?
+                .map(|q| format!("{path}?{q}")),
+            None => None,
+        };
         let (new_body, _) = body.walk(&rules, &mut assign)?;
         Ok(RequestOutcome {
             body: new_body.unwrap_or_else(|| body.into_bytes()),
-            counts,
+            counts: assign.counts,
             unscanned,
             target,
         })
+    }
+}
+
+/// Pass 1: the texts of a request, and which skip the ML model.
+#[derive(Default)]
+struct Collect {
+    texts: Vec<String>,
+    rules_only: Vec<bool>,
+}
+
+impl Sink for Collect {
+    fn visit(&mut self, s: &mut String, tier: Tier) {
+        self.texts.push(s.clone());
+        self.rules_only.push(tier == Tier::Identifier);
+    }
+
+    fn found(&self) -> Option<&[Found]> {
+        Some(&[])
+    }
+}
+
+/// Pass 2: the engine's results written back in the same order, with what
+/// each replaced and the counts by kind.
+struct Assign {
+    results: std::vec::IntoIter<parda_engine::Redaction>,
+    found: Vec<Found>,
+    counts: BTreeMap<String, u32>,
+}
+
+impl Sink for Assign {
+    fn visit(&mut self, s: &mut String, _: Tier) {
+        self.found.clear();
+        let Some(r) = self.results.next() else {
+            return;
+        };
+        for x in &r.replaced {
+            *self.counts.entry(x.kind.to_string()).or_insert(0) += 1;
+            self.found.push(Found {
+                start: x.original_span.start,
+                end: x.original_span.end,
+                surrogate: x.surrogate.clone(),
+                kind: x.kind.to_string(),
+            });
+        }
+        *s = r.text;
+    }
+
+    fn found(&self) -> Option<&[Found]> {
+        Some(&self.found)
+    }
+
+    fn forget(&mut self, kind: &str) {
+        if let Some(n) = self.counts.get_mut(kind) {
+            *n -= 1;
+            if *n == 0 {
+                self.counts.remove(kind);
+            }
+        }
     }
 }
 
@@ -174,8 +227,10 @@ enum ReqBody {
         raw: Bytes,
         value: Value,
     },
-    /// `application/x-www-form-urlencoded`.
+    /// Declared `application/x-www-form-urlencoded`.
     Form(String),
+    /// Any other text: redacted as it reads literally and as it reads
+    /// decoded as a form.
     Text(String),
     Multipart {
         raw: Bytes,
@@ -207,30 +262,54 @@ impl ReqBody {
             return Ok(ReqBody::Empty);
         }
         let (media, boundary) = media_type(headers);
-        let text = || String::from_utf8(raw.to_vec()).ok();
-        Ok(match media.as_str() {
-            m if is_json(m) => {
-                let value = body::parse_json(&raw).map_err(|_| unparseable())?;
-                ReqBody::Json { raw, value }
-            }
-            "application/x-www-form-urlencoded" => match text() {
-                Some(t) => ReqBody::Form(t),
-                None => ReqBody::Opaque(raw),
-            },
-            "multipart/form-data" => match boundary {
-                Some(boundary) => ReqBody::Multipart { raw, boundary },
-                None => return Err(unparseable()),
-            },
-            // No type, or text: JSON is walked by the JSON rules (sites post
-            // JSON as text/plain to avoid CORS preflights), other text whole.
-            m if m.is_empty() || m.starts_with("text/") => match json_container(&raw) {
-                Some(value) => ReqBody::Json { raw, value },
-                None => match text() {
-                    Some(t) => ReqBody::Text(t),
-                    None => ReqBody::Opaque(raw),
-                },
-            },
-            _ => ReqBody::Opaque(raw),
+        let form = media == "application/x-www-form-urlencoded";
+        let typed_text = media.starts_with("text/");
+        let not_utf8 = || {
+            refusal(
+                400,
+                "parda_not_utf8",
+                "the request body is not UTF-8 text, so parda could not filter it; it was not sent",
+            )
+        };
+        // A body declared in another charset (UTF-16 of ASCII text is valid
+        // UTF-8, NULs interleaved) cannot be read as text here.
+        let declared = headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if (is_json(&media) || form || typed_text) && !utf8_charset(declared) {
+            return Err(not_utf8());
+        }
+        if is_json(&media) {
+            let value = body::parse_json_unique(&raw).map_err(|_| unparseable())?;
+            return Ok(ReqBody::Json { raw, value });
+        }
+        if media == "multipart/form-data" {
+            return match boundary {
+                Some(boundary) => Ok(ReqBody::Multipart { raw, boundary }),
+                None => Err(unparseable()),
+            };
+        }
+        // Whatever the type says, a JSON object or array is walked as JSON:
+        // sites post JSON as text/plain to skip CORS preflights, jQuery
+        // labels it as a form, others as octet-stream.
+        if let Some(value) = json_container(&raw)? {
+            return Ok(ReqBody::Json { raw, value });
+        }
+        if !(form || typed_text || media.is_empty()) {
+            return Ok(ReqBody::Opaque(raw));
+        }
+        // A form or text in another charset (or holding NULs, as UTF-16
+        // does) cannot be filtered; an untyped body like that is binary data.
+        let text = match String::from_utf8(raw.to_vec()) {
+            Ok(text) if !text.contains('\0') => text,
+            _ if form || typed_text => return Err(not_utf8()),
+            _ => return Ok(ReqBody::Opaque(raw)),
+        };
+        Ok(if form {
+            ReqBody::Form(text)
+        } else {
+            ReqBody::Text(text)
         })
     }
 
@@ -240,25 +319,26 @@ impl ReqBody {
         Ok(match self {
             ReqBody::Empty => (None, 0),
             ReqBody::Json { raw, value } => {
-                let mut changed = false;
-                walk_json(value, rules, &mut |t: &mut String, tier| {
-                    let before = t.clone();
-                    f(t, tier);
-                    changed |= *t != before;
-                });
-                let out = changed.then(|| {
+                let mut track = Tracking {
+                    inner: f,
+                    changed: false,
+                };
+                walk_json(value, rules, &mut track).map_err(|_| unparseable())?;
+                let out = track.changed.then(|| {
                     let json = serde_json::to_vec(value).unwrap_or_default();
                     Bytes::from(preserve_numbers(raw, json))
                 });
                 (out, 0)
             }
-            ReqBody::Form(text) => (walk_form(text, rules, f).map(Bytes::from), 0),
+            ReqBody::Form(text) => (
+                walk_form(text, rules, f)
+                    .map_err(|_| unparseable())?
+                    .map(Bytes::from),
+                0,
+            ),
             ReqBody::Text(text) => {
-                if text.trim().is_empty() {
-                    return Ok((None, 0));
-                }
                 let mut t = text.clone();
-                f(&mut t, Tier::Text);
+                visit_body_text(&mut t, rules, f).map_err(|_| unparseable())?;
                 ((t != *text).then(|| Bytes::from(t)), 0)
             }
             ReqBody::Multipart { raw, boundary } => {
@@ -285,13 +365,22 @@ fn is_json(media: &str) -> bool {
     media == "application/json" || media == "text/json" || media.ends_with("+json")
 }
 
-/// A JSON object or array, if `raw` is one.
-fn json_container(raw: &[u8]) -> Option<Value> {
-    let start = raw.iter().find(|b| !b.is_ascii_whitespace())?;
-    if !matches!(start, b'{' | b'[') {
-        return None;
+/// A JSON object or array, if `raw` is one (after a BOM and whitespace).
+/// JSON that names a key twice is refused.
+fn json_container(raw: &[u8]) -> Result<Option<Value>, Refusal> {
+    let start = raw
+        .strip_prefix(b"\xEF\xBB\xBF")
+        .unwrap_or(raw)
+        .iter()
+        .find(|b| !b.is_ascii_whitespace());
+    if !matches!(start, Some(b'{' | b'[')) {
+        return Ok(None);
     }
-    body::parse_json(raw).ok()
+    match body::parse_json_unique(raw) {
+        Ok(v) => Ok(Some(v)),
+        Err(body::JsonError::Invalid) => Ok(None),
+        Err(body::JsonError::DuplicateKey) => Err(unparseable()),
+    }
 }
 
 /// The media type (lower-case, without parameters) and the multipart
@@ -373,34 +462,30 @@ impl BodyTransform for EngineTransform {
         self.rewrite(host, path, headers, body).map(|o| o.body)
     }
 
-    /// As for the answer to a POST (see
-    /// [`BodyTransform::response_stream_for`]).
+    /// Answers are restored only where they are the user's own (see
+    /// `sites::restore_rule`): on chatgpt.com, claude.ai and Gemini the
+    /// allowlisted send (POST) and history (GET) endpoints; on any other
+    /// listed host streamed answers to POST requests. Everything else
+    /// passes through with its tags, so a page someone else wrote never
+    /// gets the viewer's values.
     fn response_stream(
-        &self,
-        host: &str,
-        path: &str,
-        content_type: &str,
-    ) -> Box<dyn StreamTransform> {
-        self.response_stream_for(&http::Method::POST, host, path, content_type)
-    }
-
-    /// Answers are restored only for the user's own sends (POST) and own
-    /// history (allowlisted GET endpoints per site); everything else passes
-    /// through, so a page someone else wrote never gets the viewer's values.
-    fn response_stream_for(
         &self,
         method: &http::Method,
         host: &str,
         path: &str,
         content_type: &str,
     ) -> Box<dyn StreamTransform> {
-        let own = *method == http::Method::POST
-            || (*method == http::Method::GET && sites::restores_get(host, path));
-        if !own {
-            return crate::restore::passthrough();
+        let rule = sites::restore_rule(host, method, path);
+        let scope = || self.settings().scope_for(host);
+        match rule {
+            sites::Restore::Never => crate::restore::passthrough(),
+            sites::Restore::Answer => {
+                crate::restore::for_content_type(&self.engine, &scope(), content_type)
+            }
+            sites::Restore::Streamed => {
+                crate::restore::for_stream_only(&self.engine, &scope(), content_type)
+            }
         }
-        let scope = self.settings().scope_for(host);
-        crate::restore::for_content_type(&self.engine, &scope, content_type)
     }
 
     fn request_outcome(
@@ -770,87 +855,697 @@ pub(crate) mod tests {
         assert_eq!(out.body, mp.replace("Ravi Kumar", "[NAME_1]"));
     }
 
+    fn body_text(out: &RequestOutcome) -> String {
+        String::from_utf8(out.body.to_vec()).unwrap()
+    }
+
+    fn assert_unparseable(r: &Refusal) {
+        assert_eq!(r.status, 400, "{}", r.message);
+        assert!(
+            r.message.starts_with("parda_unparseable_body"),
+            "{}",
+            r.message
+        );
+        assert!(!r.message.contains("Ravi") && !r.message.contains("ravi"));
+    }
+
+    /// Reviewer probes (I3): keys and value-less pieces of forms and query
+    /// strings, and JSON object keys, are text like any value.
+    #[test]
+    fn keys_and_bare_pieces_are_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        let form = "application/x-www-form-urlencoded";
+        let out = rewrite(&t, "chatgpt.com", form, Bytes::from("q=hi&Ravi%20Kumar"));
+        assert_eq!(body_text(&out), "q=hi&%5BNAME_1%5D");
+        assert_eq!(out.counts.get("Person"), Some(&1));
+        let out = rewrite(&t, "chatgpt.com", form, Bytes::from("Ravi+Kumar=1&n=2"));
+        assert_eq!(body_text(&out), "%5BNAME_1%5D=1&n=2");
+        let out = t
+            .rewrite_request(
+                "chatgpt.com",
+                "/search?Ravi%20Kumar",
+                &HeaderMap::new(),
+                Bytes::new(),
+            )
+            .unwrap();
+        assert_eq!(out.target.as_deref(), Some("/search?%5BNAME_1%5D"));
+        let out = t
+            .rewrite_request(
+                "chatgpt.com",
+                "/s?Ravi+Kumar=x&ravi%40example.com",
+                &HeaderMap::new(),
+                Bytes::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            out.target.as_deref(),
+            Some("/s?%5BNAME_1%5D=x&%5BEMAIL_1%5D")
+        );
+        // JSON object keys, at any depth and inside JSON-in-strings; the
+        // order of the keys is kept.
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            Bytes::from(r#"{"a":1,"Ravi Kumar":"x","m":{"ravi@example.com":[1]},"z":2}"#),
+        );
+        assert_eq!(
+            body_text(&out),
+            r#"{"a":1,"[NAME_1]":"x","m":{"[EMAIL_1]":[1]},"z":2}"#
+        );
+        let inner = r#"{"Ravi Kumar":0}"#;
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            json_body(&json!({ "blob": inner })),
+        );
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["blob"], r#"{"[NAME_1]":0}"#);
+        // Identifier keys and values stay byte-identical.
+        let ids =
+            format!(r#"{{"conversation_id":"{UUID}","parent_message_id":"client-created-root"}}"#);
+        assert_eq!(
+            body_text(&rewrite(
+                &t,
+                "chatgpt.com",
+                "application/json",
+                Bytes::from(ids.clone())
+            )),
+            ids
+        );
+        let plain = "f.req=x&at=AJvLN6M%3A1697000000000&flag&e=%E2%9C%93";
+        assert_eq!(
+            body_text(&rewrite(&t, "chatgpt.com", form, Bytes::from(plain))),
+            plain
+        );
+    }
+
+    /// Reviewer probes (I3, M5): a JSON object or array is walked as JSON
+    /// whatever the request says its type is.
+    #[test]
+    fn json_bodies_are_sniffed_under_any_content_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        let body =
+            format!(r#"{{"prompt":"Ravi Kumar, mail ravi@example.com","id":"{UUID}","n":1.50}}"#);
+        let want = body.replace(
+            "Ravi Kumar, mail ravi@example.com",
+            "[NAME_1], mail [EMAIL_1]",
+        );
+        for ct in [
+            "application/x-www-form-urlencoded",
+            "application/x-www-form-urlencoded; charset=UTF-8",
+            "application/octet-stream",
+            "application/x-json",
+            "application/javascript",
+            "image/png",
+            "text/plain",
+            "",
+        ] {
+            let out = rewrite(&t, "chatgpt.com", ct, Bytes::from(body.clone()));
+            assert_eq!(body_text(&out), want, "{ct}");
+            assert_eq!(out.unscanned, 0, "{ct}");
+        }
+        let arr = "\u{feff}[\"Ravi Kumar\"]";
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/octet-stream",
+            Bytes::from(arr),
+        );
+        assert_eq!(body_text(&out), "[\"[NAME_1]\"]");
+        // Anything else of an opaque type is still forwarded unscanned.
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/octet-stream",
+            Bytes::from("{x"),
+        );
+        assert_eq!((body_text(&out).as_str(), out.unscanned), ("{x", 1));
+    }
+
+    /// Reviewer probes (I3, M4): a form or text body that is not UTF-8
+    /// cannot be filtered, so it is refused.
+    #[test]
+    fn non_utf8_form_and_text_bodies_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        for (ct, body) in [
+            (
+                "application/x-www-form-urlencoded",
+                &b"q=Ravi+Kumar&x=\xff"[..],
+            ),
+            ("text/plain; charset=iso-8859-1", b"Ravi Kumar caf\xe9"),
+            ("text/plain", b"Ravi Kumar \xc3"),
+        ] {
+            let r = refusal(&t, ct, Bytes::copy_from_slice(body));
+            assert_eq!(r.status, 400, "{ct}: {}", r.message);
+            assert!(r.message.starts_with("parda_not_utf8"), "{}", r.message);
+            assert!(!r.message.contains("Ravi"));
+        }
+        // An untyped binary body is not text: forwarded, counted unscanned.
+        let out = rewrite(&t, "chatgpt.com", "", Bytes::from_static(b"\x89PNG\xff"));
+        assert_eq!(out.unscanned, 1);
+    }
+
+    fn utf16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    /// Review finding (fix round 1b): a declared charset other than UTF-8
+    /// (UTF-16 of ASCII text is valid UTF-8, NULs interleaved) is refused
+    /// for text, form and JSON bodies; text and form bodies holding NUL
+    /// bytes are too; a multipart field in another charset or holding NULs
+    /// is counted unscanned; an untyped body with NULs is binary.
+    #[test]
+    fn declared_charsets_other_than_utf8_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        let text = utf16le("hello Ravi Kumar, mail ravi@example.com");
+        let form = utf16le("q=Ravi+Kumar&m=ravi%40example.com");
+        for (ct, body) in [
+            ("text/plain; charset=utf-16le", &text),
+            ("text/plain;charset=\"UTF-16\"", &text),
+            ("application/x-www-form-urlencoded; charset=utf-16le", &form),
+            (
+                "application/json; charset=utf-16",
+                &utf16le("{\"a\":\"Ravi Kumar\"}"),
+            ),
+            ("text/plain", &text),
+            ("application/x-www-form-urlencoded", &form),
+            ("text/plain; charset=iso-8859-1", &b"Ravi Kumar".to_vec()),
+        ] {
+            let r = refusal(&t, ct, Bytes::copy_from_slice(body));
+            assert_eq!(r.status, 400, "{ct}: {}", r.message);
+            assert!(
+                r.message.starts_with("parda_not_utf8"),
+                "{ct}: {}",
+                r.message
+            );
+        }
+        // UTF-8 and US-ASCII are text.
+        for ct in ["text/plain; charset=UTF-8", "text/plain; charset=us-ascii"] {
+            let out = rewrite(&t, "chatgpt.com", ct, Bytes::from_static(b"hi Ravi Kumar"));
+            assert_eq!(out.counts.get("Person"), Some(&1), "{ct}");
+        }
+        // Untyped, with NULs: binary, forwarded and counted unscanned.
+        let out = rewrite(&t, "chatgpt.com", "", Bytes::from(text.clone()));
+        assert_eq!((out.unscanned, out.body.as_ref()), (1, text.as_slice()));
+        // Multipart text fields in UTF-16 (declared or not) are unscanned.
+        for part_ct in ["text/plain; charset=utf-16le", "text/plain"] {
+            let mut mp = format!(
+                "--BB\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\
+                 Content-Type: {part_ct}\r\n\r\n"
+            )
+            .into_bytes();
+            mp.extend(utf16le("Ravi Kumar ravi@example.com"));
+            mp.extend_from_slice(b"\r\n--BB--\r\n");
+            let out = rewrite(
+                &t,
+                "chatgpt.com",
+                "multipart/form-data; boundary=BB",
+                Bytes::from(mp.clone()),
+            );
+            assert_eq!(
+                (out.unscanned, out.body.as_ref()),
+                (1, mp.as_slice()),
+                "{part_ct}"
+            );
+        }
+    }
+
+    /// Reviewer probe (M1): serde keeps the last of two equal keys, so the
+    /// first would go out unvisited. Such JSON is refused, also inside
+    /// strings and forms.
+    #[test]
+    fn duplicate_json_keys_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        let dup = r#"{"prompt":"Ravi Kumar","prompt":"hello"}"#;
+        for (ct, body) in [
+            ("application/json", dup.to_string()),
+            ("text/plain", dup.to_string()),
+            ("application/octet-stream", dup.to_string()),
+            ("application/json", r#"{"m":[{"a":1,"a":2}]}"#.to_string()),
+            ("application/json", json!({ "blob": dup }).to_string()),
+            (
+                "application/json",
+                json!([[null, json!([dup]).to_string()]]).to_string(),
+            ),
+            (
+                "application/x-www-form-urlencoded",
+                format!(
+                    "f.req={}",
+                    form_urlencoded::byte_serialize(json!([null, dup]).to_string().as_bytes())
+                        .collect::<String>()
+                ),
+            ),
+            (
+                "application/json",
+                json!({"u": format!("https://x.example/?d={}",
+                    form_urlencoded::byte_serialize(dup.as_bytes()).collect::<String>())})
+                .to_string(),
+            ),
+        ] {
+            assert_unparseable(&refusal(&t, ct, Bytes::from(body)));
+        }
+        // Typed into a message, JSON is text: redacted as written.
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            json_body(&json!({ "prompt": dup })),
+        );
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["prompt"], dup.replace("Ravi Kumar", "[NAME_1]"));
+    }
+
+    /// Reviewer probes (I4, M4): percent-encoding hides an e-mail from the
+    /// rules, so URL queries inside bodies are decoded and redacted like
+    /// the request target, and form-encoded text bodies are walked as forms.
+    #[test]
+    fn url_queries_and_form_encoded_text_are_decoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            Bytes::from(
+                r#"{"href":"https://www.perplexity.ai/search?q=mail%20jdoe%40corp.example%20about%20it#x","id":"https://chatgpt.com/c/1?r=2"}"#,
+            ),
+        );
+        assert_eq!(
+            body_text(&out),
+            r#"{"href":"https://www.perplexity.ai/search?q=mail+%5BEMAIL_1%5D+about+it#x","id":"https://chatgpt.com/c/1?r=2"}"#
+        );
+        // A URL inside prose, in a JSON string or a text body.
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "text/plain",
+            Bytes::from("see https://x.example/p?n=Ravi+Kumar&m=ravi%40example.com#top now"),
+        );
+        assert_eq!(
+            body_text(&out),
+            "see https://x.example/p?n=%5BNAME_1%5D&m=%5BEMAIL_2%5D#top now"
+        );
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            json_body(&json!({"prompt": "read HTTPS://x.example/?q=ravi%40example.com please"})),
+        );
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(
+            v["prompt"],
+            "read HTTPS://x.example/?q=%5BEMAIL_2%5D please"
+        );
+        // Form-encoded text, with or without a content type.
+        for ct in ["text/plain", "text/plain;charset=UTF-8", ""] {
+            let out = rewrite(
+                &t,
+                "chatgpt.com",
+                ct,
+                Bytes::from("prompt=Ravi+Kumar&mail=ravi%40example.com"),
+            );
+            assert_eq!(
+                body_text(&out),
+                "prompt=%5BNAME_1%5D&mail=%5BEMAIL_2%5D",
+                "{ct}"
+            );
+            let out = rewrite(&t, "chatgpt.com", ct, Bytes::from("ravi%40example.com"));
+            assert_eq!(body_text(&out), "%5BEMAIL_2%5D", "{ct}");
+        }
+        // Prose stays prose.
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "text/plain",
+            Bytes::from("1+1=2, Ravi Kumar"),
+        );
+        assert_eq!(body_text(&out), "1+1=2, [NAME_1]");
+    }
+
+    /// `s` read literally and read as form/URL-encoded (`+` a space, `%XX`
+    /// a byte): a value must survive in neither.
+    fn readings(s: &str) -> [String; 2] {
+        let spaced = s.replace('+', " ");
+        let decoded = percent_encoding::percent_decode_str(&spaced)
+            .decode_utf8_lossy()
+            .into_owned();
+        [s.to_string(), decoded]
+    }
+
+    #[track_caller]
+    fn assert_gone(sent: &str, out: &str, values: &[&str]) {
+        for reading in readings(out) {
+            for v in values {
+                assert!(
+                    !reading.contains(v),
+                    "{sent:?} -> {out:?}: {v:?} survives in {reading:?}"
+                );
+            }
+        }
+    }
+
+    /// Scan R5.2: percent-encoding anywhere in a URL hides an e-mail or a
+    /// name from the rules: fragments, path segments, relative and
+    /// scheme-relative URLs and bare query strings are decoded too.
+    #[test]
+    fn url_fragments_paths_and_relative_urls_are_decoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        for url in [
+            "https://www.perplexity.ai/search#q=jdoe%40corp.example",
+            "https://www.perplexity.ai/search#jdoe%40corp.example",
+            "https://x.example/u/jdoe%40corp.example/",
+            "https://x.example/u/jdoe%40corp.example/?n=1#top",
+            "/search?q=mail%20jdoe%40corp.example",
+            "//x.example/?q=mail%20jdoe%40corp.example",
+            "?q=mail%20jdoe%40corp.example",
+            "email=jdoe%40corp.example&n=1",
+            "see /u/jdoe%40corp.example/ today",
+        ] {
+            let body = json!({ "href": url }).to_string();
+            let out = rewrite(&t, "chatgpt.com", "application/json", Bytes::from(body));
+            let v: Value = serde_json::from_slice(&out.body).unwrap();
+            let href = v["href"].as_str().unwrap();
+            assert_gone(url, href, &["jdoe", "corp.example"]);
+            assert_eq!(out.counts.get("Email"), Some(&1), "{url} -> {href}");
+        }
+        for url in [
+            "https://www.perplexity.ai/search#q=Ravi%20Kumar",
+            "https://www.perplexity.ai/search#Ravi%20Kumar",
+            "https://x.example/u/Ravi%20Kumar/",
+            "/u/Ravi+Kumar?x=1",
+        ] {
+            let body = json!({ "href": url }).to_string();
+            let out = rewrite(&t, "chatgpt.com", "application/json", Bytes::from(body));
+            let v: Value = serde_json::from_slice(&out.body).unwrap();
+            let href = v["href"].as_str().unwrap();
+            assert_gone(url, href, &["Ravi", "Kumar"]);
+            assert_eq!(out.counts.get("Person"), Some(&1), "{url} -> {href}");
+        }
+        // Re-encoded where it changed; untouched URLs keep their bytes.
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            Bytes::from(
+                r#"{"a":"https://x.example/u/ravi%40example.com/","b":"https://x.example/a%20b/#c%20d"}"#,
+            ),
+        );
+        assert_eq!(
+            body_text(&out),
+            r#"{"a":"https://x.example/u/%5BEMAIL_2%5D/","b":"https://x.example/a%20b/#c%20d"}"#
+        );
+    }
+
+    /// Scan R5.3 and the form-sniff finding: a body not declared as a form
+    /// is read literally by some servers and decoded by others, so both
+    /// readings are redacted, whatever else the text holds (a trailing
+    /// newline, brackets, non-ASCII).
+    #[test]
+    fn text_bodies_are_redacted_in_both_readings() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = transform(&engine(dir.path()), |_| {});
+        let name = ["Ravi", "Kumar"];
+        let mail = ["jdoe", "corp.example"];
+        for (body, values) in [
+            ("a=Ravi+Kumar", &name[..]),
+            ("a=b Ravi Kumar", &name),
+            ("x%20Ravi%20Kumar", &name),
+            ("prompt=Ravi%20Kumar&n=1\n", &name),
+            ("prompt=Ravi%20Kumar&tags[]=x", &name),
+            ("x.y+tag@corp.example", &["x.y", "tag@", "corp.example"]),
+            ("jdoe.smith+work@corp.example", &mail),
+            ("prompt=hi&mail=jdoe%40corp.example\n", &mail),
+            ("prompt=hi&mail=jdoe%40corp.example\r\n", &mail),
+            ("prompt=hi&mail=jdoe%40corp.example&tags[]=x", &mail),
+            ("prompt=café&mail=jdoe%40corp.example", &mail),
+            ("{x}&m=jdoe%40corp.example", &mail),
+        ] {
+            for ct in ["text/plain", "text/plain;charset=UTF-8", ""] {
+                let out = rewrite(&t, "chatgpt.com", ct, Bytes::from(body));
+                let text = body_text(&out);
+                assert_gone(body, &text, values);
+                assert_eq!(out.unscanned, 0, "{ct} {body:?}");
+                assert_eq!(
+                    out.counts.values().sum::<u32>(),
+                    1,
+                    "{ct} {body:?} -> {text:?}"
+                );
+            }
+        }
+        // Multipart text fields are bodies of their own.
+        let mp = "--b\r\nContent-Disposition: form-data; name=\"payload\"\r\n\r\n\
+                  m=jdoe%40corp.example&n=Ravi+Kumar\r\n--b--\r\n";
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "multipart/form-data; boundary=b",
+            Bytes::from(mp),
+        );
+        let text = body_text(&out);
+        assert_gone(mp, &text, &["jdoe", "Ravi", "Kumar"]);
+        // A name only the model knows, under form keys that would skip it
+        // in a declared form, is found in a text body.
+        let dir = tempfile::tempdir().unwrap();
+        let (_ml, t) = with_names(dir.path());
+        for body in ["id=Priya", "token=Priya&q=hi", "x%20Priya"] {
+            for ct in ["text/plain", ""] {
+                let out = rewrite(&t, "chatgpt.com", ct, Bytes::from(body));
+                assert_gone(body, &body_text(&out), &["Priya"]);
+            }
+        }
+    }
+
     /// Restore `body` as the answer of `host`.
     fn answer(t: &EngineTransform, host: &str, body: &str) -> String {
-        let mut r = t.response_stream(host, "/", "text/plain");
+        let path = if host.ends_with("claude.ai") {
+            "/api/organizations/o1/chat_conversations/c1/completion"
+        } else {
+            "/backend-api/conversation"
+        };
+        let mut r = t.response_stream(&http::Method::POST, host, path, "text/plain");
         let mut out = r.push(body.as_bytes()).to_vec();
         out.extend_from_slice(&r.finish());
         String::from_utf8(out).unwrap()
     }
 
-    #[test]
-    fn only_post_answers_and_own_history_are_restored() {
-        let dir = tempfile::tempdir().unwrap();
-        let t = transform(&engine(dir.path()), |_| {});
-        let restores = |method: http::Method, host: &str, path: &str| {
-            !t.response_stream_for(&method, host, path, "application/json")
-                .is_passthrough()
+    /// Is a `[NAME_1]` in an answer of `content_type` to `method host path`
+    /// restored? (One scope for every site, so only the endpoint rule
+    /// decides.)
+    fn restored(
+        t: &EngineTransform,
+        method: &http::Method,
+        host: &str,
+        path: &str,
+        content_type: &str,
+    ) -> bool {
+        let body = match content_type {
+            "text/event-stream" => "data: {\"t\":\"hi [NAME_1]\"}\n\n",
+            "application/x-ndjson" | "application/json; lines" => {
+                "{\"t\":\"a [NAME_1]\"}\n{\"t\":\"b\"}\n"
+            }
+            "application/json" => "{\"t\":\"hi [NAME_1]\"}",
+            _ => "hi [NAME_1]",
         };
+        let ct = content_type.trim_end_matches("; lines");
+        let mut r = t.response_stream(method, host, path, ct);
+        let mut out = Vec::new();
+        for b in body.as_bytes().chunks(5) {
+            out.extend_from_slice(&r.push(b));
+        }
+        out.extend_from_slice(&r.finish());
+        let out = String::from_utf8(out).unwrap();
+        if out.contains("Ravi Kumar") {
+            return true;
+        }
+        assert_eq!(out, body, "{method} {host}{path} {content_type}");
+        false
+    }
+
+    fn global(dir: &std::path::Path) -> EngineTransform {
+        let e = engine(dir);
+        assert_eq!(e.redact("Ravi Kumar", "global").unwrap().text, "[NAME_1]");
+        transform(&e, |c| c.scope = "global".into())
+    }
+
+    const ALL_TYPES: [&str; 5] = [
+        "text/event-stream",
+        "application/x-ndjson",
+        "application/json; lines",
+        "application/json",
+        "text/plain",
+    ];
+
+    #[test]
+    fn known_sites_restore_only_their_send_and_history_endpoints() {
         use http::Method;
-        // The user's own sends.
-        assert!(restores(
-            Method::POST,
+        let dir = tempfile::tempdir().unwrap();
+        let t = global(dir.path());
+        let sends = [
+            ("chatgpt.com", "/backend-api/conversation"),
+            ("chatgpt.com", "/backend-api/f/conversation"),
+            ("chat.openai.com", "/backend-api/conversation"),
+            ("chatgpt.com", "/Backend-API/Conversation"),
+            ("chatgpt.com", "/backend-api/conversation?x=1"),
+            (
+                "claude.ai",
+                "/api/organizations/o1/chat_conversations/c1/completion",
+            ),
+            (
+                "claude.ai",
+                "/api/organizations/o1/chat_conversations/c1/retry_completion",
+            ),
+            (
+                "gemini.google.com",
+                "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate",
+            ),
+        ];
+        let history = [
+            ("chatgpt.com", "/backend-api/conversation/6f1c2a9e"),
+            ("chatgpt.com", "/backend-api/conversations"),
+            ("claude.ai", "/api/organizations/o1/chat_conversations"),
+            ("claude.ai", "/api/organizations/o1/chat_conversations/c1"),
+        ];
+        for ct in ALL_TYPES {
+            for (host, path) in sends {
+                assert!(
+                    restored(&t, &Method::POST, host, path, ct),
+                    "{host}{path} {ct}"
+                );
+                assert!(
+                    !restored(&t, &Method::GET, host, path, ct),
+                    "{host}{path} {ct}"
+                );
+            }
+            for (host, path) in history {
+                assert!(
+                    restored(&t, &Method::GET, host, path, ct),
+                    "{host}{path} {ct}"
+                );
+                assert!(
+                    !restored(&t, &Method::POST, host, path, ct),
+                    "{host}{path} {ct}"
+                );
+                assert!(
+                    !restored(&t, &Method::PUT, host, path, ct),
+                    "{host}{path} {ct}"
+                );
+                assert!(
+                    !restored(&t, &Method::PATCH, host, path, ct),
+                    "{host}{path} {ct}"
+                );
+            }
+            // Shared pages, GPTs, snapshots, Gemini's batchexecute, any
+            // other endpoint of these sites: tags stay, whatever the
+            // method or format.
+            for (host, path) in [
+                ("chatgpt.com", "/backend-api/share/x"),
+                ("chatgpt.com", "/backend-api/gizmos/x"),
+                ("chatgpt.com", "/backend-api/conversation/a/b"),
+                ("chatgpt.com", "/echo"),
+                ("claude.ai", "/api/chat_snapshots/s1"),
+                ("claude.ai", "/api/organizations/o1/chat_conversations/c1/x"),
+                ("gemini.google.com", "/_/BardChatUi/data/batchexecute"),
+            ] {
+                for m in [Method::GET, Method::POST] {
+                    assert!(!restored(&t, &m, host, path, ct), "{m} {host}{path} {ct}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn path_tricks_never_reach_an_allowlisted_endpoint() {
+        use http::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let t = global(dir.path());
+        let ct = "application/json";
+        for (m, path) in [
+            (Method::GET, "/backend-api/conversation/.."),
+            (Method::GET, "/backend-api/conversation/%2e%2e"),
+            (Method::GET, "/backend-api/conversation/%2E%2E"),
+            (Method::GET, "/backend-api/conversation/."),
+            (Method::GET, "/backend-api/conversation/%2e"),
+            (Method::GET, "//backend-api/conversation/x"),
+            (Method::GET, "/backend-api//conversation/x"),
+            (Method::GET, "/backend-api/conversation/x/"),
+            (Method::GET, "/backend-api/conversation/%252e%252e"),
+            (Method::GET, "/backend-api/conversation/%zz"),
+            (Method::GET, "/backend-api/conversation/a%2F..%2Fshare"),
+            (Method::GET, "/backend-api/conversation/x;.."),
+            (Method::GET, "/backend-api/conversation/x\\..\\..\\share"),
+            (Method::GET, "backend-api/conversation/x"),
+            (Method::POST, "/backend-api/conversation/.."),
+            (Method::POST, "/backend-api/conversation/x/.."),
+            (Method::POST, "/backend-api/share/../conversation"),
+            (Method::POST, "/backend-api/share/%2e%2e/conversation"),
+            (Method::POST, "//backend-api/conversation"),
+            (Method::POST, "/backend-api/conversation/"),
+        ] {
+            assert!(!restored(&t, &m, "chatgpt.com", path, ct), "{m} {path}");
+        }
+        // Percent-encoded literals are decoded once and still match.
+        assert!(restored(
+            &t,
+            &Method::POST,
             "chatgpt.com",
-            "/backend-api/conversation"
+            "/backend-api/%63onversation",
+            ct
         ));
-        assert!(restores(
-            Method::POST,
-            "gemini.google.com",
-            "/_/BardChatUi/data/batchexecute"
-        ));
-        // The user's own history.
-        assert!(restores(
-            Method::GET,
-            "chatgpt.com",
-            "/backend-api/conversation/6f1c2a9e"
-        ));
-        assert!(restores(
-            Method::GET,
-            "chatgpt.com",
-            "/backend-api/conversations"
-        ));
-        assert!(restores(
-            Method::GET,
-            "claude.ai",
-            "/api/organizations/o1/chat_conversations/c1"
-        ));
-        assert!(restores(
-            Method::GET,
-            "claude.ai",
-            "/api/organizations/o1/chat_conversations"
-        ));
-        // Everything else: shared pages, GPTs, snapshots, other methods.
-        assert!(!restores(
-            Method::GET,
-            "chatgpt.com",
-            "/backend-api/share/abc"
-        ));
-        assert!(!restores(
-            Method::GET,
-            "chatgpt.com",
-            "/backend-api/gizmos/g-1"
-        ));
-        assert!(!restores(
-            Method::GET,
-            "chatgpt.com",
-            "/backend-api/conversation/a/b"
-        ));
-        assert!(!restores(
-            Method::GET,
-            "claude.ai",
-            "/api/chat_snapshots/s1"
-        ));
-        assert!(!restores(Method::GET, "perplexity.ai", "/rest/thread/x"));
-        assert!(!restores(
-            Method::PUT,
-            "chatgpt.com",
-            "/backend-api/conversation"
-        ));
-        assert!(!restores(
-            Method::PATCH,
-            "chatgpt.com",
-            "/backend-api/conversation/x"
-        ));
+    }
+
+    #[test]
+    fn other_sites_restore_only_streamed_answers_to_posts() {
+        use http::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let t = global(dir.path());
+        for host in [
+            "chat.deepseek.com",
+            "meta.ai",
+            "perplexity.ai",
+            "example.com",
+        ] {
+            for path in ["/api/v0/chat/completion", "/api/graphql/", "/"] {
+                // Streamed answers to the user's sends.
+                for ct in [
+                    "text/event-stream",
+                    "application/x-ndjson",
+                    "application/json; lines",
+                ] {
+                    assert!(
+                        restored(&t, &Method::POST, host, path, ct),
+                        "{host}{path} {ct}"
+                    );
+                    assert!(
+                        !restored(&t, &Method::GET, host, path, ct),
+                        "{host}{path} {ct}"
+                    );
+                    assert!(
+                        !restored(&t, &Method::PUT, host, path, ct),
+                        "{host}{path} {ct}"
+                    );
+                }
+                // A single document (a GraphQL answer, a page) never.
+                for ct in ["application/json", "text/plain"] {
+                    for m in [Method::POST, Method::GET] {
+                        assert!(!restored(&t, &m, host, path, ct), "{m} {host}{path} {ct}");
+                    }
+                }
+            }
+        }
+        // Google-framed JSON on another site is a document too.
+        let mut r = t.response_stream(&Method::POST, "meta.ai", "/x", "application/json");
+        let framed = ")]}'\n\n23\n[[\"a\",\"hi [NAME_1]\"]]\n";
+        let mut out = r.push(framed.as_bytes()).to_vec();
+        out.extend_from_slice(&r.finish());
+        assert_eq!(out, framed.as_bytes());
     }
 
     #[test]
@@ -936,6 +1631,32 @@ pub(crate) mod tests {
         );
     }
 
+    /// Review M6: a look-alike delimiter cannot turn text into an
+    /// unscanned "file", and base64 text parts are redacted.
+    #[test]
+    fn multipart_look_alike_delimiters_and_base64_parts_are_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path());
+        let t = transform(&e, |c| c.unscanned = UnscannedMedia::Block);
+        let ct = "multipart/form-data; boundary=b0";
+        let body = "--b0\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nhi\r\n\
+                    --b0x\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.txt\"\r\n\r\n\
+                    I am Ravi Kumar\r\n\
+                    --b0\r\nContent-Disposition: form-data; name=\"q\"\r\n\
+                    Content-Transfer-Encoding: base64\r\n\r\nSSBhbSBSYXZpIEt1bWFy\r\n--b0--\r\n";
+        let out = rewrite(&t, "example.com", ct, Bytes::from(body));
+        assert_eq!(out.unscanned, 0);
+        assert_eq!(
+            out.body,
+            body.replace("I am Ravi Kumar", "I am [NAME_1]")
+                .replace("SSBhbSBSYXZpIEt1bWFy", "SSBhbSBbTkFNRV8xXQ==")
+        );
+        // A text part parda cannot decode is unscanned (refused in block mode).
+        let qp = "--b0\r\nContent-Disposition: form-data; name=\"q\"\r\n\
+                  Content-Transfer-Encoding: quoted-printable\r\n\r\nRavi=20Kumar\r\n--b0--\r\n";
+        assert_eq!(refusal(&t, ct, qp).status, 415);
+    }
+
     /// Fails every batch (strict mode refuses the send).
     pub(crate) struct FailingMl;
 
@@ -959,6 +1680,83 @@ pub(crate) mod tests {
             self.0.lock().unwrap().push(texts.len());
             Ok(vec![Vec::new(); texts.len()])
         }
+    }
+
+    /// Flags every "Priya" as a person (a name only the ML model knows) and
+    /// records each text it was shown.
+    pub(crate) struct NameMl(pub(crate) Mutex<Vec<String>>);
+
+    impl MlDetector for NameMl {
+        fn name(&self) -> &str {
+            "names"
+        }
+        fn detect_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<Detection>>> {
+            let mut seen = self.0.lock().unwrap();
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    seen.push(t.to_string());
+                    t.match_indices("Priya")
+                        .map(|(i, m)| Detection {
+                            span: parda_core::Span::new(i, i + m.len()),
+                            kind: parda_core::EntityKind::Person,
+                            score: 0.99,
+                            source: parda_core::Source::Ml,
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+    }
+
+    fn with_names(dir: &std::path::Path) -> (Arc<NameMl>, EngineTransform) {
+        let ml = Arc::new(NameMl(Mutex::new(Vec::new())));
+        let e = engine_with(dir, Some(ml.clone()), |c| c.detect.model = "names".into());
+        (ml, transform(&e, |_| {}))
+    }
+
+    /// Scan R5.1: a key skips the name model only when a value would (it is
+    /// identifier-shaped and looks like an id, or it is a known protocol
+    /// key); a one-word name used as a key is found like any text.
+    #[test]
+    fn name_like_keys_reach_the_name_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ml, t) = with_names(dir.path());
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            Bytes::from(r#"{"prompt":"hi","Priya":"x","m":{"PriyaSharma":1}}"#),
+        );
+        assert_eq!(
+            body_text(&out),
+            r#"{"prompt":"hi","[NAME_1]":"x","m":{"[NAME_1]Sharma":1}}"#
+        );
+        let form = "application/x-www-form-urlencoded";
+        let out = rewrite(&t, "chatgpt.com", form, Bytes::from("Priya_Sharma=1&q=hi"));
+        assert_eq!(body_text(&out), "%5BNAME_1%5D_Sharma=1&q=hi");
+        let out = t
+            .rewrite_request(
+                "chatgpt.com",
+                "/x?PriyaSharma=1",
+                &HeaderMap::new(),
+                Bytes::new(),
+            )
+            .unwrap();
+        assert_eq!(out.target.as_deref(), Some("/x?%5BNAME_1%5DSharma=1"));
+        // Known protocol keys (built-in, site and `skip_keys` lists) and
+        // id-looking keys still skip only the model.
+        ml.0.lock().unwrap().clear();
+        let ids = format!(r#"{{"conversation_id":"{UUID}","model":"auto","{UUID}":1}}"#);
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/json",
+            Bytes::from(ids.clone()),
+        );
+        assert_eq!(body_text(&out), ids);
+        let seen = ml.0.lock().unwrap().clone();
+        assert!(seen.is_empty(), "{seen:?}");
     }
 
     #[test]

