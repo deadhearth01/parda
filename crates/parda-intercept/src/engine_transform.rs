@@ -555,15 +555,21 @@ fn replace_numbers(json: Vec<u8>, changed: &[(usize, String)]) -> Result<Vec<u8>
 /// Whitespace between JSON tokens.
 const JSON_WS: [char; 4] = [' ', '\t', '\n', '\r'];
 
-/// Text that starts like JSON (`{`, `[` or `"`, after a BOM and
-/// whitespace) and holds a backslash, but is not JSON: a lenient reader
-/// would decode escapes that glue a letter to the value (`\n9876543210`)
-/// when read literally, so it cannot be filtered safely.
+/// Text (not JSON, not JSON lines) that starts like JSON (`{`, `[` or
+/// `"`, after a BOM and whitespace) and holds a backslash, or that has a
+/// line like that (R8.1): a lenient reader would decode escapes that glue
+/// a letter to the value (`\n9876543210`) when read literally, so it
+/// cannot be filtered safely. A line that parses on its own counts too: the
+/// body is read literally, never with that line's escapes decoded.
 fn escaped_like_json(text: &str) -> bool {
-    text.trim_start_matches('\u{feff}')
-        .trim_start_matches(JSON_WS)
-        .starts_with(['{', '[', '"'])
-        && text.contains('\\')
+    let looks = |t: &str| {
+        t.trim_start_matches(|c: char| c == '\u{feff}' || JSON_WS.contains(&c))
+            .starts_with(['{', '[', '"'])
+    };
+    (looks(text) && text.contains('\\'))
+        || text
+            .split(['\n', '\r'])
+            .any(|line| line.contains('\\') && looks(line))
 }
 
 /// The media type (lower-case, without parameters) and the multipart
@@ -878,6 +884,45 @@ pub(crate) mod tests {
             Bytes::from("{\"t\":1}\n9876543210\n"),
         );
         assert!(!String::from_utf8_lossy(&out.body).contains("9876543210"));
+    }
+
+    /// R8.1 (scan on 21de04b): the escape check read only the body's first
+    /// character, so a text body whose later line starts like JSON and holds
+    /// JSON escapes was redacted literally (`\n9876543210` glues the `n` to
+    /// the number). Any such line in a text body is refused now, whether it
+    /// parses on its own or not: the body is read literally, never with the
+    /// line's escapes decoded.
+    #[test]
+    fn later_lines_that_look_like_escaped_json_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path());
+        let t = transform(&e, |_| {});
+        for body in [
+            "hello there\n{\"m\":\"Phone:\\n9876543210\", bad}\n",
+            "note\n  [\"Phone:\\n9876543210\"\n",
+            "note\r\n\"Phone:\\n9876543210\r\n",
+            "note\n{\"m\":\"Phone:\\n9876543210\"}\n",
+            "a=1\n\t\"Phone:\\t9876543210\"",
+        ] {
+            for ct in ["text/plain", "text/plain;charset=utf-8", ""] {
+                let r = refusal(&t, ct, body.to_string());
+                assert_eq!(r.status, 400, "{ct} {body:?}");
+                assert!(
+                    r.message.starts_with("parda_unparseable_body"),
+                    "{ct} {body:?}"
+                );
+            }
+        }
+        // Lines that start like JSON without a backslash, or hold one but
+        // do not start like JSON, are text as before.
+        for body in [
+            "Hi\n[Draft] Ravi Kumar\n{ hi }",
+            "Hi\nC:\\new Ravi Kumar\n\"quoted\" too",
+        ] {
+            let out = rewrite(&t, "chatgpt.com", "text/plain", Bytes::from(body));
+            let text = String::from_utf8(out.body.to_vec()).unwrap();
+            assert!(!text.contains("Kumar"), "{text}");
+        }
     }
 
     /// R8.2 (scan on 21de04b): JSON lines in a body not declared as JSON were

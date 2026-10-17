@@ -107,8 +107,8 @@ Tags follow `replace.style` (there is no separate style for intercept).
     `\n9876543210` cannot hide a number. Such a body also keeps the readings a text body gets: its
     strings and keys are read decoded as a form too (`+` is a space), and its numbers as text (a
     number found this way becomes a JSON string holding its tag). A text or untyped body that
-    starts like JSON (`{`, `[`, `"`) and holds a backslash but is not JSON (or JSON lines) is
-    refused. A text or untyped body
+    starts like JSON (`{`, `[`, `"`) and holds a backslash, or that has a line like that, but is
+    not JSON (or JSON lines) is refused. A text or untyped body
     written in form encoding (`prompt=Ravi+Kumar&mail=ravi%40example.com`) is read as a form, so `+`
     and `%40` cannot hide a name or an e-mail.
   - *URLs inside strings.* The query of every `http(s)://` link in any of these strings is decoded,
@@ -138,7 +138,7 @@ Tags follow `replace.style` (there is no separate style for intercept).
 
     | Status and code | When |
     |---|---|
-    | `400 parda_unparseable_body` | a body typed as JSON that is not JSON; a text or untyped body that starts like JSON and holds a backslash but is not JSON (or JSON lines); a JSON key given twice (anywhere, JSON inside strings, forms and queries included); two keys that redaction would make the same; a multipart body without a boundary, that does not split as RFC 2046 says, or whose preamble or epilogue holds the boundary |
+    | `400 parda_unparseable_body` | a body typed as JSON that is not JSON; a text or untyped body that starts like JSON and holds a backslash, or has a line like that, but is not JSON (or JSON lines); a JSON key given twice (anywhere, JSON inside strings, forms and queries included); two keys that redaction would make the same; a multipart body without a boundary, that does not split as RFC 2046 says, or whose preamble or epilogue holds the boundary |
     | `400 parda_not_utf8` | a form, `text/*` or JSON body declaring a charset other than UTF-8 or US-ASCII; a form or `text/*` body that is not UTF-8 or holds NUL bytes (UTF-16) |
     | `413 parda_body_too_large` | a body too large to filter |
     | `415 parda_unsupported_encoding` | a `content-encoding` parda cannot decode |
