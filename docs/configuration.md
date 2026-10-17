@@ -51,7 +51,8 @@ hosts = ["chatgpt.com", "chat.openai.com", "claude.ai", "gemini.google.com", "co
          "perplexity.ai", "chat.deepseek.com", "chat.mistral.ai", "grok.com", "meta.ai", "poe.com"]
 scope = "per-host"                 # each site its own scope; or a fixed name, e.g. "global"
 unscanned = "allow"                # allow | block — file uploads and binary bodies
-skip_keys = []                     # extra JSON / form keys never changed, e.g. ["trace_tag"]
+skip_keys = []                     # extra identifier keys, e.g. ["trace_tag"]: identifier-shaped
+                                   # values under them skip only the name model (rules still apply)
 
 [privacy]
 log_values = false
@@ -120,15 +121,16 @@ Tags follow `replace.style` (there is no separate style for intercept).
     every request it makes.
   - *Not read, counted as unscanned* (with `unscanned = "block"` the request is refused,
     `415 parda_unscanned_blocked`): file parts; multipart fields that are not text or JSON, are not
-    UTF-8, or use another transfer encoding (quoted-printable); bodies of other types that are not
-    JSON (images, binary data); untyped bodies that are not UTF-8. Headers other than `Referer` are
+    UTF-8 (a declared charset other than UTF-8, or NUL bytes, as UTF-16 has), or use another
+    transfer encoding (quoted-printable); bodies of other types that are not JSON (images, binary
+    data); untyped bodies that are not UTF-8 or hold NUL bytes. Headers other than `Referer` are
     forwarded as they are, and WebSocket traffic is tunnelled without inspection.
   - *Refused, never sent unfiltered.* The message names the problem and never quotes the request.
 
     | Status and code | When |
     |---|---|
     | `400 parda_unparseable_body` | a body typed as JSON that is not JSON; a JSON key given twice (anywhere, JSON inside strings, forms and queries included); two keys that redaction would make the same; a multipart body without a boundary, that does not split as RFC 2046 says, or whose preamble or epilogue holds the boundary |
-    | `400 parda_not_utf8` | a form or `text/*` body in a charset other than UTF-8 |
+    | `400 parda_not_utf8` | a form, `text/*` or JSON body declaring a charset other than UTF-8 or US-ASCII; a form or `text/*` body that is not UTF-8 or holds NUL bytes (UTF-16) |
     | `413 parda_body_too_large` | a body too large to filter |
     | `415 parda_unsupported_encoding` | a `content-encoding` parda cannot decode |
     | `415 parda_unscanned_blocked` | an unscanned part while `unscanned = "block"` |
@@ -153,8 +155,11 @@ Tags follow `replace.style` (there is no separate style for intercept).
   - *Formats.* JSON, NDJSON, server-sent-event streams, Google's `)]}'` frames (lengths recomputed)
     and plain text, including tags split across stream events. Real values only land inside JSON
     strings (escaped as JSON) or plain text; data that looks like JSON but does not parse passes
-    through with its tags. HTML pages and other types pass through unchanged. A single event, line
-    or frame larger than 16 MiB passes through, with the rest of that answer, unrestored.
+    through with its tags. A streamed text is JSON text once it reaches a string or an object
+    (`{"`, `["`), not because it starts with a bracket (`[NAME_1] said`, `[1] see` are text); JSON
+    text that turns into prose goes on unrestored. HTML pages and other types pass through
+    unchanged. A single event, line or frame larger than 16 MiB passes through, with the rest of
+    that answer, unrestored.
   - **A tag inside a URL is never restored**, so a prompt-injected image or link cannot carry your
     real data to another server. URLs are read as markdown renderers and browsers read them:
     markdown link and image targets (`](…)`, `](<…>)`, backslash escapes, spaces in `<…>`) and
