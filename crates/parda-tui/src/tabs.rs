@@ -465,6 +465,9 @@ fn intercept_line(it: &Value) -> Option<Line<'static>> {
             warn,
         ),
         (None, Some(e)) => (format!("NOT LISTENING — {e}"), bad),
+        (None, None) if it["enabled"].as_bool() == Some(true) => {
+            (crate::app::NO_PROXY.to_string(), bad)
+        }
         (None, None) if pac_set => (
             "OFF but the system proxy still points here — AI sites fail to load; \
              run parda intercept off"
@@ -1152,6 +1155,11 @@ mod tests {
             (
                 json!({"enabled": false, "listening": null, "ca": true, "error": null, "pac": null}),
                 "intercept  off",
+            ),
+            (
+                // Enabled, but the daemon runs with --no-proxy.
+                json!({"enabled": true, "listening": null, "ca": true, "error": null, "pac": null}),
+                "NOT LISTENING — the daemon runs without",
             ),
             (
                 json!({"enabled": false, "listening": null, "ca": true, "error": null,

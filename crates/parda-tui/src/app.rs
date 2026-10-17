@@ -367,6 +367,7 @@ impl App {
         let intercept_was = c.intercept.enabled;
         f(&mut c);
         let switched_on = c.intercept.enabled && !intercept_was;
+        let switched_off = !c.intercept.enabled && intercept_was;
         let res = c
             .to_toml_string()
             .map_err(anyhow::Error::from)
@@ -377,6 +378,7 @@ impl App {
                     .into()
             }
             Ok(v) if switched_on => intercept_message(&v["intercept"]),
+            Ok(v) if switched_off => intercept_off_message(&v["intercept"]),
             Ok(_) => "saved and applied".into(),
             Err(e) => format!("update failed: {e}"),
         });
@@ -585,13 +587,33 @@ fn intercept_message(it: &Value) -> String {
             "intercept listening on {addr} — run `parda intercept on` to send AI sites through it"
         ),
         (None, Some(e)) => format!("saved, but not listening — {e}"),
+        (None, None) if it["enabled"].as_bool() == Some(true) => NO_PROXY.into(),
         _ => "saved and applied".into(),
+    }
+}
+
+/// Intercept on, but no listener and no reason: the daemon was started
+/// with `--no-proxy` (or the listener ended).
+pub(crate) const NO_PROXY: &str = "NOT LISTENING — the daemon runs without its proxy services \
+                                   (restart it without --no-proxy)";
+
+/// What switching intercept off did, from the daemon's answer.
+fn intercept_off_message(it: &Value) -> String {
+    if !it.is_object() {
+        return "saved and applied".into();
+    }
+    if it["pac"].is_string() {
+        "listener stopped — the system proxy still sends AI sites to parda, so they fail to \
+         load; run `parda intercept off` to restore your settings"
+            .into()
+    } else {
+        "intercept off — listener stopped".into()
     }
 }
 
 #[cfg(test)]
 mod intercept_message_tests {
-    use super::intercept_message;
+    use super::{intercept_message, intercept_off_message};
     use serde_json::json;
 
     #[test]
@@ -615,7 +637,33 @@ mod intercept_message_tests {
             m.contains("127.0.0.1:9999") && m.contains("parda intercept on"),
             "{m}"
         );
+        // Switched on, but the daemon runs with --no-proxy: no listener, no error.
+        let no_proxy = json!({"enabled": true, "listening": null, "error": null, "pac": null});
+        let m = intercept_message(&no_proxy);
+        assert!(
+            m.contains("NOT LISTENING") && m.contains("--no-proxy"),
+            "{m}"
+        );
         // An older daemon says nothing about it.
         assert_eq!(intercept_message(&json!(null)), "saved and applied");
+    }
+
+    #[test]
+    fn says_what_switching_intercept_off_did() {
+        let pac_set = json!({"enabled": false, "listening": null,
+                             "pac": "http://127.0.0.1:8788/parda.pac"});
+        let m = intercept_off_message(&pac_set);
+        assert!(
+            m.contains("listener stopped")
+                && m.contains("fail to load")
+                && m.contains("parda intercept off"),
+            "{m}"
+        );
+        let clean = json!({"enabled": false, "listening": null, "pac": null});
+        assert_eq!(
+            intercept_off_message(&clean),
+            "intercept off — listener stopped"
+        );
+        assert_eq!(intercept_off_message(&json!(null)), "saved and applied");
     }
 }
