@@ -48,6 +48,7 @@ pub struct Seen {
     pub query: Option<String>,
     pub content_type: Option<String>,
     pub content_encoding: Option<String>,
+    pub referer: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -106,6 +107,7 @@ async fn handle(
         query: req.uri().query().map(str::to_string),
         content_type: header("content-type"),
         content_encoding: header("content-encoding"),
+        referer: header("referer"),
         body: Vec::new(),
     };
     s.body = req.into_body().collect().await.unwrap().to_bytes().to_vec();

@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::header::{
     ACCEPT_ENCODING, ALLOW, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_TYPE, HOST, ORIGIN, UPGRADE, X_CONTENT_TYPE_OPTIONS,
+    CONTENT_TYPE, HOST, ORIGIN, REFERER, UPGRADE, X_CONTENT_TYPE_OPTIONS,
 };
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
@@ -577,6 +577,7 @@ async fn forward(
     );
 
     let mut headers = end_to_end(&parts.headers);
+    strip_referer(&mut headers);
     headers.remove(HOST);
     headers.remove(CONTENT_LENGTH);
     headers.remove(CONTENT_ENCODING);
@@ -769,6 +770,7 @@ async fn upgrade(
 ) -> Response<Body> {
     let client_side = hyper::upgrade::on(&mut req);
     let mut headers = end_to_end(req.headers());
+    strip_referer(&mut headers);
     headers.remove(HOST);
     headers.remove(CONTENT_LENGTH);
     headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
@@ -850,6 +852,27 @@ fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
         .map(|t| t.trim().to_ascii_lowercase())
         .filter(|t| !t.is_empty())
         .collect()
+}
+
+/// Cut the query and fragment off every `Referer`. A page opened with the
+/// prompt in its URL (`chatgpt.com/?q=…`, `claude.ai/new?q=…`) would
+/// otherwise send that text, unredacted, with every later request it makes.
+fn strip_referer(headers: &mut HeaderMap) {
+    let values: Vec<HeaderValue> = headers.get_all(REFERER).iter().cloned().collect();
+    if values.is_empty() {
+        return;
+    }
+    headers.remove(REFERER);
+    for v in values {
+        let b = v.as_bytes();
+        let cut = b
+            .iter()
+            .position(|&c| c == b'?' || c == b'#')
+            .unwrap_or(b.len());
+        if let Ok(v) = HeaderValue::from_bytes(&b[..cut]) {
+            headers.append(REFERER, v);
+        }
+    }
 }
 
 /// `headers` without hop-by-hop headers (fixed list plus any named in
@@ -1017,6 +1040,39 @@ mod tests {
         .await
         .expect("read_body must give up on its own");
         assert_eq!(r.unwrap_err(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn referers_lose_query_and_fragment() {
+        let mut h = HeaderMap::new();
+        h.append(
+            REFERER,
+            HeaderValue::from_static("https://chatgpt.com/?q=Ravi#x"),
+        );
+        h.append(
+            REFERER,
+            HeaderValue::from_static("https://a.example/p#Ravi?y"),
+        );
+        h.append(REFERER, HeaderValue::from_static("https://a.example/p"));
+        h.insert(ORIGIN, HeaderValue::from_static("https://chatgpt.com"));
+        strip_referer(&mut h);
+        let got: Vec<_> = h
+            .get_all(REFERER)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "https://chatgpt.com/",
+                "https://a.example/p",
+                "https://a.example/p"
+            ]
+        );
+        assert_eq!(h.get(ORIGIN).unwrap(), "https://chatgpt.com");
+        let mut none = HeaderMap::new();
+        strip_referer(&mut none);
+        assert!(none.is_empty());
     }
 
     #[test]

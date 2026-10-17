@@ -690,3 +690,43 @@ async fn other_sites_get_back_streamed_answers_to_sends_only() {
         seen[3].text()
     );
 }
+
+/// Reviewer probe (I4): a page opened as `chatgpt.com/?q=<prompt>` would
+/// send the real prompt in the `Referer` of every later request, undoing the
+/// query redaction. Listed hosts get the referrer without query or fragment.
+#[tokio::test]
+async fn referer_loses_its_query_and_fragment() {
+    let up = start_upstream(site()).await;
+    let parda = start_parda(&up, |_| {}, None).await;
+    let c = parda.client();
+    let base = format!("https://chatgpt.com:{}", up.port);
+    for (referer, want) in [
+        (
+            "https://chatgpt.com/?q=Ravi%20Kumar%20ravi%40example.com#frag",
+            "https://chatgpt.com/",
+        ),
+        ("https://chatgpt.com/c/x#Ravi", "https://chatgpt.com/c/x"),
+        (
+            "https://other.example/a?b=Ravi+Kumar",
+            "https://other.example/a",
+        ),
+        ("https://chatgpt.com/c/x", "https://chatgpt.com/c/x"),
+    ] {
+        c.get(format!("{base}/echo"))
+            .header("referer", referer)
+            .send()
+            .await
+            .unwrap();
+        c.post(format!("{base}/echo"))
+            .header("referer", referer)
+            .header("content-type", "text/plain")
+            .body("hi")
+            .send()
+            .await
+            .unwrap();
+        let seen = up.seen();
+        for s in &seen[seen.len() - 2..] {
+            assert_eq!(s.referer.as_deref(), Some(want), "{} {referer}", s.method);
+        }
+    }
+}
