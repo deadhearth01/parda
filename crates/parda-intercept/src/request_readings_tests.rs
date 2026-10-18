@@ -6,6 +6,8 @@
 //! over values, encoder chains and declared content types.
 
 use bytes::Bytes;
+use http::HeaderMap;
+use http::header::CONTENT_TYPE;
 use serde_json::Value;
 
 use crate::engine_transform::EngineTransform;
@@ -322,6 +324,46 @@ fn r2_6_multipart_fields_get_the_body_readings() {
     // A field declared as JSON that is not JSON is refused.
     let body = field("meta", Some("application/json"), "Phone: 9876543210");
     assert_unparseable(&body, &send(&t, mp, &body).unwrap_err());
+}
+
+/// Round 2, finding 7: a Content-Type holding a byte outside visible ASCII
+/// made the body look untyped, so a UTF-16 or Latin-1 body went out
+/// unscanned instead of being refused; so did a second Content-Type.
+#[test]
+fn r2_7_unreadable_content_types_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = transform(&engine(dir.path()), |_| {});
+    let utf16: Vec<u8> = "Ravi Kumar, ravi@example.com, 9876543210"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let latin1 = b"Ravi Kumar caf\xe9 9876543210".to_vec();
+    for (ct, body) in [
+        (&b"text/plain; charset=utf-16le; x=\xff"[..], &utf16),
+        (b"application/json; charset=utf-16le; x=\xe9", &utf16),
+        (b"text/plain; charset=iso-8859-1; v=\xe9", &latin1),
+        // Unknown charsets on any type.
+        (b"application/octet-stream; charset=x-unknown", &latin1),
+    ] {
+        let mut h = HeaderMap::new();
+        h.insert(CONTENT_TYPE, http::HeaderValue::from_bytes(ct).unwrap());
+        let r = t
+            .rewrite_request("chatgpt.com", "/x", &h, Bytes::from(body.clone()))
+            .unwrap_err();
+        assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(ct));
+        assert!(r.message.starts_with("parda_not_utf8"), "{}", r.message);
+    }
+    // Two Content-Types: refused, whichever comes first.
+    let mut h = HeaderMap::new();
+    h.append(CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+    h.append(
+        CONTENT_TYPE,
+        "text/plain; charset=utf-16le".parse().unwrap(),
+    );
+    let r = t
+        .rewrite_request("chatgpt.com", "/x", &h, Bytes::from(utf16.clone()))
+        .unwrap_err();
+    assert_eq!(r.status, 400, "{}", r.message);
 }
 
 /// Implementer's open item: a value split across JSON tokens is found by

@@ -141,7 +141,7 @@ Tags follow `replace.style` (there is no separate style for intercept).
     | Status and code | When |
     |---|---|
     | `400 parda_unparseable_body` | a body or multipart field typed as JSON that is not JSON; text that looks like escaped JSON but is not JSON (see above); a JSON key given twice (anywhere, JSON inside strings, forms and queries included); two keys that redaction would make the same; a multipart body without a boundary, that does not split as RFC 2046 says, or whose preamble or epilogue holds the boundary |
-    | `400 parda_not_utf8` | a form, `text/*` or JSON body declaring a charset other than UTF-8 or US-ASCII; a form or `text/*` body that is not UTF-8 or holds NUL bytes (UTF-16) |
+    | `400 parda_not_utf8` | a body of any type declaring a charset other than UTF-8 or US-ASCII; a `Content-Type` holding bytes outside visible ASCII, or two different ones; a form or `text/*` body that is not UTF-8 or holds NUL bytes (UTF-16) |
     | `413 parda_body_too_large` | a body too large to filter |
     | `415 parda_unsupported_encoding` | a `content-encoding` parda cannot decode |
     | `415 parda_unscanned_blocked` | an unscanned part (a file, binary data, a WebSocket upgrade) while `unscanned = "block"` |

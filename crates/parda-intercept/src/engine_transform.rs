@@ -269,17 +269,7 @@ impl ReqBody {
         if raw.is_empty() {
             return Ok(ReqBody::Empty);
         }
-        let ct = content_type(headers)?;
-        let (media, boundary) = media_type(&ct);
-        // A body declared in another charset (UTF-16 of ASCII text is valid
-        // UTF-8, NULs interleaved) cannot be read as text here.
-        if (is_json(&media)
-            || media == "application/x-www-form-urlencoded"
-            || media.starts_with("text/"))
-            && !utf8_charset(&ct)
-        {
-            return Err(not_utf8());
-        }
+        let (media, boundary) = media_type(&content_type(headers)?);
         if media == "multipart/form-data" {
             return match boundary {
                 Some(boundary) => Ok(ReqBody::Multipart { raw, boundary }),
@@ -339,13 +329,23 @@ fn is_json(media: &str) -> bool {
     media == "application/json" || media == "text/json" || media.ends_with("+json")
 }
 
-/// The request's `Content-Type` (empty when it has none).
+/// The request's `Content-Type` (empty when it has none). A type parda
+/// cannot read for sure is refused like text that is not UTF-8: one holding
+/// bytes outside visible ASCII (it would read as no type at all), a second,
+/// different one, or a charset other than UTF-8 or US-ASCII on any type.
 fn content_type(headers: &HeaderMap) -> Result<String, Refusal> {
-    Ok(headers
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string())
+    let mut all = headers.get_all(CONTENT_TYPE).iter();
+    let Some(first) = all.next() else {
+        return Ok(String::new());
+    };
+    if all.any(|v| v != first) {
+        return Err(not_utf8());
+    }
+    let ct = first.to_str().map_err(|_| not_utf8())?;
+    if !utf8_charset(ct) {
+        return Err(not_utf8());
+    }
+    Ok(ct.to_string())
 }
 
 /// The media type (lower-case, without parameters) and the multipart

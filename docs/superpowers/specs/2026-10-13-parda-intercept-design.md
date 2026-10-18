@@ -54,7 +54,7 @@ browser / desktop app ──PAC──► AI host?  no ──► DIRECT (untouche
   | Status, code | When |
   |---|---|
   | 400 `parda_unparseable_body` | body or multipart field typed as JSON that does not parse; text that looks like escaped JSON but is not JSON (§4); a JSON key repeated anywhere (also JSON in strings, forms, queries, sniffed bodies); two keys that redaction makes equal; multipart without a boundary, not splitting per RFC 2046, or with the boundary in its preamble or epilogue |
-  | 400 `parda_not_utf8` | form, `text/*` or JSON body declaring a charset other than UTF-8/US-ASCII; form or `text/*` body not UTF-8 or holding NUL bytes |
+  | 400 `parda_not_utf8` | any body declaring a charset other than UTF-8/US-ASCII; a `Content-Type` with bytes outside visible ASCII, or two different ones; form or `text/*` body not UTF-8 or holding NUL bytes |
   | 413 `parda_body_too_large` | decoded body over the cap |
   | 415 `parda_unsupported_encoding` | unknown `content-encoding` |
   | 415 `parda_unscanned_blocked` | unscanned part with `intercept.unscanned = "block"` |
