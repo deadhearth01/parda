@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 parda-core.workspace = true
 parda-engine.workspace = true
+parda-wire.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -24,9 +25,12 @@ futures.workspace = true
 http.workspace = true
 
 [dev-dependencies]
+# Compressing test request bodies.
+flate2 = "1"
+ruzstd = "0.9"
 parda-detect.workspace = true
 tempfile.workspace = true
-flate2 = "1"
+brotli = "9"
 proptest.workspace = true
 
 [lints]

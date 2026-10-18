@@ -45,6 +45,31 @@ macro_rules! hf {
 
 static CATALOG: &[ModelSpec] = &[
     ModelSpec {
+        id: "parda-pii-edge",
+        description: "parda fine-tune of GLiNER-PII edge — India-first + global names, Aadhaar/PAN/UPI/IFSC (fp32)",
+        license: "apache-2.0",
+        files: &[
+            ModelFile {
+                path: "model.onnx",
+                url: "https://github.com/deadhearth01/parda/releases/download/models-v1/parda-pii-edge-model.onnx",
+                sha256: "3397facc44c8435696cd6deb14f5c7da6a0440844363d6b0f0f44454b4de16e6",
+                size: 181_117_929,
+            },
+            ModelFile {
+                path: "tokenizer.json",
+                url: "https://github.com/deadhearth01/parda/releases/download/models-v1/parda-pii-edge-tokenizer.json",
+                sha256: "e74d8989e6feaad253ce072ca7db3ff9a1a211ca271ec7a4f1f73cd1529cff12",
+                size: 3_583_851,
+            },
+            ModelFile {
+                path: "gliner_config.json",
+                url: "https://github.com/deadhearth01/parda/releases/download/models-v1/parda-pii-edge-gliner_config.json",
+                sha256: "2a05ac6f249c43723c11288fb6fa6f04533db1b3e15aba7a33694b2193d9b342",
+                size: 4_551,
+            },
+        ],
+    },
+    ModelSpec {
         id: "gliner-pii-edge",
         description: "Knowledgator GLiNER-PII edge (Ettin 32M, INT8) — fast general PII model",
         license: "apache-2.0",

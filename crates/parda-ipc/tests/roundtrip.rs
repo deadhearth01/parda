@@ -844,7 +844,7 @@ fn every_request_roundtrips_through_json() {
             scope: Some("chat".into()),
         },
         Request::Restore {
-            text: "⟦PERSON_1⟧".into(),
+            text: "[NAME_1]".into(),
             scope: None,
         },
         Request::Scan {

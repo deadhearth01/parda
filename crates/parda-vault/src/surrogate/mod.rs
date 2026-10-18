@@ -20,9 +20,9 @@ use parda_core::EntityKind;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-/// A typed placeholder: `token(&EntityKind::Person, 1)` → `⟦PERSON_1⟧`.
+/// A typed tag: `token(&EntityKind::Person, 1)` → `[NAME_1]`.
 pub fn token(kind: &EntityKind, n: u32) -> String {
-    format!("⟦{}_{n}⟧", kind.label())
+    format!("[{}_{n}]", kind.tag_label())
 }
 
 fn rng_for(seed: [u8; 32], attempt: u32) -> ChaCha20Rng {
@@ -96,6 +96,20 @@ impl SurrogateGen {
         }
         // Nothing in the value could be varied (e.g. punctuation only).
         token(kind, token_number(seed, attempt))
+    }
+
+    /// A stand-in for a URL whose contents were redacted in place:
+    /// `template` is the URL with every value found inside it already
+    /// replaced by its own stand-in, at the byte ranges `pins`. Those stay
+    /// verbatim; the rest is replaced as by [`generate`](Self::generate).
+    pub fn url_with_pins(
+        &self,
+        template: &str,
+        pins: &[(usize, usize)],
+        seed: [u8; 32],
+        attempt: u32,
+    ) -> String {
+        ids::url_pinned(template, pins, &mut rng_for(seed, attempt))
     }
 }
 
@@ -218,7 +232,7 @@ mod tests {
     #[test]
     fn address_uses_token() {
         let s = SurrogateGen::new().generate(&EntityKind::Address, "12 MG Road, Pune", seed(14), 0);
-        assert!(s.starts_with("⟦ADDRESS_"));
+        assert!(s.starts_with("[ADDRESS_"));
     }
 
     #[test]
@@ -232,8 +246,9 @@ mod tests {
 
     #[test]
     fn token_format() {
-        assert_eq!(token(&EntityKind::Person, 1), "⟦PERSON_1⟧");
-        assert_eq!(token(&EntityKind::IpAddress, 7), "⟦IP_ADDRESS_7⟧");
+        assert_eq!(token(&EntityKind::Person, 1), "[NAME_1]");
+        assert_eq!(token(&EntityKind::IpAddress, 7), "[IP_7]");
+        assert_eq!(token(&EntityKind::Aadhaar, 2), "[AADHAAR_2]");
     }
 
     #[test]

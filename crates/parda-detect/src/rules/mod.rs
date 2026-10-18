@@ -1,6 +1,7 @@
 //! Compiled recognizers. Findings may overlap; the engine applies core's merge policy.
 mod global;
 mod india;
+mod keyed;
 mod secrets;
 mod us_uk;
 
@@ -46,9 +47,18 @@ impl RuleDetector {
                 continue;
             }
             match pack.as_str() {
-                "global" => rules.extend(global::rules()),
-                "india" => rules.extend(india::rules()),
-                "us_uk" => rules.extend(us_uk::rules()),
+                "global" => {
+                    rules.extend(global::rules());
+                    rules.extend(keyed::global());
+                }
+                "india" => {
+                    rules.extend(india::rules());
+                    rules.extend(keyed::india());
+                }
+                "us_uk" => {
+                    rules.extend(us_uk::rules());
+                    rules.extend(keyed::us_uk());
+                }
                 "secrets" => rules.extend(secrets::rules()),
                 _ => tracing::warn!(pack, "unknown rule pack; ignoring"),
             }

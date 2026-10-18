@@ -2,7 +2,9 @@
 
 mod commands;
 
-use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
+
+use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
@@ -11,11 +13,13 @@ use clap::{Parser, Subcommand};
     about = "Local PII filter for AI chats and agents",
     long_about = "parda replaces names, contacts, IDs and secrets with realistic stand-ins before \
 text reaches a cloud AI, and puts the real values back in the answers. Everything runs on this \
-machine.\n\nStart with `parda setup`, then point your agent at the proxy (`parda env claude`)."
+machine.\n\nStart with `parda setup`, then point your agent at the proxy (`parda env claude`). \
+Run `parda` alone in a terminal for the dashboard."
 )]
 struct Cli {
+    /// No subcommand: the dashboard in a terminal, this help otherwise.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -32,7 +36,7 @@ enum Command {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// Open the terminal dashboard.
+    /// Open the terminal dashboard (also: `parda` alone in a terminal).
     Tui {
         /// Print every tab once as plain text instead (for scripts and bug reports).
         #[arg(long)]
@@ -40,6 +44,10 @@ enum Command {
     },
     /// Stop the running daemon.
     Stop,
+    /// Turn protection on (the default).
+    On,
+    /// Pause protection: text is sent unredacted until `parda on`.
+    Off,
     /// Show daemon status.
     Status {
         #[arg(long)]
@@ -93,6 +101,12 @@ enum Command {
     /// Start parda at login.
     #[command(subcommand)]
     Service(ServiceCmd),
+    /// The local root certificate used to protect AI websites and apps.
+    #[command(subcommand)]
+    Ca(CaCmd),
+    /// Filter AI websites and apps: point the system proxy setting at parda.
+    #[command(subcommand)]
+    Intercept(InterceptCmd),
     /// Print environment settings that route an agent through parda.
     Env {
         #[arg(value_parser = ["claude", "codex", "openai", "anthropic"])]
@@ -161,9 +175,60 @@ enum ServiceCmd {
     Status,
 }
 
+#[derive(Subcommand)]
+enum CaCmd {
+    /// Create the certificate (kept in parda's data folder, key encrypted).
+    Create {
+        /// Replace an existing certificate (re-run `parda ca install` afterwards).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the certificate's path.
+    Path,
+    /// Trust the certificate for your user (the OS asks you to confirm).
+    Install,
+    /// Remove it from your trust store (refused while intercept is in use).
+    Uninstall {
+        /// Remove it even though AI sites sent to parda will then fail to load.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show whether it exists and is trusted.
+    Status,
+}
+
+#[derive(Subcommand)]
+enum InterceptCmd {
+    /// Start filtering AI sites (needs a trusted `parda ca`); prints how to undo.
+    On,
+    /// Put the previous proxy settings back and stop filtering AI sites.
+    Off {
+        /// The saved settings cannot be read: switch off parda's automatic
+        /// proxy setting wherever it is set and move the saved file aside.
+        #[arg(long)]
+        forget: bool,
+    },
+    /// Certificate, listener, system proxy and site list (changes nothing).
+    Status,
+}
+
 fn main() {
     let cli = Cli::parse();
-    let result = match cli.command {
+    let Some(command) = cli.command else {
+        // `parda` alone: the dashboard for a person at a terminal, the
+        // short help for scripts and pipes.
+        let result = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            commands::tui::run(false)
+        } else {
+            Cli::command().print_help().map_err(anyhow::Error::from)
+        };
+        if let Err(e) = result {
+            eprintln!("parda: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    };
+    let result = match command {
         Command::Daemon {
             no_clipboard,
             no_proxy,
@@ -172,6 +237,8 @@ fn main() {
         } => commands::daemon::run(!no_proxy, !no_clipboard, !no_hotkey, verbose),
         Command::Tui { dump } => commands::tui::run(dump),
         Command::Stop => commands::status::stop(),
+        Command::On => commands::protection::set(true),
+        Command::Off => commands::protection::set(false),
         Command::Status { json } => commands::status::run(json),
         Command::Redact { text, scope, json } => commands::redact::redact(text, scope, json),
         Command::Restore { text, scope } => commands::redact::restore(text, scope),
@@ -210,6 +277,18 @@ fn main() {
             ServiceCmd::Uninstall => commands::service::uninstall(),
             ServiceCmd::Status => commands::service::status(),
         },
+        Command::Ca(c) => match c {
+            CaCmd::Create { force } => commands::ca::create(force),
+            CaCmd::Path => commands::ca::path(),
+            CaCmd::Install => commands::ca::install(),
+            CaCmd::Uninstall { force } => commands::ca::uninstall(force),
+            CaCmd::Status => commands::ca::status(),
+        },
+        Command::Intercept(i) => commands::intercept::with_system(|cx| match i {
+            InterceptCmd::On => commands::intercept::on(cx),
+            InterceptCmd::Off { forget } => commands::intercept::off_with(cx, forget),
+            InterceptCmd::Status => commands::intercept::status(cx),
+        }),
         Command::Env { agent } => commands::env::run(&agent),
     };
     if let Err(e) = result {

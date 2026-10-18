@@ -27,12 +27,6 @@ impl HFTokenizer {
         })
     }
 
-    pub fn from_pretrained(identifier: &str) -> Result<Self> {
-        Ok(Self {
-            inner: tokenizers::Tokenizer::from_pretrained(identifier, None)?
-        })
-    }
-
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         Ok(Self {
             inner: tokenizers::Tokenizer::from_bytes(bytes)?

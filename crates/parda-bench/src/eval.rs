@@ -29,6 +29,10 @@ pub struct Report {
     /// Cases with `restore(redact(x)) == x`.
     pub round_trip_rate: f64,
     pub mean_ms: f64,
+    /// Gold values not found, as `Kind: value` (the corpus is synthetic).
+    pub misses: Vec<String>,
+    /// Gold values still present in the redacted text.
+    pub leaks: Vec<String>,
 }
 
 /// A prediction matches a gold span of the same kind when it covers it or
@@ -55,6 +59,7 @@ pub fn score(model: &str, outcomes: &[Outcome<'_>]) -> Report {
     let mut per_kind: BTreeMap<String, KindScore> = BTreeMap::new();
     let mut region_person: BTreeMap<String, (u32, u32)> = BTreeMap::new();
     let (mut no_leak, mut round_trip) = (0u32, 0u32);
+    let (mut misses, mut leaks) = (Vec::new(), Vec::new());
     let mut ms = 0.0;
     let gold_kinds: std::collections::BTreeSet<String> = outcomes
         .iter()
@@ -72,6 +77,9 @@ pub fn score(model: &str, outcomes: &[Outcome<'_>]) -> Report {
             let k = per_kind.entry(g.kind.clone()).or_default();
             k.gold += 1;
             k.found += u32::from(hit);
+            if !hit {
+                misses.push(format!("{}: {}", g.kind, &o.case.text[g.start..g.end]));
+            }
             if g.kind == "Person" {
                 let r = region_person
                     .entry(o.case.region().to_string())
@@ -94,11 +102,15 @@ pub fn score(model: &str, outcomes: &[Outcome<'_>]) -> Report {
             k.predicted += 1;
             k.correct += u32::from(ok);
         }
-        let leaked = o
+        let leaked_values: Vec<&str> = o
             .case
             .entities
             .iter()
-            .any(|g| o.redacted.contains(&o.case.text[g.start..g.end]));
+            .map(|g| &o.case.text[g.start..g.end])
+            .filter(|v| o.redacted.contains(v))
+            .collect();
+        let leaked = !leaked_values.is_empty();
+        leaks.extend(leaked_values.into_iter().map(String::from));
         no_leak += u32::from(!leaked);
         round_trip += u32::from(o.restored == o.case.text);
     }
@@ -118,6 +130,8 @@ pub fn score(model: &str, outcomes: &[Outcome<'_>]) -> Report {
         zero_leak_rate: ratio(no_leak, n),
         round_trip_rate: ratio(round_trip, n),
         mean_ms: if n == 0 { 0.0 } else { ms / f64::from(n) },
+        misses,
+        leaks,
     }
 }
 

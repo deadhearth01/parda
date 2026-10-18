@@ -127,4 +127,7 @@ version = "1.11.1"
 
 [dependencies.tokenizers]
 version = "0.21.0"
-features = ["http"]
+# parda patch: no network code and no esaxx (its static CRT breaks MSVC links
+# against ONNX Runtime). Upstream enabled the defaults plus "http".
+default-features = false
+features = ["onig"]

@@ -1,0 +1,24 @@
+# Names never used as stand-ins: they are also everyday English words,
+# eponyms of laws, units, algorithms or tools, brands or places, so they
+# turn up in text for other reasons. Every word of a stand-in becomes its own
+# mapping and restore matches words in any case, so such a stand-in would
+# rewrite "foster collaboration", "Maxwell's equations", "Graham scan",
+# "Murphy's law" or "Jenkins pipeline" in answers. The words still count as
+# names when classifying a real person's name (Indian or Western).
+# Whitespace separated, any case.
+
+# Everyday English words.
+foster warren victor henry carter palmer tucker scott dirk hector jasper
+julian norman oscar peter roger ralph martin marshall chandler harper fowler
+griffin bailey franklin underwood galloway juliet danish pinto bora shah khan
+kang dalal
+
+# Laws, units, theorems, algorithms, tools.
+maxwell graham lambert dalton gilbert johnson murphy kelly morgan jenkins
+kimball pearson reynolds schmidt thompson jensen hamilton laurent kaplan cohen
+friedman montgomery walsh wolfe watson wilson lloyd fleming hartley rutherford
+kessler nielsen lewis russell clifford alice miranda holmes
+
+# Brands and places.
+suzuki tiffany chelsea charlotte carmen wendy karen scarlett gibson collins
+webster jameson wagner stanley bajaj zara

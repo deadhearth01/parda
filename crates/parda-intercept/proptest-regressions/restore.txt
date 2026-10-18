@@ -1,0 +1,15 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8b1f9c8ad74fbbd4b3a81abe41f4438ccbca1bb934d21de0f7078ffb9bb03d69 # shrinks to text = " <a href=\" <a href=\"\n> [NAME_1]", cuts = [], chunk = 1
+cc 22c86a3a5ba52b3fc7d4a6b777bebd2ba90a505c09e6a4ce098aabb3e158c540 # shrinks to text = " <a href=\"](< \"[NAME_1]", cuts = [], chunk = 1
+cc 0a730ed32f53adbae6b2658e8fcf5bea9a0bdad29d9cf738ea42101911106b48 # shrinks to text = "<http:![i](\r[EMAIL_1]", cuts = [], chunk = 1
+cc d4d28895995d472cd4a00903b1a16b686734346735979700e65980b4d373d901 # shrinks to text = "](< <a href=\"\n> [NAME_1] <a href=\"", cuts = [], chunk = 1
+cc 72c77d25ea88176a82fd6756e59ff21ccc5e26b9f10fbbbcf6edcf8140a7248e # shrinks to text = "<http:\r[EMAIL_1]\\>", cuts = [], chunk = 1
+cc a3f8f1d85e178dba890b7b373f85101dba5a9423dc957e906a7a45ffd3dbd0f8 # shrinks to text = "![i](](< [NAME_1]>", cuts = [], chunk = 1
+cc 19804a756d79ce5502a49b6f0f64b02887ea26a512993ff69c2988fa7f4b3dfe # shrinks to text = "[\"\n> ", cuts = [], chunk = 1
+cc 916bfe802ee9f87e1289959cc1bdf95856d5f18833c8dec60882b752f3ee7abc # shrinks to text = "\u{a0}", cuts = [2], chunk = 1
+cc a25de1d8451575ba41e5185f22cb2491e819833b4d1f5f2bddd884fedb677bc4 # shrinks to text = " \n[1]: [EMAIL_1]NAME>\u{3000}<http:\n[1]: [NAME_2]", cuts = [185], chunk = 1

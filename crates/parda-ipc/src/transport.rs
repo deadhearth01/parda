@@ -71,14 +71,14 @@ pub fn is_not_running(err: &anyhow::Error) -> bool {
     })
 }
 
-/// Resolve `<runtime_dir>/parda.sock` on Unix or `parda-<USERNAME>-<hash of runtime_dir>`
-/// on Windows.
+/// Resolve `<runtime_dir>/parda.sock` on Unix or
+/// `parda-<user SID>-<hash of runtime_dir>` on Windows.
 /// On Windows, `PARDA_PIPE_NAME` overrides the full namespaced pipe name.
 ///
 /// # Panics
 /// Panics if the OS cannot represent the name (for example an embedded NUL),
-/// or if neither Windows naming environment variable is set. `Client::connect`
-/// and `serve` return an error for these cases instead.
+/// or if the Windows user SID cannot be read. `Client::connect` and `serve`
+/// return an error for these cases instead.
 pub fn socket_name(runtime_dir: &Path) -> Name<'static> {
     checked_socket_name(runtime_dir).expect("invalid parda socket name")
 }
@@ -97,8 +97,8 @@ fn checked_socket_name(runtime_dir: &Path) -> io::Result<Name<'static>> {
     let name = match std::env::var_os("PARDA_PIPE_NAME") {
         Some(name) => name,
         None => {
-            let user = std::env::var_os("USERNAME")
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "USERNAME is not set"))?;
+            // The SID, unlike %USERNAME%, cannot be chosen by another user.
+            let user = crate::win::current_user_sid()?;
             let mut name = std::ffi::OsString::from("parda-");
             name.push(user);
             // One pipe per runtime directory, so separate PARDA_HOMEs (and
@@ -157,6 +157,10 @@ impl Client {
             .wait_mode(ConnectWaitMode::Timeout(timeout))
             .connect_sync()
             .map_err(classify_connect_error)?;
+        // Anyone can create a pipe with a predictable name before the daemon
+        // does: never send text to a server of another user.
+        #[cfg(windows)]
+        verify_server_owner(&stream)?;
         let bounded = stream.set_recv_timeout(Some(timeout)).is_ok();
         let mut client = Self {
             stream: BufReader::new(stream),
@@ -237,6 +241,22 @@ impl Client {
     }
 }
 
+/// Fail unless the process serving the pipe runs as this user.
+#[cfg(windows)]
+fn verify_server_owner(stream: &Stream) -> Result<()> {
+    let pid = stream
+        .peer_creds()?
+        .pid()
+        .ok_or_else(|| io::Error::other("the pipe server's process id is unknown"))?;
+    if crate::win::process_user_sid(pid)? != crate::win::current_user_sid()? {
+        return Err(IpcError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the parda pipe is served by another user's process; refusing to use it",
+        )));
+    }
+    Ok(())
+}
+
 fn classify_connect_error(error: io::Error) -> IpcError {
     use io::ErrorKind::{ConnectionRefused, NotADirectory, NotFound};
     match error.kind() {
@@ -305,25 +325,57 @@ pub async fn serve(runtime_dir: &Path, handler: Arc<dyn Handler>) -> Result<()> 
     let name = checked_socket_name(runtime_dir)?;
     #[cfg(unix)]
     prepare_runtime(runtime_dir, &name).await?;
-    let listener = ListenerOptions::new().name(name).create_tokio()?;
+    let listener = listener_options(name)?.create_tokio()?;
     tracing::debug!("ipc listening");
     let mut connections = JoinSet::new();
+    let mut backoff = ACCEPT_BACKOFF_MIN;
     loop {
         tokio::select! {
-            stream = listener.accept() => {
-                let stream = stream?;
-                let handler = handler.clone();
-                connections.spawn(async move {
-                    // Peer errors terminate only that connection. Never log
-                    // frames or request data: they may contain raw PII.
-                    if let Err(error) = connection(stream, handler).await {
-                        tracing::debug!(%error, "ipc connection ended with an error");
-                    }
-                });
-            }
+            stream = listener.accept() => match stream {
+                Ok(stream) => {
+                    backoff = ACCEPT_BACKOFF_MIN;
+                    let handler = handler.clone();
+                    connections.spawn(async move {
+                        // Peer errors terminate only that connection. Never log
+                        // frames or request data: they may contain raw PII.
+                        if let Err(error) = connection(stream, handler).await {
+                            tracing::debug!(%error, "ipc connection ended with an error");
+                        }
+                    });
+                }
+                // Out of descriptors (EMFILE), a peer that vanished before
+                // accept, …: never a reason to stop serving (the daemon
+                // shuts everything down when this function returns).
+                Err(error) => {
+                    tracing::warn!(%error, retry_ms = backoff.as_millis() as u64, "ipc accept failed");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
+                }
+            },
             _ = connections.join_next(), if !connections.is_empty() => {}
         }
     }
+}
+
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+#[cfg(not(windows))]
+fn listener_options(name: Name<'_>) -> io::Result<ListenerOptions<'_>> {
+    Ok(ListenerOptions::new().name(name))
+}
+
+/// The pipe's DACL admits only this user and SYSTEM (the default DACL lets
+/// Everyone and Anonymous open it for reading).
+#[cfg(windows)]
+fn listener_options(name: Name<'_>) -> io::Result<ListenerOptions<'_>> {
+    use interprocess::os::windows::local_socket::ListenerOptionsExt;
+    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+    let sddl = crate::win::owner_only_sddl(&crate::win::current_user_sid()?);
+    let sddl = widestring::U16CString::from_str(&sddl)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let sd = SecurityDescriptor::deserialize(&sddl)?;
+    Ok(ListenerOptions::new().name(name).security_descriptor(sd))
 }
 
 #[cfg(unix)]

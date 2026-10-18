@@ -11,3 +11,7 @@
 /training/data/
 /training/runs/
 /training/out/
+__pycache__/
+*.pyc
+/.parda-home*/
+/.worktrees/

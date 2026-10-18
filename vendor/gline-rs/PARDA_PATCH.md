@@ -21,3 +21,7 @@ Note: some of the vendored crate's own unit tests (`encoded::tests::*`,
 `tensors::span::tests::test`) load `models/gliner_small-v2.1/tokenizer.json`, which is not
 part of the published crate, so they fail when run here; they are not part of parda's test
 suite (the vendored crate is excluded from the workspace).
+- `Cargo.toml` + `src/text/tokenizer.rs`: `tokenizers` is built without default features
+  (keeping only `onig`) and `HFTokenizer::from_pretrained` (network download) is removed.
+  The default `esaxx_fast` feature compiles C++ with the static CRT, which fails to link with
+  ONNX Runtime (dynamic CRT) on Windows/MSVC (LNK2038); parda never downloads tokenizers here.

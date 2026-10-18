@@ -12,7 +12,7 @@ use std::sync::Arc;
 pub use catalog::{ModelFile, ModelSpec, catalog, default_model_id, find_model, ml_labels};
 pub use ep::ExecutionProvider;
 pub use gliner::GlinerDetector;
-pub use manager::{ModelManager, download_verified, sha256_hex};
+pub use manager::{MODEL_FILES, ModelManager, download_verified, model_file, sha256_hex};
 use parda_core::MlDetector;
 
 /// Load the detector for catalog model `id` from `models_root/<id>`.

@@ -14,6 +14,7 @@
 mod anthropic;
 mod error;
 mod guard;
+mod legacy;
 mod openai_chat;
 mod openai_responses;
 mod route;
@@ -21,8 +22,8 @@ mod server;
 mod sse;
 mod walk;
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use parda_core::ProxyConfig;
@@ -30,9 +31,9 @@ use parda_engine::Engine;
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-pub use route::Provider;
-pub use server::{SCOPE_HEADER, router, serve, serve_with_shutdown};
-pub use sse::{SseEvent, parse_sse, serialize};
+pub use route::{Provider, normalize_path};
+pub use server::{SCOPE_HEADER, bind, router, serve, serve_with_shutdown};
+pub use sse::{SseEvent, SseParser, parse_sse, serialize};
 
 /// One proxied request, for the event feed. Never holds raw values.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -44,16 +45,34 @@ pub struct ProxyEvent {
     pub ml_ms: u64,
     /// Time parda itself added (redaction + restore of a JSON body).
     pub added_ms: u64,
-    /// Images / binary documents forwarded without scanning.
+    /// Images / binary documents / token ids forwarded without scanning.
     pub unscanned_media: u32,
+    /// Blocks, parts or items of a type parda does not know, forwarded
+    /// without scanning (a warning).
+    pub unknown_parts: u32,
     pub status: u16,
     pub streaming: bool,
+    /// Protection was switched off: the request went upstream unfiltered.
+    pub paused: bool,
+    /// The path is listed in `proxy.passthrough_paths`: the request was
+    /// forwarded unfiltered (a warning).
+    pub passthrough: bool,
     pub error: Option<String>,
 }
 
+/// Distinct vault scopes (`x-parda-scope`) one proxy accepts, the default
+/// scope included: each one keeps an in-memory restore index for the life
+/// of the daemon.
+pub const MAX_SCOPES: usize = 256;
+
+/// The scope of a request without a (valid) `x-parda-scope` header. It is
+/// always admitted, so the cap can never lock out the default.
+pub const DEFAULT_SCOPE: &str = "global";
+
 pub struct ProxyState {
     pub engine: Engine,
-    pub cfg: ProxyConfig,
+    cfg: RwLock<Arc<ProxyConfig>>,
+    scopes: Mutex<HashSet<String>>,
     pub events: broadcast::Sender<ProxyEvent>,
     pub http: reqwest::Client,
 }
@@ -66,15 +85,55 @@ impl ProxyState {
         events: broadcast::Sender<ProxyEvent>,
     ) -> anyhow::Result<Arc<Self>> {
         let http = reqwest::Client::builder()
+            // Redirects go back to the client untouched: following them here
+            // would re-send the request (and its API key headers) to wherever
+            // the redirect points.
+            .redirect(reqwest::redirect::Policy::none())
+            // Never route upstream traffic through another proxy (HTTPS_PROXY
+            // may even point at parda itself).
+            .no_proxy()
             .connect_timeout(Duration::from_secs(30))
             .pool_idle_timeout(Duration::from_secs(90))
             .user_agent(concat!("parda/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Arc::new(ProxyState {
             engine,
-            cfg,
+            cfg: RwLock::new(Arc::new(cfg)),
+            scopes: Mutex::new(HashSet::from([DEFAULT_SCOPE.to_string()])),
             events,
             http,
         }))
+    }
+
+    /// The settings in force; each request uses one snapshot.
+    pub fn config(&self) -> Arc<ProxyConfig> {
+        self.cfg.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Admit a scope unless [`MAX_SCOPES`] others are already in use.
+    pub(crate) fn admit_scope(&self, scope: &str) -> bool {
+        let mut seen = self.scopes.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(scope) {
+            return true;
+        }
+        if seen.len() >= MAX_SCOPES {
+            return false;
+        }
+        seen.insert(scope.to_string());
+        true
+    }
+
+    /// True if `scope` has been admitted (it can hold surrogates to restore).
+    pub(crate) fn scope_known(&self, scope: &str) -> bool {
+        self.scopes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(scope)
+    }
+
+    /// Apply new settings to the running proxy. `listen` and `enabled` only
+    /// take effect on restart; everything else applies to the next request.
+    pub fn set_config(&self, cfg: ProxyConfig) {
+        *self.cfg.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(cfg);
     }
 }

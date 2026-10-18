@@ -5,19 +5,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parda_core::{
-    Action, Config, Detection, EntityKind, MlDetector, Mode, Source, Span, Style, merge,
-};
+use parda_core::{Action, Config, Detection, EntityKind, MlDetector, Mode, Source, Span, Style};
 use parda_detect::{AllowList, Detector, DictionaryDetector, RuleDetector, RulesFile};
 use parda_vault::surrogate::{SurrogateGen, apply_case, token};
-use parda_vault::{Store, load_or_create_key};
+use parda_vault::{Store, open_vault};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 
 use crate::cache::{self, DetCache};
-use crate::fragment::{DEFAULT_MAX_FRAGMENT_BYTES, split_fragments};
+use crate::fragment::{DEFAULT_MAX_FRAGMENT_BYTES, ml_windows};
 use crate::index::ScopeIndex;
 use crate::ml::MlWorker;
+use crate::resolve::{Item, flatten, resolve};
 use crate::restore::{Entry, RestoreTable, case_insensitive};
 use crate::stream::StreamRestorer;
 
@@ -32,6 +31,10 @@ const MAX_ML_BUDGET: Duration = Duration::from_secs(30);
 const MAX_ATTEMPTS: u32 = 64;
 /// Vault `last_used_at` is refreshed at most this often per mapping.
 const TOUCH_INTERVAL: Duration = Duration::from_secs(3600);
+/// Entries in the touch rate-limit map before old ones are dropped.
+const TOUCHED_MAX: usize = 100_000;
+/// Rounds of the post-redaction self-check before a request is refused.
+const MAX_REPAIR_ROUNDS: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct EngineOptions {
@@ -88,6 +91,8 @@ pub struct Redaction {
     pub ml_ms: u64,
     /// The ML tier did not run (fast mode after a failure, or no model).
     pub ml_skipped: bool,
+    /// Protection is switched off: the text was passed through unchanged.
+    pub paused: bool,
 }
 
 impl Redaction {
@@ -146,11 +151,19 @@ impl Detectors {
     }
 }
 
+/// In-memory views of the vault, valid for one deletion generation.
+#[derive(Default)]
+pub(crate) struct Indexes {
+    scopes: HashMap<String, ScopeIndex>,
+    /// [`Store::deletions`] when `scopes` was last known to match the vault.
+    deletions: u64,
+}
+
 pub(crate) struct Inner {
     store: Store,
     surrogates: SurrogateGen,
     detectors: RwLock<Arc<Detectors>>,
-    indexes: Mutex<HashMap<String, ScopeIndex>>,
+    indexes: Mutex<Indexes>,
     cache: DetCache,
     ml_cache: Arc<DetCache>,
     ml: Option<MlWorker>,
@@ -170,12 +183,12 @@ impl Engine {
     /// strict mode refuses to redact.
     pub fn open(opts: EngineOptions, ml: Option<Arc<dyn MlDetector>>) -> Result<Engine> {
         create_private_dir(&opts.data_dir)?;
-        let (key, _source) = load_or_create_key(&opts.data_dir, opts.use_keyring)?;
-        let store = Store::open(&opts.data_dir.join("vault.db"), key)?;
+        let (store, _source) = open_vault(&opts.data_dir, opts.use_keyring)?;
         let pruned = store.prune(opts.config.vault.ttl_days)?;
         if pruned > 0 {
             tracing::info!(pruned, "expired vault mappings removed");
         }
+        let deletions = store.deletions();
         let ml_cache = Arc::new(DetCache::new(CACHE_CAPACITY));
         let ml = match ml {
             Some(det) => Some(
@@ -193,7 +206,10 @@ impl Engine {
                 store,
                 surrogates: SurrogateGen::new(),
                 detectors: RwLock::new(Arc::new(Detectors::new(opts.config, opts.rules, 1))),
-                indexes: Mutex::new(HashMap::new()),
+                indexes: Mutex::new(Indexes {
+                    scopes: HashMap::new(),
+                    deletions,
+                }),
                 cache: DetCache::new(CACHE_CAPACITY),
                 ml_cache,
                 ml,
@@ -228,8 +244,10 @@ impl Engine {
         self.inner.cache.clear();
     }
 
-    /// Apply a new configuration (packs, actions, mode, style, budgets). The
-    /// ML model itself is not reloaded.
+    /// Apply a new configuration (packs, actions, mode, style, budgets, model
+    /// threshold). The ML model itself is not reloaded: a threshold below the
+    /// one it was loaded with only takes effect once it is (the model never
+    /// reports findings under its load-time threshold).
     pub fn set_config(&self, config: Config) {
         let mut d = self.inner.detectors.write();
         let next = Detectors::new(config, d.rules_file.clone(), d.epoch + 1);
@@ -246,8 +264,8 @@ impl Engine {
     /// Find entities without replacing anything.
     pub fn scan(&self, text: &str) -> Result<Vec<Detection>> {
         let det = self.inner.detectors.read().clone();
-        let (mut per_text, _, _) = self.inner.detect(&det, &[text])?;
-        Ok(per_text.pop().unwrap_or_default())
+        let (mut per_text, _, _) = self.inner.detect(&det, &[text], &[])?;
+        Ok(flatten(resolve(text, per_text.pop().unwrap_or_default())))
     }
 
     pub fn redact(&self, text: &str, scope: &str) -> Result<Redaction> {
@@ -257,13 +275,56 @@ impl Engine {
 
     /// Redact several texts (e.g. every string of one API request) with one
     /// ML batch. Fails as a whole if any text holds a blocked kind.
+    ///
+    /// With protection switched off every text comes back unchanged and
+    /// marked [`Redaction::paused`].
     pub fn redact_many(&self, texts: &[&str], scope: &str) -> Result<Vec<Redaction>> {
-        self.inner.redact_many(texts, scope)
+        self.redact_many_tiered(texts, &[], scope)
+    }
+
+    /// [`Engine::redact_many`] where the texts flagged in `rules_only` skip
+    /// the ML model and see only the dictionary and rule tiers: identifiers
+    /// a site needs verbatim (ids, tokens, enum words), which the model could
+    /// mistake for names, while an e-mail, phone or key in them is still
+    /// redacted. Still one call and one ML batch for the other texts.
+    /// Missing flags count as `false`.
+    pub fn redact_many_tiered(
+        &self,
+        texts: &[&str],
+        rules_only: &[bool],
+        scope: &str,
+    ) -> Result<Vec<Redaction>> {
+        if !self.inner.detectors.read().config.protection.enabled {
+            return Ok(texts
+                .iter()
+                .map(|t| Redaction {
+                    text: (*t).to_string(),
+                    replaced: Vec::new(),
+                    blocked: Vec::new(),
+                    warned: Vec::new(),
+                    ml_ms: 0,
+                    ml_skipped: true,
+                    paused: true,
+                })
+                .collect());
+        }
+        self.inner.redact_many(texts, rules_only, scope)
     }
 
     pub fn restore(&self, text: &str, scope: &str) -> String {
         match self.inner.table(scope) {
             Some(t) => t.apply(text, None),
+            None => text.to_string(),
+        }
+    }
+
+    /// [`Engine::restore`], except that a surrogate is left as it is when
+    /// the run of non-ASCII-whitespace text before it holds any of
+    /// `/ ? = & % \ : @`, follows `www.`, or is longer than 2 KiB: a real
+    /// value is never put back into something shaped like a URL or query.
+    pub fn restore_url_safe(&self, text: &str, scope: &str) -> String {
+        match self.inner.table(scope) {
+            Some(t) => t.apply_url_safe(text, None, &mut crate::restore::UrlRun::default()),
             None => text.to_string(),
         }
     }
@@ -275,7 +336,8 @@ impl Engine {
     /// Drop the in-memory view of a scope (or all) so it is re-read from the
     /// vault; call after wiping the vault.
     pub fn forget_scopes(&self) {
-        self.inner.indexes.lock().clear();
+        self.inner.indexes.lock().scopes.clear();
+        self.inner.touched.lock().clear();
     }
 }
 
@@ -346,111 +408,302 @@ pub fn source_label(source: &Source) -> &'static str {
     }
 }
 
-fn strictly_inside(inner: &Span, outer: &Span) -> bool {
-    outer.start <= inner.start && inner.end <= outer.end && outer.len() > inner.len()
+/// How a stand-in is generated.
+enum Shape<'a> {
+    /// From the real value alone.
+    Plain,
+    /// A URL whose contents were already redacted in place: `template` is
+    /// the URL with those stand-ins at `pins`.
+    Url {
+        template: &'a str,
+        pins: &'a [(usize, usize)],
+    },
 }
 
-/// Resolve tier conflicts, then merge, without ever losing coverage.
-///
-/// * Anything strictly inside a format match (an e-mail, URL, UPI id, …) is
-///   part of it: "ravi" inside "ravi.k@gmail.com", or a phone number inside
-///   "9876543210@ybl", must not split it.
-/// * A model guess does not decide the kind of a format match: the model
-///   calling a Voter ID a passport number, or an API key an e-mail, loses
-///   to the rule. Only a model address or name that strictly contains a rule
-///   match (an address around a PIN code) competes in the merge.
-/// * Coverage is the union of every tier: whatever part of a losing
-///   detection no winner covers (the rest of an address around a validated
-///   phone number, the name part of an odd e-mail) is still redacted, as its
-///   own segment of the loser's kind. Tier conflicts can change kinds, never
-///   shrink what is hidden.
-fn resolve(text: &str, dets: Vec<Detection>) -> Vec<Detection> {
-    let rules: Vec<(Span, bool)> = dets
-        .iter()
-        .filter(|d| matches!(d.source, Source::Rule { .. }))
-        .map(|d| {
-            let structured = !matches!(
-                d.kind,
-                EntityKind::Person
-                    | EntityKind::Address
-                    | EntityKind::Organization
-                    | EntityKind::Custom(_)
-            );
-            (d.span, structured)
-        })
-        .collect();
-    let mut competing = Vec::with_capacity(dets.len());
-    let mut deferred = Vec::new();
-    for d in dets {
-        if rules
-            .iter()
-            .any(|(s, structured)| *structured && strictly_inside(&d.span, s))
-        {
-            continue; // covered by the enclosing format match
+/// Per-request context for choosing stand-ins.
+struct Req<'a> {
+    scope: &'a str,
+    style: Style,
+    input: InputWords<'a>,
+}
+
+/// One stand-in to find.
+struct Ask<'a> {
+    kind: &'a EntityKind,
+    real: &'a str,
+    shape: Shape<'a>,
+    /// Values a format match swallowed: its stand-in must not repeat them.
+    absorbed: &'a [&'a str],
+}
+
+/// A redacted text and where each top-level stand-in sits in it.
+struct Rendered {
+    text: String,
+    replaced: Vec<Replacement>,
+    placed: Vec<Placed>,
+}
+
+struct Placed {
+    /// Span of the stand-in in the output.
+    out: Span,
+    /// Span of the real value in the input.
+    input: Span,
+    kind: EntityKind,
+}
+
+/// The words of every input text of a request, for "is this string already
+/// written somewhere?" checks on new stand-ins. Built on first use only (most
+/// requests reuse existing mappings and never ask).
+struct InputWords<'a> {
+    texts: &'a [&'a str],
+    /// The scope's restore table before this request. Its stand-ins are
+    /// echo-guarded (every occurrence in the input is being replaced), so a
+    /// new stand-in may reuse them ("Arjun" for "Ravi" in "Ravi Verma").
+    pre: Arc<RestoreTable>,
+    /// ASCII-lower-cased word → (text, byte offset) of each occurrence.
+    index: std::sync::OnceLock<HashMap<String, Vec<(usize, usize)>>>,
+}
+
+impl<'a> InputWords<'a> {
+    fn new(texts: &'a [&'a str], pre: Arc<RestoreTable>) -> Self {
+        InputWords {
+            texts,
+            pre,
+            index: std::sync::OnceLock::new(),
         }
-        if d.source == Source::Ml {
-            let container = matches!(d.kind, EntityKind::Address | EntityKind::Person);
-            if rules
-                .iter()
-                .any(|(s, _)| s.overlaps(&d.span) && !(container && strictly_inside(s, &d.span)))
-            {
-                deferred.push(d);
-                continue;
+    }
+
+    fn index(&self) -> &HashMap<String, Vec<(usize, usize)>> {
+        self.index.get_or_init(|| {
+            let mut m: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+            for (ti, text) in self.texts.iter().enumerate() {
+                for (start, end) in alnum_runs(text) {
+                    m.entry(text[start..end].to_ascii_lowercase())
+                        .or_default()
+                        .push((ti, start));
+                }
             }
-        }
-        competing.push(d);
+            m
+        })
     }
-    let winners = merge(competing.clone());
-    let mut out = winners.clone();
-    for d in competing
-        .iter()
-        .filter(|d| !winners.contains(d))
-        .chain(&deferred)
-    {
-        for seg in uncovered(text, d.span, &out) {
-            out.push(Detection {
-                span: seg,
-                ..d.clone()
-            });
-        }
+
+    /// Does `s` occur word-bounded (ignoring ASCII case, as restore
+    /// matches) in some input text?
+    fn occurs(&self, s: &str) -> bool {
+        // An occurrence of `s` starts its first word at a word start of the
+        // text, so only those positions need checking.
+        let Some((w_start, w_end)) = alnum_runs(s).next() else {
+            return false;
+        };
+        let Some(hits) = self.index().get(&s[w_start..w_end].to_ascii_lowercase()) else {
+            return false;
+        };
+        hits.iter().any(|&(ti, at)| {
+            let t = self.texts[ti];
+            let Some(p) = at.checked_sub(w_start) else {
+                return false;
+            };
+            let end = p + s.len();
+            end <= t.len()
+                && t.is_char_boundary(p)
+                && t.is_char_boundary(end)
+                && t[p..end].eq_ignore_ascii_case(s)
+                && word_bounded(t, p, end)
+        })
     }
-    out.sort_by_key(|d| (d.span.start, d.span.end));
-    out
+
+    /// Would `s` as a new stand-in also match text the user wrote?
+    fn clashes(&self, s: &str) -> bool {
+        !self.pre.contains(s) && self.occurs(s)
+    }
 }
 
-/// Parts of `span` not covered by `taken`, trimmed to letters and digits,
-/// that still contain at least one letter or digit.
-fn uncovered(text: &str, span: Span, taken: &[Detection]) -> Vec<Span> {
-    let mut cuts: Vec<Span> = taken
-        .iter()
-        .map(|d| d.span)
-        .filter(|s| s.overlaps(&span))
-        .collect();
-    cuts.sort_by_key(|s| s.start);
-    let mut gaps = Vec::new();
-    let mut pos = span.start;
-    for c in cuts {
-        if c.start > pos {
-            gaps.push(Span::new(pos, c.start));
+/// Byte ranges of the maximal runs of letters and digits in `s`.
+fn alnum_runs(s: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut chars = s.char_indices().peekable();
+    std::iter::from_fn(move || {
+        let (start, _) = chars.by_ref().find(|(_, c)| c.is_alphanumeric())?;
+        let mut end = s.len();
+        while let Some(&(i, c)) = chars.peek() {
+            if !c.is_alphanumeric() {
+                end = i;
+                break;
+            }
+            chars.next();
         }
-        pos = pos.max(c.end);
+        Some((start, end))
+    })
+}
+
+/// No letter or digit on either side of `t[start..end]` where the match
+/// itself begins / ends with one (restore's boundary rule).
+fn word_bounded(t: &str, start: usize, end: usize) -> bool {
+    let m = &t[start..end];
+    let first = m.chars().next().is_some_and(char::is_alphanumeric);
+    let last = m.chars().next_back().is_some_and(char::is_alphanumeric);
+    !(first
+        && t[..start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric))
+        && !(last && t[end..].chars().next().is_some_and(char::is_alphanumeric))
+}
+
+/// Does `needle` occur word-bounded, ignoring ASCII case, in `hay`?
+fn contains_word(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return false;
     }
-    if pos < span.end {
-        gaps.push(Span::new(pos, span.end));
+    let (h, n) = (hay.to_ascii_lowercase(), needle.to_ascii_lowercase());
+    h.match_indices(&n)
+        .any(|(i, _)| word_bounded(hay, i, i + needle.len()))
+}
+
+enum Check {
+    Ok,
+    /// Regions of the input to redact as a whole next round.
+    Repair(Vec<Detection>),
+    /// Mismatch with nothing left to repair.
+    Fail,
+}
+
+/// Does `r` restore to `input` with `table`? If not, which input regions
+/// caused it: a stand-in restore does not find where it was placed (cut
+/// inside a word), or a match that is not one of the placed stand-ins (a
+/// stand-in running into neighbouring text that together read as another
+/// stand-in). Each region is widened to whole words.
+///
+/// `r.placed` and the matches are both sorted by output offset, so this is
+/// one merge walk plus a binary search per bad match.
+fn self_check(table: &RestoreTable, input: &str, r: &Rendered) -> Check {
+    if table.apply(&r.text, None) == input {
+        return Check::Ok;
     }
-    gaps.into_iter()
-        .filter_map(|g| {
-            let seg = text.get(g.start..g.end)?;
-            let start = g.start + seg.find(|c: char| c.is_alphanumeric())?;
-            let end = g.start
-                + seg
-                    .char_indices()
-                    .rev()
-                    .find(|(_, c)| c.is_alphanumeric())
-                    .map(|(i, c)| i + c.len_utf8())?;
-            (start < end).then(|| Span::new(start, end))
+    let found = table.find(&r.text, None);
+    let placed = &r.placed;
+    let mut regions: Vec<(Span, EntityKind)> = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    loop {
+        match (placed.get(i), found.get(j)) {
+            (Some(p), Some(f)) if p.out.start == f.start && p.out.end == f.end => {
+                if table.replacement(f.pattern, &r.text[f.start..f.end])
+                    != input[p.input.start..p.input.end]
+                {
+                    regions.push((p.input, p.kind.clone()));
+                }
+                i += 1;
+                j += 1;
+            }
+            // A stand-in restore does not find where it was placed.
+            (Some(p), Some(f)) if p.out.start <= f.start => {
+                regions.push((p.input, p.kind.clone()));
+                i += 1;
+            }
+            (Some(p), None) => {
+                regions.push((p.input, p.kind.clone()));
+                i += 1;
+            }
+            // A match that is not a placed stand-in.
+            (_, Some(f)) => {
+                let span = Span::new(
+                    map_to_input(placed, f.start, false),
+                    map_to_input(placed, f.end, true),
+                );
+                regions.push((span, table.kind(f.pattern).clone()));
+                j += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    let repairs: Vec<Detection> = regions
+        .into_iter()
+        .map(|(span, kind)| Detection {
+            span: widen_to_words(input, span),
+            kind,
+            score: 1.0,
+            source: Source::Dictionary,
         })
-        .collect()
+        // A region that cannot grow would fail the same way again.
+        .filter(|d| {
+            let k = placed.partition_point(|p| p.input.start < d.span.start);
+            placed.get(k).is_none_or(|p| p.input != d.span)
+        })
+        .collect();
+    if repairs.is_empty() {
+        Check::Fail
+    } else {
+        Check::Repair(repairs)
+    }
+}
+
+/// Input offset of output offset `o`: inside a stand-in it maps to the start
+/// (or, for an `end` offset, the end) of the real value it replaced.
+/// `placed` is sorted by output offset.
+fn map_to_input(placed: &[Placed], o: usize, end: bool) -> usize {
+    // The last stand-in starting before `o` (at or before it, for a start).
+    let k = if end {
+        placed.partition_point(|p| p.out.start < o)
+    } else {
+        placed.partition_point(|p| p.out.start <= o)
+    };
+    let Some(p) = k.checked_sub(1).map(|k| &placed[k]) else {
+        return o;
+    };
+    match (end, o < p.out.end, o == p.out.end) {
+        (false, true, _) => p.input.start,
+        (true, true, _) | (true, _, true) => p.input.end,
+        _ => p.input.end + (o - p.out.end),
+    }
+}
+
+/// `span` grown left and right over adjacent letters and digits.
+fn widen_to_words(text: &str, span: Span) -> Span {
+    let mut start = span.start;
+    while let Some(c) = text[..start]
+        .chars()
+        .next_back()
+        .filter(|c| c.is_alphanumeric())
+    {
+        start -= c.len_utf8();
+    }
+    let mut end = span.end;
+    while let Some(c) = text[end..].chars().next().filter(|c| c.is_alphanumeric()) {
+        end += c.len_utf8();
+    }
+    Span::new(start, end)
+}
+
+/// Keep the touch rate-limit map bounded: drop entries old enough to be
+/// touched again anyway, and everything if that is not enough.
+fn bound_touched(t: &mut HashMap<[u8; 32], Instant>, now: Instant, max: usize) {
+    if t.len() > max {
+        t.retain(|_, at| now.duration_since(*at) < TOUCH_INTERVAL);
+        if t.len() > max {
+            t.clear();
+        }
+    }
+}
+
+fn push_unique(v: &mut Vec<EntityKind>, k: &EntityKind) {
+    if !v.contains(k) {
+        v.push(k.clone());
+    }
+}
+
+/// ML cache key: the window text, salted with the model so results of one
+/// model are never served for another.
+fn ml_key(model: &str, window: &str) -> cache::Key {
+    cache::key(&format!("ml\u{0}{model}"), 0, window)
+}
+
+/// A model span is usable only if it is non-empty, inside `body` and on
+/// character boundaries (another `MlDetector` implementation may get this
+/// wrong; slicing with a bad span would panic).
+fn valid_span(body: &str, span: Span) -> bool {
+    span.start < span.end
+        && span.end <= body.len()
+        && body.is_char_boundary(span.start)
+        && body.is_char_boundary(span.end)
 }
 
 fn token_parts(s: &str) -> Vec<(usize, usize)> {
@@ -490,8 +743,9 @@ fn core(tok: &str) -> &str {
 
 impl Inner {
     pub(crate) fn table(&self, scope: &str) -> Option<Arc<RestoreTable>> {
+        let deletions = self.store.deletions();
         let mut indexes = self.indexes.lock();
-        let idx = match self.index_mut(&mut indexes, scope) {
+        let idx = match self.index_mut(&mut indexes, scope, deletions) {
             Ok(idx) => idx,
             Err(e) => {
                 tracing::error!(error = %e, "cannot read vault for restore");
@@ -502,11 +756,21 @@ impl Inner {
         (!t.is_empty()).then_some(t)
     }
 
+    /// The in-memory view of `scope`, rebuilt from the vault when rows were
+    /// deleted since it was built (`deletions` is the store's current
+    /// deletion generation).
     fn index_mut<'a>(
         &self,
-        indexes: &'a mut HashMap<String, ScopeIndex>,
+        indexes: &'a mut Indexes,
         scope: &str,
+        deletions: u64,
     ) -> Result<&'a mut ScopeIndex> {
+        if indexes.deletions != deletions {
+            indexes.scopes.clear();
+            indexes.deletions = deletions;
+            self.touched.lock().clear();
+        }
+        let indexes = &mut indexes.scopes;
         if !indexes.contains_key(scope) {
             let entries = self
                 .store
@@ -523,40 +787,72 @@ impl Inner {
         Ok(indexes.get_mut(scope).expect("inserted above"))
     }
 
-    /// Run the tiers over `texts`. Returns per-text detections (merged,
-    /// allow-listed, sorted), ML milliseconds and whether ML was skipped.
-    fn detect(&self, det: &Detectors, texts: &[&str]) -> Result<(Vec<Vec<Detection>>, u64, bool)> {
-        struct Frag<'a> {
-            text_idx: usize,
+    /// Run the tiers over `texts`. Returns per-text findings of every tier
+    /// (allow-listed and sorted, but not yet resolved: policy must see every
+    /// finding before overlaps are resolved), ML milliseconds and whether ML
+    /// was skipped.
+    ///
+    /// The dictionary and rule tiers always see each text whole (they are
+    /// linear and cheap), so no split can cut a value they would find. Only
+    /// the model runs per window ([`ml_windows`], overlapping), with its
+    /// results cached per window; the final result is cached per text.
+    ///
+    /// Texts flagged in `rules_only` skip the model (and have their own
+    /// cache entries).
+    fn detect(
+        &self,
+        det: &Detectors,
+        texts: &[&str],
+        rules_only: &[bool],
+    ) -> Result<(Vec<Vec<Detection>>, u64, bool)> {
+        let rules_only = |i: usize| rules_only.get(i).copied().unwrap_or(false);
+        let keys: Vec<cache::Key> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let kind = if rules_only(i) {
+                    "found-rules"
+                } else {
+                    "found"
+                };
+                cache::key(kind, det.epoch, t)
+            })
+            .collect();
+        let mut results: Vec<Option<Arc<Vec<Detection>>>> =
+            keys.iter().map(|k| self.cache.get(k)).collect();
+        let hits = results.iter().filter(|r| r.is_some()).count() as u64;
+        let misses: Vec<usize> = (0..texts.len()).filter(|&i| results[i].is_none()).collect();
+
+        // Model windows of the texts not in the final cache.
+        struct Win {
             span: Span,
-            body: &'a str,
             key: cache::Key,
         }
-        let mut frags = Vec::new();
-        for (ti, text) in texts.iter().enumerate() {
-            for span in split_fragments(text, DEFAULT_MAX_FRAGMENT_BYTES) {
-                let body = &text[span.start..span.end];
-                frags.push(Frag {
-                    text_idx: ti,
-                    span,
-                    body,
-                    key: cache::key("final", det.epoch, body),
-                });
+        let ml_required = det.ml_required();
+        let model = self.ml.as_ref().map_or("", |m| m.name());
+        let mut windows: HashMap<usize, Vec<Win>> = HashMap::new();
+        // The texts that need the model.
+        let ml_misses: Vec<usize> = misses.iter().copied().filter(|&i| !rules_only(i)).collect();
+        if ml_required {
+            for &ti in &ml_misses {
+                let text = texts[ti];
+                let w = ml_windows(text, DEFAULT_MAX_FRAGMENT_BYTES)
+                    .into_iter()
+                    .map(|span| Win {
+                        span,
+                        key: ml_key(model, &text[span.start..span.end]),
+                    })
+                    .collect();
+                windows.insert(ti, w);
             }
         }
+        let fragments: u64 = windows.values().map(|w| w.len() as u64).sum();
 
-        let mut results: Vec<Option<Arc<Vec<Detection>>>> =
-            frags.iter().map(|f| self.cache.get(&f.key)).collect();
-        let hits = results.iter().filter(|r| r.is_some()).count() as u64;
-
-        // ML for fragments not in the final cache.
-        let ml_required = det.ml_required();
         let strict = det.config.detect.mode == Mode::Strict;
         let mut ml_ms = 0;
         let mut ml_skipped = false;
         let mut ml_dets: HashMap<cache::Key, Arc<Vec<Detection>>> = HashMap::new();
-        let misses: Vec<usize> = (0..frags.len()).filter(|&i| results[i].is_none()).collect();
-        if ml_required && !misses.is_empty() {
+        if ml_required && !ml_misses.is_empty() {
             match &self.ml {
                 None => {
                     if strict {
@@ -565,21 +861,23 @@ impl Inner {
                     ml_skipped = true;
                 }
                 Some(worker) => {
-                    // Unique fragments that the model has not seen.
+                    // Unique windows that the model has not seen.
                     let mut texts_for_ml = Vec::new();
                     let mut keys_for_ml = Vec::new();
-                    for &i in &misses {
-                        let mk = cache::key("ml", 0, frags[i].body);
-                        if ml_dets.contains_key(&mk) || keys_for_ml.contains(&mk) {
-                            continue;
-                        }
-                        if let Some(d) = self.ml_cache.get(&mk) {
-                            ml_dets.insert(mk, d);
-                        } else if frags[i].body.chars().any(char::is_alphabetic) {
-                            texts_for_ml.push(frags[i].body.to_string());
-                            keys_for_ml.push(mk);
-                        } else {
-                            ml_dets.insert(mk, Arc::new(Vec::new()));
+                    for &ti in &ml_misses {
+                        for w in &windows[&ti] {
+                            let body = &texts[ti][w.span.start..w.span.end];
+                            if ml_dets.contains_key(&w.key) || keys_for_ml.contains(&w.key) {
+                                continue;
+                            }
+                            if let Some(d) = self.ml_cache.get(&w.key) {
+                                ml_dets.insert(w.key, d);
+                            } else if body.chars().any(char::is_alphabetic) {
+                                texts_for_ml.push(body.to_string());
+                                keys_for_ml.push(w.key);
+                            } else {
+                                ml_dets.insert(w.key, Arc::new(Vec::new()));
+                            }
                         }
                     }
                     if !texts_for_ml.is_empty() {
@@ -620,91 +918,91 @@ impl Inner {
             self.stats.lock().ml_skipped += 1;
         }
 
-        for &i in &misses {
-            let f = &frags[i];
-            let mut dets = det.dict.detect(f.body);
-            dets.extend(det.rules.detect(f.body));
-            let ml_ok = !ml_required || !ml_skipped;
-            if ml_required && !ml_skipped {
-                let mk = cache::key("ml", 0, f.body);
-                if let Some(m) = ml_dets.get(&mk) {
-                    dets.extend(m.iter().filter(|d| !not_a_name(f.body, d)).cloned());
+        let ml_ok = !ml_required || !ml_skipped;
+        // Applied here, not only when the model was loaded, so changing
+        // `detect.ml_threshold` at runtime takes effect (the final cache is
+        // keyed by the config epoch; the ML cache keeps raw model output).
+        let threshold = det.config.detect.ml_threshold;
+        for &ti in &misses {
+            let text = texts[ti];
+            let mut dets = det.dict.detect(text);
+            dets.extend(det.rules.detect(text));
+            if let Some(text_windows) = windows.get(&ti).filter(|_| ml_required && !ml_skipped) {
+                let mut seen = std::collections::HashSet::new();
+                for w in text_windows {
+                    let Some(found) = ml_dets.get(&w.key) else {
+                        continue;
+                    };
+                    let body = &text[w.span.start..w.span.end];
+                    for d in found.iter() {
+                        if !valid_span(body, d.span) {
+                            tracing::warn!("ML detector returned an invalid span; ignored");
+                            continue;
+                        }
+                        if d.score < threshold {
+                            continue;
+                        }
+                        let d = Detection {
+                            span: d.span.shifted(w.span.start),
+                            ..d.clone()
+                        };
+                        // Overlapping windows report the same entity twice.
+                        if not_a_name(text, &d) || !seen.insert((d.span, d.kind.clone())) {
+                            continue;
+                        }
+                        dets.push(d);
+                    }
                 }
             }
-            let dets = det.allow.filter(f.body, resolve(f.body, dets));
+            let mut dets = det.allow.filter(text, dets);
+            dets.sort_by_key(|d| (d.span.start, d.span.end));
             let dets = Arc::new(dets);
-            if ml_ok {
-                self.cache.put(f.key, dets.clone());
+            if ml_ok || rules_only(ti) {
+                self.cache.put(keys[ti], dets.clone());
             }
-            results[i] = Some(dets);
+            results[ti] = Some(dets);
         }
 
-        let mut per_text: Vec<Vec<Detection>> = vec![Vec::new(); texts.len()];
-        for (f, r) in frags.iter().zip(results) {
-            for d in r.expect("filled above").iter() {
-                let mut d = d.clone();
-                d.span = d.span.shifted(f.span.start);
-                per_text[f.text_idx].push(d);
-            }
-        }
+        let per_text = results
+            .into_iter()
+            .map(|r| r.expect("filled above").as_ref().clone())
+            .collect();
         {
             let mut s = self.stats.lock();
-            s.fragments += frags.len() as u64;
+            s.fragments += fragments;
             s.cache_hits += hits;
         }
         Ok((per_text, ml_ms, ml_skipped))
     }
 
-    fn redact_many(&self, texts: &[&str], scope: &str) -> Result<Vec<Redaction>> {
+    fn redact_many(
+        &self,
+        texts: &[&str],
+        rules_only: &[bool],
+        scope: &str,
+    ) -> Result<Vec<Redaction>> {
         let det = self.detectors.read().clone();
-        let (per_text, ml_ms, ml_skipped) = self.detect(&det, texts)?;
+        let (per_text, ml_ms, ml_skipped) = self.detect(&det, texts, rules_only)?;
 
-        let mut indexes = self.indexes.lock();
-        let idx = self.index_mut(&mut indexes, scope)?;
-
-        // Surrogate-echo guard: a surrogate string already present in the
-        // input (a different, undetected value that happens to look like
-        // one) gets its own mapping, so restore cannot confuse the two.
-        let table = idx.table();
-        let mut plans: Vec<(Vec<Detection>, Vec<EntityKind>, Vec<EntityKind>)> = Vec::new();
+        // Policy first, over everything every tier found: a `block` kind
+        // refuses the request wherever it sits (inside a URL too), a `warn`
+        // kind is reported, and only `redact` findings go on to be resolved,
+        // so an ignored or warned container (a URL, a UPI id) cannot swallow
+        // a value inside it that must be redacted.
         let mut blocked_all: Vec<EntityKind> = Vec::new();
-        for (text, mut dets) in texts.iter().zip(per_text) {
-            if !table.is_empty() {
-                for f in table.find(text, None) {
-                    let span = Span::new(f.start, f.end);
-                    if !dets.iter().any(|d| d.span.overlaps(&span)) {
-                        dets.push(Detection {
-                            span,
-                            kind: table.kind(f.pattern).clone(),
-                            score: 1.0,
-                            source: Source::Dictionary,
-                        });
-                    }
-                }
-                dets.sort_by_key(|d| (d.span.start, d.span.end));
-            }
-            let mut keep = Vec::with_capacity(dets.len());
-            let (mut blocked, mut warned) = (Vec::new(), Vec::new());
+        let mut plans = Vec::with_capacity(texts.len());
+        for dets in per_text {
+            let (mut keep, mut blocked, mut warned) = (Vec::new(), Vec::new(), Vec::new());
             for d in dets {
                 match det.config.action_for(&d.kind) {
                     Action::Redact => keep.push(d),
-                    Action::Block => {
-                        if !blocked.contains(&d.kind) {
-                            blocked.push(d.kind.clone());
-                        }
-                    }
-                    Action::Warn => {
-                        if !warned.contains(&d.kind) {
-                            warned.push(d.kind.clone());
-                        }
-                    }
+                    Action::Block => push_unique(&mut blocked, &d.kind),
+                    Action::Warn => push_unique(&mut warned, &d.kind),
                     Action::Ignore => {}
                 }
             }
             for k in &blocked {
-                if !blocked_all.contains(k) {
-                    blocked_all.push(k.clone());
-                }
+                push_unique(&mut blocked_all, k);
             }
             plans.push((keep, blocked, warned));
         }
@@ -712,42 +1010,101 @@ impl Inner {
             return Err(EngineError::Blocked(blocked_all));
         }
 
-        let style = det.config.replace.style;
+        // Prune and wipe wait while stand-ins are chosen and sent, so a
+        // mapping in use cannot vanish from the vault meanwhile; rows they
+        // removed earlier make the index reload here.
+        let rows = self.store.hold_rows();
+        let mut indexes = self.indexes.lock();
+        let idx = self.index_mut(&mut indexes, scope, rows.deletions())?;
+
+        // Surrogate-echo guard: a surrogate string already present in the
+        // input (a different, undetected value that happens to look like
+        // one) gets its own mapping, so restore cannot confuse the two. It
+        // takes part in resolution like any finding, so a partial detection
+        // over the echo ("Arjun" of "Arjun Mehta") cannot split it.
+        let pre = idx.table();
+        let req = Req {
+            scope,
+            style: det.config.replace.style,
+            input: InputWords::new(texts, pre.clone()),
+        };
+        let mut keeps: Vec<Vec<Detection>> = Vec::with_capacity(texts.len());
+        let mut verdicts = Vec::with_capacity(texts.len());
+        for (text, (mut keep, blocked, warned)) in texts.iter().zip(plans) {
+            for f in pre.find(text, None) {
+                keep.push(Detection {
+                    span: Span::new(f.start, f.end),
+                    kind: pre.kind(f.pattern).clone(),
+                    score: 1.0,
+                    source: Source::Dictionary,
+                });
+            }
+            keeps.push(keep);
+            verdicts.push((blocked, warned));
+        }
+
+        // Self-check: every output must restore, with the table as it is
+        // after the whole batch, to exactly its input. A region that does
+        // not (a stand-in that runs into undetected text and reads as
+        // another stand-in, a detection cut inside a word) is redacted as a
+        // whole on the next round. Output that still fails is never sent.
+        let rendered = 'rounds: {
+            for _ in 0..MAX_REPAIR_ROUNDS {
+                let mut rendered = Vec::with_capacity(texts.len());
+                for (text, keep) in texts.iter().zip(&keeps) {
+                    rendered.push(self.render(idx, &req, text, keep.clone())?);
+                }
+                let table = idx.table();
+                let (mut clean, mut failed) = (true, false);
+                for (i, r) in rendered.iter().enumerate() {
+                    match self_check(&table, texts[i], r) {
+                        Check::Ok => {}
+                        Check::Repair(regions) => {
+                            clean = false;
+                            keeps[i].extend(regions);
+                        }
+                        Check::Fail => {
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+                if failed {
+                    break;
+                }
+                if clean {
+                    break 'rounds rendered;
+                }
+            }
+            tracing::error!("redacted text would not restore to its input; refusing");
+            return Err(EngineError::Other(
+                "redaction self-check failed: the redacted text would not restore to the original"
+                    .into(),
+            ));
+        };
+        drop(indexes);
+        drop(rows);
+
         let mut out = Vec::with_capacity(texts.len());
         let mut counts: BTreeMap<String, u64> = BTreeMap::new();
         let mut sources: BTreeMap<String, u64> = BTreeMap::new();
-        for (text, (dets, blocked, warned)) in texts.iter().zip(plans) {
-            let mut new = String::with_capacity(text.len() + 16);
-            let mut replaced = Vec::with_capacity(dets.len());
-            let mut pos = 0;
-            for d in dets {
-                let real = &text[d.span.start..d.span.end];
-                let sur = self.surrogate_for(idx, scope, &d.kind, real, style)?;
-                new.push_str(&text[pos..d.span.start]);
-                new.push_str(&sur);
-                pos = d.span.end;
-                *counts.entry(d.kind.to_string()).or_insert(0) += 1;
+        for (r, (blocked, warned)) in rendered.into_iter().zip(verdicts) {
+            for x in &r.replaced {
+                *counts.entry(x.kind.to_string()).or_insert(0) += 1;
                 *sources
-                    .entry(source_label(&d.source).to_string())
+                    .entry(source_label(&x.source).to_string())
                     .or_insert(0) += 1;
-                replaced.push(Replacement {
-                    kind: d.kind,
-                    source: d.source,
-                    original_span: d.span,
-                    surrogate: sur,
-                });
             }
-            new.push_str(&text[pos..]);
             out.push(Redaction {
-                text: new,
-                replaced,
+                text: r.text,
+                replaced: r.replaced,
                 blocked,
                 warned,
                 ml_ms,
                 ml_skipped,
+                paused: false,
             });
         }
-        drop(indexes);
         let mut s = self.stats.lock();
         s.redactions += texts.len() as u64;
         for (k, n) in sources {
@@ -757,6 +1114,104 @@ impl Inner {
             *s.entities.entry(k).or_insert(0) += n;
         }
         Ok(out)
+    }
+
+    /// Resolve `keep` (redact findings, echoes and repair regions) and
+    /// replace every item with its stand-in.
+    fn render(
+        &self,
+        idx: &mut ScopeIndex,
+        req: &Req,
+        text: &str,
+        keep: Vec<Detection>,
+    ) -> Result<Rendered> {
+        let items = resolve(text, keep);
+        let mut new = String::with_capacity(text.len() + 16);
+        let mut replaced = Vec::with_capacity(items.len());
+        let mut placed = Vec::with_capacity(items.len());
+        let mut pos = 0;
+        for item in &items {
+            let sur = self.item_surrogate(idx, req, text, item, &mut replaced)?;
+            new.push_str(&text[pos..item.det.span.start]);
+            let at = new.len();
+            new.push_str(&sur);
+            placed.push(Placed {
+                out: Span::new(at, new.len()),
+                input: item.det.span,
+                kind: item.det.kind.clone(),
+            });
+            pos = item.det.span.end;
+            replaced.push(Replacement {
+                kind: item.det.kind.clone(),
+                source: item.det.source,
+                original_span: item.det.span,
+                surrogate: sur,
+            });
+        }
+        new.push_str(&text[pos..]);
+        replaced.sort_by_key(|r| (r.original_span.start, r.original_span.end));
+        Ok(Rendered {
+            text: new,
+            replaced,
+            placed,
+        })
+    }
+
+    /// The stand-in for one resolved item. A URL with values found inside
+    /// it gets those values' own stand-ins in place (recorded in
+    /// `replaced`), and the rest of the URL shaped around them.
+    fn item_surrogate(
+        &self,
+        idx: &mut ScopeIndex,
+        req: &Req,
+        text: &str,
+        item: &Item,
+        replaced: &mut Vec<Replacement>,
+    ) -> Result<String> {
+        let d = &item.det;
+        let real = &text[d.span.start..d.span.end];
+        let absorbed: Vec<&str> = item
+            .absorbed
+            .iter()
+            .filter_map(|s| text.get(s.start..s.end))
+            .filter(|a| a.chars().filter(|c| c.is_alphanumeric()).count() >= 3)
+            .collect();
+        if item.children.is_empty() || req.style == Style::Token {
+            let ask = Ask {
+                kind: &d.kind,
+                real,
+                shape: Shape::Plain,
+                absorbed: &absorbed,
+            };
+            return self.surrogate_for(idx, req, &ask);
+        }
+        let mut template = String::with_capacity(real.len());
+        let mut pins = Vec::with_capacity(item.children.len());
+        let mut pos = d.span.start;
+        for child in &item.children {
+            let cs = self.item_surrogate(idx, req, text, child, replaced)?;
+            template.push_str(&text[pos..child.det.span.start]);
+            pins.push((template.len(), template.len() + cs.len()));
+            template.push_str(&cs);
+            pos = child.det.span.end;
+            replaced.push(Replacement {
+                kind: child.det.kind.clone(),
+                source: child.det.source,
+                original_span: child.det.span,
+                surrogate: cs,
+            });
+        }
+        template.push_str(&text[pos..d.span.end]);
+        let ask = Ask {
+            kind: &d.kind,
+            real,
+            shape: Shape::Url {
+                template: &template,
+                pins: &pins,
+            },
+            absorbed: &absorbed,
+        };
+        self.surrogate_for(idx, req, &ask)
     }
 
     fn seed(&self, scope: &str, kind: &EntityKind, real: &str) -> [u8; 32] {
@@ -783,25 +1238,65 @@ impl Inner {
             return;
         }
         t.insert(k, now);
+        bound_touched(&mut t, now, TOUCHED_MAX);
         drop(t);
         if let Err(e) = self.store.touch(scope, real) {
             tracing::warn!(error = %e, "vault touch failed");
         }
     }
 
+    /// Keep the name-word mappings of a full name ("Ravi" → "Arjun" for
+    /// "Ravi Kumar") alive as long as the full name is in use: a model
+    /// answer mentioning only the first name must still restore, and an
+    /// expired "Arjun" must not be handed to someone else.
+    fn touch_name_parts(&self, idx: &ScopeIndex, scope: &str, real: &str) {
+        let parts = token_parts(real);
+        if parts.len() < 2 {
+            return;
+        }
+        for (a, b) in parts {
+            let word = core(&real[a..b]);
+            if word.chars().count() < 3 {
+                continue;
+            }
+            if let Some(e) = idx.variant(word).filter(|e| {
+                e.kind == EntityKind::Person && !e.surrogate.contains(char::is_whitespace)
+            }) {
+                self.touch(scope, &e.real);
+            }
+        }
+    }
+
+    /// Is `candidate` unusable as a new stand-in for this request?
+    fn rejected(&self, idx: &ScopeIndex, req: &Req, ask: &Ask, candidate: &str) -> bool {
+        let person = *ask.kind == EntityKind::Person && req.style == Style::Surrogate;
+        candidate.is_empty()
+            || candidate.eq_ignore_ascii_case(ask.real)
+            || idx.conflicts(candidate, ask.real)
+            || (person && self.person_tokens_conflict(idx, ask.real, candidate))
+            // Already written somewhere in the input: restore would rewrite
+            // that text too ("Ravi Kumar met Arjun" → "Arjun Desai met Arjun").
+            || req.input.clashes(candidate)
+            || (person
+                && token_parts(candidate)
+                    .into_iter()
+                    .map(|(a, b)| core(&candidate[a..b]))
+                    .any(|w| w.chars().count() >= 3 && req.input.clashes(w)))
+            // Repeats a value it was meant to hide ("ravi" in an e-mail).
+            || ask.absorbed.iter().any(|a| contains_word(candidate, a))
+    }
+
     /// The surrogate for `real`: an existing mapping, else a fresh one that
     /// is stored before it is returned.
-    fn surrogate_for(
-        &self,
-        idx: &mut ScopeIndex,
-        scope: &str,
-        kind: &EntityKind,
-        real: &str,
-        style: Style,
-    ) -> Result<String> {
+    fn surrogate_for(&self, idx: &mut ScopeIndex, req: &Req, ask: &Ask) -> Result<String> {
+        let (scope, kind, real, style) = (req.scope, ask.kind, ask.real, req.style);
         if let Some(e) = idx.exact(real) {
             let s = e.surrogate.clone();
+            let is_person = e.kind == EntityKind::Person;
             self.touch(scope, real);
+            if is_person {
+                self.touch_name_parts(idx, scope, real);
+            }
             return Ok(s);
         }
         let ci = case_insensitive(kind);
@@ -814,22 +1309,19 @@ impl Inner {
                         .then(|| idx.variant(real))
                         .flatten()
                         .map(|v| apply_case(real, &v.surrogate));
-                    match variant {
-                        Some(v) => v,
-                        None if *kind == EntityKind::Person => {
+                    match (variant, &ask.shape) {
+                        (Some(v), _) => v,
+                        (None, Shape::Url { template, pins }) => {
+                            self.surrogates.url_with_pins(template, pins, seed, attempt)
+                        }
+                        (None, Shape::Plain) if *kind == EntityKind::Person => {
                             self.person_candidate(idx, real, seed, attempt)
                         }
-                        None => self.surrogates.generate(kind, real, seed, attempt),
+                        (None, Shape::Plain) => self.surrogates.generate(kind, real, seed, attempt),
                     }
                 }
             };
-            if candidate.is_empty()
-                || candidate.eq_ignore_ascii_case(real)
-                || idx.conflicts(&candidate, real)
-                || (style == Style::Surrogate
-                    && *kind == EntityKind::Person
-                    && self.person_tokens_conflict(idx, real, &candidate))
-            {
+            if self.rejected(idx, req, ask, &candidate) {
                 continue;
             }
             match self.store.insert(scope, kind, real, &candidate) {
@@ -840,7 +1332,7 @@ impl Inner {
                         kind: kind.clone(),
                     });
                     if style == Style::Surrogate && *kind == EntityKind::Person {
-                        self.add_name_parts(idx, scope, real, &candidate);
+                        self.add_name_parts(idx, req, real, &candidate);
                     }
                     return Ok(candidate);
                 }
@@ -859,9 +1351,9 @@ impl Inner {
             }
         }
         // Give up on realistic stand-ins; a numbered token never collides.
-        for extra in 0..MAX_ATTEMPTS {
+        for extra in 0..MAX_ATTEMPTS * 4 {
             let candidate = token(kind, idx.next_token_number(kind) + extra);
-            if idx.conflicts(&candidate, real) {
+            if idx.conflicts(&candidate, real) || req.input.clashes(&candidate) {
                 continue;
             }
             match self.store.insert(scope, kind, real, &candidate) {
@@ -941,7 +1433,8 @@ impl Inner {
 
     /// Register each name word as its own mapping ("Ravi" → "Arjun") so a
     /// model mentioning only the first or last name still restores.
-    fn add_name_parts(&self, idx: &mut ScopeIndex, scope: &str, real: &str, sur: &str) {
+    fn add_name_parts(&self, idx: &mut ScopeIndex, req: &Req, real: &str, sur: &str) {
+        let scope = req.scope;
         let rt = token_parts(real);
         let st = token_parts(sur);
         if rt.len() < 2 || rt.len() != st.len() {
@@ -955,6 +1448,7 @@ impl Inner {
                 || s.eq_ignore_ascii_case(r)
                 || idx.variant(r).is_some()
                 || idx.conflicts(s, r)
+                || req.input.clashes(s)
             {
                 continue;
             }
@@ -974,60 +1468,6 @@ impl Inner {
 mod tests {
     use super::*;
 
-    /// Text for span-only tests: every byte a letter.
-    static TXT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "x".repeat(80));
-
-    #[test]
-    fn coverage_is_kept_when_a_rule_wins() {
-        // An address around a validated phone: phone wins, the rest of the
-        // address is still redacted on both sides.
-        let t = "Flat 4, MG Road 9876543210 Pune 411001";
-        let p = t.find("9876543210").unwrap();
-        let out = resolve(
-            t,
-            vec![
-                d(0, t.len(), EntityKind::Address, Source::Ml),
-                d(
-                    p,
-                    p + 10,
-                    EntityKind::Phone,
-                    Source::Rule { validated: true },
-                ),
-            ],
-        );
-        let kinds: Vec<_> = out
-            .iter()
-            .map(|x| (x.kind.clone(), &t[x.span.start..x.span.end]))
-            .collect();
-        assert_eq!(
-            kinds,
-            vec![
-                (EntityKind::Address, "Flat 4, MG Road"),
-                (EntityKind::Phone, "9876543210"),
-                (EntityKind::Address, "Pune 411001"),
-            ]
-        );
-        // An odd e-mail the e-mail rule misses, with phone digits inside.
-        let t = "mail rahul.9876543210@corp-mail now";
-        let s0 = t.find("rahul").unwrap();
-        let e0 = t.find(" now").unwrap();
-        let p = t.find("9876543210").unwrap();
-        let out = resolve(
-            t,
-            vec![
-                d(s0, e0, EntityKind::Email, Source::Ml),
-                d(
-                    p,
-                    p + 10,
-                    EntityKind::Phone,
-                    Source::Rule { validated: true },
-                ),
-            ],
-        );
-        let texts: Vec<_> = out.iter().map(|x| &t[x.span.start..x.span.end]).collect();
-        assert_eq!(texts, vec!["rahul", "9876543210", "corp-mail"]);
-    }
-
     #[test]
     fn token_parts_and_core() {
         assert_eq!(
@@ -1037,27 +1477,6 @@ mod tests {
         assert_eq!(core("Kumar,"), "Kumar");
         assert_eq!(core("(R.)"), "R");
         assert_eq!(core("..."), "");
-    }
-
-    #[test]
-    fn absorb_drops_name_inside_email() {
-        let dets = vec![
-            Detection {
-                span: Span::new(0, 4),
-                kind: EntityKind::Person,
-                score: 1.0,
-                source: Source::Dictionary,
-            },
-            Detection {
-                span: Span::new(0, 16),
-                kind: EntityKind::Email,
-                score: 0.9,
-                source: Source::Rule { validated: false },
-            },
-        ];
-        let out = resolve(&TXT, dets);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, EntityKind::Email);
     }
 
     fn d(s: usize, e: usize, kind: EntityKind, source: Source) -> Detection {
@@ -1097,59 +1516,131 @@ mod tests {
     }
 
     #[test]
-    fn longer_format_match_wins_over_validated_inner_match() {
-        // "9876543210@ybl": a validated phone inside an (unvalidated) UPI id.
-        let out = resolve(
-            &TXT,
-            vec![
-                d(0, 10, EntityKind::Phone, Source::Rule { validated: true }),
-                d(0, 14, EntityKind::Upi, Source::Rule { validated: false }),
-            ],
-        );
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, EntityKind::Upi);
+    fn input_words_find_word_bounded_occurrences() {
+        let texts = [
+            "Ravi met Arjun Desai, mail [EMAIL_2] or +91 98765 43210",
+            "arjunx",
+        ];
+        let w = InputWords::new(&texts, Arc::new(RestoreTable::build(&[])));
+        assert!(w.occurs("Arjun"));
+        assert!(w.occurs("ARJUN DESAI"));
+        assert!(w.occurs("[EMAIL_2]"));
+        assert!(w.occurs("+91 98765 43210"));
+        assert!(!w.occurs("Arju"), "inside a word");
+        assert!(!w.occurs("[EMAIL_1]"));
+        assert!(!w.occurs("Desai Arjun"));
+        assert!(!w.occurs("..."));
+        // An existing stand-in is echo-guarded, so it may be reused.
+        let pre = RestoreTable::build(&[Entry {
+            surrogate: "Arjun".into(),
+            real: "Ravi".into(),
+            kind: EntityKind::Person,
+        }]);
+        let w = InputWords::new(&texts, Arc::new(pre));
+        assert!(!w.clashes("arjun") && w.clashes("Desai"));
     }
 
     #[test]
-    fn model_does_not_relabel_a_format_match() {
-        let out = resolve(
-            &TXT,
-            vec![
-                d(7, 17, EntityKind::Passport, Source::Ml),
-                d(
-                    7,
-                    17,
-                    EntityKind::VoterId,
-                    Source::Rule { validated: false },
-                ),
-            ],
+    fn self_check_helpers() {
+        assert!(contains_word("ravi.m@gmail.com", "Ravi"));
+        assert!(!contains_word("raviraj@gmail.com", "ravi"));
+        assert_eq!(
+            widen_to_words("xZubinx is", Span::new(1, 6)),
+            Span::new(0, 7)
         );
-        assert_eq!(out[0].kind, EntityKind::VoterId);
-        // A model e-mail span that wraps an API key (plus a full stop) loses.
-        let t = "Value: xoxb-123456789012-123456789012-abcdefghijklmnop.";
-        let out = resolve(
-            t,
-            vec![
-                d(7, 55, EntityKind::Email, Source::Ml),
-                d(7, 54, EntityKind::Secret, Source::Rule { validated: false }),
-            ],
+        assert_eq!(
+            widen_to_words("Zubin_dev", Span::new(0, 5)),
+            Span::new(0, 5)
         );
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, EntityKind::Secret);
-        // …but a model address that covers a PIN code still wins.
-        let out = resolve(
-            &TXT,
-            vec![
-                d(0, 40, EntityKind::Address, Source::Ml),
-                d(
-                    34,
-                    40,
-                    EntityKind::Custom("Pin".into()),
-                    Source::Rule { validated: false },
-                ),
-            ],
-        );
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, EntityKind::Address);
+        // in: "Ravi Mehta ok" → out: "Arjun Mehta ok" ("Ravi" → "Arjun")
+        let placed = [Placed {
+            out: Span::new(0, 5),
+            input: Span::new(0, 4),
+            kind: EntityKind::Person,
+        }];
+        assert_eq!(map_to_input(&placed, 0, false), 0);
+        assert_eq!(map_to_input(&placed, 3, false), 0);
+        assert_eq!(map_to_input(&placed, 3, true), 4);
+        assert_eq!(map_to_input(&placed, 11, true), 10);
+        assert_eq!(map_to_input(&placed, 6, false), 5);
+    }
+
+    #[test]
+    fn self_check_scales_to_many_stand_ins() {
+        // 50k e-mail stand-ins in 2 MB and one model span cut inside a word.
+        let entries = [
+            Entry {
+                surrogate: "arjun.m@gmail.com".into(),
+                real: "ravi.k@gmail.com".into(),
+                kind: EntityKind::Email,
+            },
+            Entry {
+                surrogate: "Madhuri".into(),
+                real: "Zubin".into(),
+                kind: EntityKind::Person,
+            },
+        ];
+        let table = RestoreTable::build(&entries);
+        let (mut input, mut out, mut placed) = (String::new(), String::new(), Vec::new());
+        for _ in 0..50_000 {
+            input.push_str("Contact ");
+            out.push_str("Contact ");
+            let (i, o) = (input.len(), out.len());
+            input.push_str("ravi.k@gmail.com");
+            out.push_str("arjun.m@gmail.com");
+            placed.push(Placed {
+                out: Span::new(o, out.len()),
+                input: Span::new(i, input.len()),
+                kind: EntityKind::Email,
+            });
+            input.push_str(" about order 12345.\n");
+            out.push_str(" about order 12345.\n");
+        }
+        let (i, o) = (input.len(), out.len());
+        input.push_str("Zubinx is here");
+        out.push_str("Madhurix is here");
+        placed.push(Placed {
+            out: Span::new(o, o + 7),
+            input: Span::new(i, i + 5),
+            kind: EntityKind::Person,
+        });
+        let r = Rendered {
+            text: out,
+            replaced: Vec::new(),
+            placed,
+        };
+        let started = Instant::now();
+        let Check::Repair(regions) = self_check(&table, &input, &r) else {
+            panic!("expected a repair");
+        };
+        let elapsed = started.elapsed();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(&input[regions[0].span.start..regions[0].span.end], "Zubinx");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    #[test]
+    fn touched_map_stays_bounded() {
+        let now = Instant::now();
+        let mut t = HashMap::new();
+        for i in 0..20u8 {
+            t.insert([i; 32], now);
+        }
+        bound_touched(&mut t, now, 10);
+        assert!(t.len() <= 10);
+        let mut t: HashMap<[u8; 32], Instant> = HashMap::new();
+        t.insert([1; 32], now);
+        bound_touched(&mut t, now, 10);
+        assert_eq!(t.len(), 1, "small maps are left alone");
+    }
+
+    #[test]
+    fn invalid_model_spans_are_rejected() {
+        let body = "नमस्ते Ravi";
+        assert!(valid_span(body, Span::new(0, 3)));
+        assert!(!valid_span(body, Span::new(0, 1)), "not a char boundary");
+        assert!(!valid_span(body, Span::new(5, 5)), "empty");
+        assert!(!valid_span(body, Span::new(9, 3)), "reversed");
+        assert!(!valid_span(body, Span::new(0, 99)), "out of bounds");
     }
 }

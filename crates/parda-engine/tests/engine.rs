@@ -229,11 +229,11 @@ fn token_style() {
     let t = "Write to ravi.k@gmail.com and amit@corp.in, cc ravi.k@gmail.com";
     let r = e.redact(t, "global").unwrap();
     assert!(
-        r.text.contains("⟦EMAIL_1⟧") && r.text.contains("⟦EMAIL_2⟧"),
+        r.text.contains("[EMAIL_1]") && r.text.contains("[EMAIL_2]"),
         "{}",
         r.text
     );
-    assert_eq!(r.text.matches("⟦EMAIL_1⟧").count(), 2);
+    assert_eq!(r.text.matches("[EMAIL_1]").count(), 2);
     assert_eq!(e.restore(&r.text, "global"), t);
 }
 
@@ -319,4 +319,115 @@ fn stream_holds_back_only_partial_prefix() {
     assert_eq!(sr.push(&format!("Hello {head}")), "Hello ");
     assert_eq!(sr.push(&format!("{tail}!")), "Ravi Kumar!");
     assert_eq!(sr.finish(), "");
+}
+
+#[test]
+fn paused_protection_passes_text_through_but_still_restores() {
+    let (_d, e) = engine();
+    let sur = e.redact("Ravi Kumar", "global").unwrap().text;
+    let mut c = e.config();
+    c.protection.enabled = false;
+    e.set_config(c);
+    let t = "Mail Ravi Kumar at ravi.k@gmail.com";
+    let r = e.redact(t, "global").unwrap();
+    assert!(r.paused);
+    assert_eq!(r.text, t);
+    assert!(r.replaced.is_empty());
+    // Surrogates sent earlier keep mapping back while paused.
+    assert_eq!(e.restore(&format!("Hi {sur}"), "global"), "Hi Ravi Kumar");
+    let mut c = e.config();
+    c.protection.enabled = true;
+    e.set_config(c);
+    let r = e.redact(t, "global").unwrap();
+    assert!(!r.paused && !r.text.contains("Ravi"));
+}
+
+#[test]
+fn default_style_is_tags_and_they_round_trip() {
+    let mut c = parda_core::Config::default();
+    c.detect.model = "none".into();
+    let (_d, e) = engine_with(c, None);
+    let t = "Mail ravi.k@gmail.com, call +91 98765 43210, Aadhaar 2345 6789 0124";
+    let r = e.redact(t, "global").unwrap();
+    assert!(
+        r.text.contains("[EMAIL_1]")
+            && r.text.contains("[PHONE_1]")
+            && r.text.contains("[AADHAAR_1]"),
+        "{}",
+        r.text
+    );
+    assert_eq!(e.restore(&r.text, "global"), t);
+    // The AI may echo a tag in another case.
+    assert_eq!(
+        e.restore("Sent to [email_1].", "global"),
+        "Sent to ravi.k@gmail.com."
+    );
+}
+
+#[test]
+fn rules_only_texts_skip_the_model_but_not_the_rules() {
+    // The model "finds" a name wherever it sees "abc".
+    let ml = NameMl::new(&["abc"]);
+    let (_d, e) = engine_with(
+        ml_config(Mode::Strict, 250),
+        Some(ml.clone() as Arc<dyn MlDetector>),
+    );
+    let rs = e
+        .redact_many_tiered(
+            &["abc text", "abc-123", "ravi@example.com", "Ravi Kumar"],
+            &[false, true, true, true],
+            "global",
+        )
+        .unwrap();
+    assert!(!rs[0].text.contains("abc"), "{}", rs[0].text);
+    // An identifier is not shown to the model…
+    assert_eq!(rs[1].text, "abc-123");
+    // …but the rule and dictionary tiers still see it.
+    assert!(!rs[2].text.contains("ravi@"), "{}", rs[2].text);
+    assert!(!rs[3].text.contains("Ravi"), "{}", rs[3].text);
+    // The same string as text afterwards does go to the model (separate
+    // cache entries).
+    let r = e
+        .redact_many_tiered(&["abc-123"], &[false], "global")
+        .unwrap();
+    assert!(!r[0].text.contains("abc"), "{}", r[0].text);
+    // Only identifiers: no model is needed, even in strict mode.
+    let (_d2, e2) = engine_with(ml_config(Mode::Strict, 250), None);
+    let r = e2
+        .redact_many_tiered(&["abc-123"], &[true], "global")
+        .unwrap();
+    assert_eq!(r[0].text, "abc-123");
+}
+
+#[test]
+fn url_safe_stream_restore_matches_whole_text_under_any_chunking() {
+    let mut config = rules_only_config();
+    config.replace.style = parda_core::Style::Token;
+    let (_d, e) = engine_with(config, None);
+    let tag = e.redact("Ravi Kumar", "global").unwrap().text;
+    assert_eq!(tag, "[NAME_1]");
+    let text = "Hi [NAME_1]! ![x](//e/?d=[NAME_1]) www.x/[NAME_1] [NAME_1]\u{a0}[NAME_1] \
+                Name:[NAME_1]\n[NAME_1] end";
+    let whole = e.restore_url_safe(text, "global");
+    assert_eq!(
+        whole,
+        "Hi Ravi Kumar! ![x](//e/?d=[NAME_1]) www.x/[NAME_1] Ravi Kumar\u{a0}Ravi Kumar \
+         Name:[NAME_1]\nRavi Kumar end"
+    );
+    let chars: Vec<char> = text.chars().collect();
+    for n in 1..12 {
+        let mut r = e.stream_restorer("global").url_safe();
+        let mut out = String::new();
+        for piece in chars.chunks(n) {
+            out.push_str(&r.push(&piece.iter().collect::<String>()));
+        }
+        out.push_str(&r.finish());
+        assert_eq!(out, whole, "chunks of {n}");
+    }
+    // Text emitted around the restorer (`skip`) counts for the run.
+    let mut r = e.stream_restorer("global").url_safe();
+    r.skip("https://e/?d=");
+    let mut out = r.push("[NAME_1] [NAME_1]");
+    out.push_str(&r.finish());
+    assert_eq!(out, "[NAME_1] Ravi Kumar");
 }

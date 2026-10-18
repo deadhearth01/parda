@@ -10,11 +10,12 @@ pub mod ml;
 pub mod validators;
 
 pub use config::{
-    Action, ClipboardConfig, Config, DetectConfig, Mode, PrivacyConfig, ProxyConfig, ReplaceConfig,
-    Style, UnscannedMedia, VaultConfig,
+    Action, ClipboardConfig, Config, DEFAULT_INTERCEPT_HOSTS, DetectConfig,
+    INTERCEPT_SCOPE_PER_HOST, InterceptConfig, InterceptScope, Mode, PrivacyConfig,
+    ProtectionConfig, ProxyConfig, ReplaceConfig, Style, UnscannedMedia, VaultConfig,
 };
 pub use detection::{Detection, Source, Span};
 pub use error::{Error, Result};
 pub use kind::EntityKind;
-pub use merge::merge;
+pub use merge::{SpanSet, merge, preference};
 pub use ml::MlDetector;

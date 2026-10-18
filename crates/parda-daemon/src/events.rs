@@ -1,10 +1,11 @@
-//! Turning proxy and clipboard happenings into IPC events for the TUI, and
+//! Turning proxy, intercept and clipboard happenings into IPC events for the TUI, and
 //! keeping running totals of them for `parda status` and the dashboard.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 
 use parda_clip::ClipEvent;
+use parda_intercept::InterceptEvent;
 use parda_ipc::Event;
 use parda_proxy::ProxyEvent;
 use serde::Serialize;
@@ -76,6 +77,16 @@ impl Activity {
         a.last_event_ms = Some(e.ts_ms);
     }
 
+    /// Keep a notice for clients that connect later without counting it as
+    /// activity (a listener starting is not a request, nor a warning about one).
+    pub fn remember(&self, e: &Event) {
+        let mut a = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        a.recent.push_back(e.clone());
+        while a.recent.len() > RECENT_EVENTS {
+            a.recent.pop_front();
+        }
+    }
+
     pub fn snapshot(&self) -> Value {
         let a = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut lat: Vec<u64> = a.latencies.iter().copied().collect();
@@ -101,25 +112,88 @@ pub fn emit(tx: &broadcast::Sender<Event>, activity: &Activity, e: Event) {
     let _ = tx.send(e);
 }
 
+/// Broadcast a notice (such as [`intercept_notice`]) and keep it in the
+/// recent history, without adding it to the per-surface totals.
+pub fn notify(tx: &broadcast::Sender<Event>, activity: &Activity, e: Event) {
+    activity.remember(&e);
+    let _ = tx.send(e);
+}
+
 pub fn from_proxy(ev: &ProxyEvent) -> Event {
     let total: u32 = ev.counts.values().sum();
     let mut summary = format!("{} {} → {}", ev.provider, ev.path, ev.status);
     match &ev.error {
         Some(code) => summary.push_str(&format!(" ({code})")),
+        None if ev.paused => summary.push_str(" · PAUSED, sent unfiltered"),
         None => {
             summary.push_str(&format!(" · {total} redacted"));
             if ev.unscanned_media > 0 {
                 summary.push_str(&format!(" · {} unscanned media", ev.unscanned_media));
+            }
+            if ev.unknown_parts > 0 {
+                summary.push_str(&format!(
+                    " · {} part(s) of unknown type sent unscanned",
+                    ev.unknown_parts
+                ));
             }
             if ev.streaming {
                 summary.push_str(" · stream");
             }
         }
     }
+    if ev.passthrough {
+        summary.push_str(" · passed through unfiltered (proxy.passthrough_paths)");
+    }
     let mut e = Event::now("proxy", summary);
     e.counts = ev.counts.clone();
     e.latency_ms = Some(ev.added_ms);
-    if ev.error.is_some() || ev.status >= 400 {
+    if ev.error.is_some() || ev.status >= 400 || ev.paused || ev.passthrough || ev.unknown_parts > 0
+    {
+        e.level = "warn".into();
+    }
+    e
+}
+
+/// Longest refusal reason shown in an intercept event.
+const REFUSAL_CHARS: usize = 120;
+
+/// A request to a listed AI site. Names the host, the status, how many
+/// values were replaced (kinds in `counts`) and how many parts went
+/// unscanned; never the path, the query string or any value. `paused`:
+/// protection was switched off, so the request went out unfiltered.
+pub fn from_intercept(ev: &InterceptEvent, paused: bool) -> Event {
+    let total: u32 = ev.counts.values().sum();
+    let mut summary = format!("{} → {}", ev.host, ev.status);
+    match &ev.refused {
+        Some(why) => {
+            // Refusals never hold request text; keep the line short anyway.
+            let line = why.lines().next().unwrap_or("").trim();
+            let mut short: String = line.chars().take(REFUSAL_CHARS).collect();
+            if line.chars().count() > REFUSAL_CHARS {
+                short.push('…');
+            }
+            summary.push_str(&format!(" · refused, not sent ({short})"));
+        }
+        None if paused => summary.push_str(" · PAUSED, sent unfiltered"),
+        None => summary.push_str(&format!(" · {total} redacted")),
+    }
+    if ev.unscanned > 0 {
+        summary.push_str(&format!(" · {} part(s) sent unscanned", ev.unscanned));
+    }
+    let mut e = Event::now("intercept", summary);
+    e.counts = ev.counts.clone();
+    e.latency_ms = Some(ev.added_ms);
+    if ev.refused.is_some() || ev.status >= 400 || ev.unscanned > 0 || paused {
+        e.level = "warn".into();
+    }
+    e
+}
+
+/// A notice from the intercept listener itself (started, stopped, cannot
+/// start); send it with [`notify`], it is not intercepted traffic.
+pub fn intercept_notice(summary: impl Into<String>, warn: bool) -> Event {
+    let mut e = Event::now("intercept", summary);
+    if warn {
         e.level = "warn".into();
     }
     e
@@ -153,6 +227,11 @@ pub fn from_clip(ev: &ClipEvent) -> Event {
             Default::default(),
             false,
         ),
+        ClipEvent::PastedUnfiltered => (
+            "PAUSED — pasted unfiltered (protection is off)".to_string(),
+            Default::default(),
+            true,
+        ),
         ClipEvent::PasteFailed { reason } => (
             format!(
                 "paste keystroke failed — redacted text is on the clipboard, paste manually ({reason})"
@@ -162,6 +241,14 @@ pub fn from_clip(ev: &ClipEvent) -> Event {
         ),
         ClipEvent::Blocked { kinds } => (
             format!("paste blocked by policy ({})", kinds.join(", ")),
+            Default::default(),
+            true,
+        ),
+        ClipEvent::OriginalNotRestored { reason } => (
+            format!(
+                "pasted, but the original could not be put back — the redacted text is still \
+                 on the clipboard ({reason})"
+            ),
             Default::default(),
             true,
         ),
@@ -203,6 +290,94 @@ mod tests {
     }
 
     #[test]
+    fn notices_are_kept_for_late_clients_but_not_counted() {
+        let a = Activity::default();
+        let (tx, mut rx) = broadcast::channel(4);
+        notify(&tx, &a, intercept_notice("intercept: no CA", true));
+        assert_eq!(rx.try_recv().unwrap().summary, "intercept: no CA");
+        let s = a.snapshot();
+        assert_eq!(s["surfaces"], json!({}), "{s}");
+        assert_eq!(s["recent"].as_array().unwrap().len(), 1);
+        assert_eq!(s["last_event_ms"], Value::Null);
+    }
+
+    #[test]
+    fn intercept_summary_has_host_and_counts_but_no_path_or_values() {
+        let ev = InterceptEvent {
+            host: "chatgpt.com".into(),
+            path: "/backend-api/conversation".into(),
+            status: 200,
+            counts: BTreeMap::from([("Person".into(), 2), ("Email".into(), 1)]),
+            added_ms: 7,
+            refused: None,
+            unscanned: 0,
+        };
+        let e = from_intercept(&ev, false);
+        assert_eq!(e.surface, "intercept");
+        assert_eq!(e.summary, "chatgpt.com → 200 · 3 redacted");
+        assert_eq!(e.counts, ev.counts);
+        assert_eq!(e.latency_ms, Some(7));
+        assert_eq!(e.level, "info");
+
+        let media = from_intercept(
+            &InterceptEvent {
+                unscanned: 2,
+                ..ev.clone()
+            },
+            false,
+        );
+        assert!(
+            media.summary.ends_with(" · 2 part(s) sent unscanned"),
+            "{}",
+            media.summary
+        );
+        assert_eq!(media.level, "warn");
+
+        let refused = from_intercept(
+            &InterceptEvent {
+                status: 400,
+                counts: BTreeMap::new(),
+                refused: Some(format!(
+                    "parda_unparseable_body: {}\nsecond line",
+                    "x".repeat(200)
+                )),
+                ..ev.clone()
+            },
+            false,
+        );
+        assert!(
+            refused
+                .summary
+                .starts_with("chatgpt.com → 400 · refused, not sent (parda_unparseable_body: x")
+        );
+        assert!(refused.summary.ends_with("…)"), "{}", refused.summary);
+        assert!(!refused.summary.contains("second line"));
+        assert_eq!(refused.level, "warn");
+        let paused = from_intercept(
+            &InterceptEvent {
+                counts: BTreeMap::new(),
+                ..ev.clone()
+            },
+            true,
+        );
+        assert_eq!(
+            paused.summary,
+            "chatgpt.com → 200 · PAUSED, sent unfiltered"
+        );
+        assert_eq!(paused.level, "warn");
+        for e in [&e, &media, &refused, &paused] {
+            assert!(!e.summary.contains("backend-api"), "{}", e.summary);
+        }
+
+        let n = intercept_notice("intercept: no CA", true);
+        assert_eq!(
+            (n.surface.as_str(), n.level.as_str()),
+            ("intercept", "warn")
+        );
+        assert_eq!(intercept_notice("listening", false).level, "info");
+    }
+
+    #[test]
     fn proxy_summary() {
         let ev = ProxyEvent {
             provider: "anthropic",
@@ -211,8 +386,11 @@ mod tests {
             ml_ms: 12,
             added_ms: 15,
             unscanned_media: 1,
+            unknown_parts: 0,
             status: 200,
             streaming: true,
+            paused: false,
+            passthrough: false,
             error: None,
         };
         let e = from_proxy(&ev);
@@ -223,5 +401,35 @@ mod tests {
         );
         assert_eq!(e.latency_ms, Some(15));
         assert_eq!(e.level, "info");
+        let unknown = from_proxy(&ProxyEvent {
+            unknown_parts: 2,
+            ..ev.clone()
+        });
+        assert!(
+            unknown
+                .summary
+                .contains("2 part(s) of unknown type sent unscanned")
+        );
+        assert_eq!(unknown.level, "warn");
+        let passed = from_proxy(&ProxyEvent {
+            passthrough: true,
+            counts: BTreeMap::new(),
+            ..ev.clone()
+        });
+        assert!(
+            passed
+                .summary
+                .contains("passed through unfiltered (proxy.passthrough_paths)"),
+            "{}",
+            passed.summary
+        );
+        assert_eq!(passed.level, "warn");
+        let paused = from_proxy(&ProxyEvent {
+            paused: true,
+            counts: BTreeMap::new(),
+            ..ev
+        });
+        assert!(paused.summary.contains("PAUSED"), "{}", paused.summary);
+        assert_eq!(paused.level, "warn");
     }
 }

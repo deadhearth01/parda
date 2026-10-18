@@ -9,6 +9,20 @@ use sha2::{Digest, Sha256};
 
 use crate::catalog::find_model;
 
+/// ONNX file names a model directory may hold, in order of preference:
+/// full precision first (the fine-tuned parda model ships fp32 because the
+/// bundled ONNX Runtime mis-executes its per-channel INT8 variant), then the
+/// INT8 files of the upstream catalog models.
+pub const MODEL_FILES: [&str; 2] = ["model.onnx", "model_quint8.onnx"];
+
+/// The ONNX file to load from an installed model directory.
+pub fn model_file(dir: &Path) -> Option<PathBuf> {
+    MODEL_FILES
+        .iter()
+        .map(|f| dir.join(f))
+        .find(|p| p.is_file())
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
@@ -106,13 +120,14 @@ impl ModelManager {
         self.root.join(id)
     }
 
-    /// A model counts as installed when its directory holds the ONNX model,
-    /// the tokenizer and the GLiNER config.
+    /// A model counts as installed when its directory holds an ONNX model
+    /// (see [`MODEL_FILES`]), the tokenizer and the GLiNER config.
     pub fn is_installed(&self, id: &str) -> bool {
         let dir = self.model_dir(id);
-        ["model_quint8.onnx", "tokenizer.json", "gliner_config.json"]
-            .iter()
-            .all(|f| dir.join(f).is_file())
+        model_file(&dir).is_some()
+            && ["tokenizer.json", "gliner_config.json"]
+                .iter()
+                .all(|f| dir.join(f).is_file())
     }
 
     /// Installed model ids (directories that pass [`Self::is_installed`]).
@@ -180,7 +195,7 @@ impl ModelManager {
         fs::copy(src.join("manifest.json"), dir.join("manifest.json"))?;
         if !self.is_installed(id) {
             bail!(
-                "imported directory lacks model_quint8.onnx, tokenizer.json or gliner_config.json"
+                "imported directory lacks an ONNX model (model.onnx or model_quint8.onnx), tokenizer.json or gliner_config.json"
             );
         }
         Ok(())

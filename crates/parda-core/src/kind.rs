@@ -6,7 +6,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A category of sensitive data. Serialized as its variant name
-/// (`"Person"`, `"Aadhaar"`, …); unknown names become [`EntityKind::Custom`].
+/// (`"Person"`, `"Aadhaar"`, …); parsing ignores case and separators, and
+/// unknown names become [`EntityKind::Custom`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EntityKind {
     Person,
@@ -63,10 +64,66 @@ const NAMED: &[(&str, EntityKind)] = &[
     ("Organization", EntityKind::Organization),
 ];
 
+/// `name` lower-cased without `_`, `-` and spaces: "IP_ADDRESS" → "ipaddress".
+pub(crate) fn fold(name: &str) -> String {
+    name.chars()
+        .filter(|c| !matches!(c, '_' | '-' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 impl EntityKind {
     /// Every built-in kind, in declaration order.
     pub fn all() -> impl Iterator<Item = EntityKind> {
         NAMED.iter().map(|(_, k)| k.clone())
+    }
+
+    /// The built-in kind called `name`, ignoring case and `_` / `-` / space
+    /// separators (`secret`, `IP_ADDRESS`, `credit-card`); `None` for any
+    /// other name.
+    pub fn builtin(name: &str) -> Option<EntityKind> {
+        let folded = fold(name.trim());
+        NAMED
+            .iter()
+            .find(|(n, _)| fold(n) == folded)
+            .map(|(_, k)| k.clone())
+    }
+
+    /// Built-in kind names, comma separated (for error messages).
+    pub fn builtin_names() -> String {
+        NAMED.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+    }
+
+    /// Short label used in tags such as `[NAME_1]`, `[AADHAAR_2]`.
+    pub fn tag_label(&self) -> String {
+        let short = match self {
+            EntityKind::Person => "NAME",
+            EntityKind::IpAddress => "IP",
+            EntityKind::MacAddress => "MAC",
+            EntityKind::CreditCard => "CARD",
+            EntityKind::BankAccount => "ACCOUNT",
+            EntityKind::VoterId => "VOTER_ID",
+            EntityKind::DrivingLicence => "LICENCE",
+            EntityKind::IndianVehicleReg => "VEHICLE",
+            EntityKind::UsSsn => "SSN",
+            EntityKind::UkNino => "NINO",
+            EntityKind::DateOfBirth => "DOB",
+            EntityKind::Organization => "ORG",
+            EntityKind::Custom(name) => {
+                return name
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() {
+                            c.to_ascii_uppercase()
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+            }
+            _ => return self.label(),
+        };
+        short.to_string()
     }
 
     /// Upper-snake label used in placeholder tokens, e.g. `IP_ADDRESS`.
@@ -100,12 +157,10 @@ impl fmt::Display for EntityKind {
 impl FromStr for EntityKind {
     type Err = std::convert::Infallible;
 
+    /// Built-in names match ignoring case and separators (see
+    /// [`EntityKind::builtin`]); anything else is a custom kind.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(NAMED
-            .iter()
-            .find(|(n, _)| *n == s)
-            .map(|(_, k)| k.clone())
-            .unwrap_or_else(|| EntityKind::Custom(s.to_string())))
+        Ok(EntityKind::builtin(s).unwrap_or_else(|| EntityKind::Custom(s.to_string())))
     }
 }
 
@@ -135,6 +190,48 @@ mod tests {
             "Thing".parse::<EntityKind>().unwrap(),
             EntityKind::Custom("Thing".into())
         );
+    }
+
+    #[test]
+    fn builtin_names_ignore_case_and_separators() {
+        for (name, kind) in [
+            ("secret", EntityKind::Secret),
+            ("SECRET", EntityKind::Secret),
+            ("ip_address", EntityKind::IpAddress),
+            ("IP_ADDRESS", EntityKind::IpAddress),
+            ("credit-card", EntityKind::CreditCard),
+            ("Date Of Birth", EntityKind::DateOfBirth),
+        ] {
+            assert_eq!(name.parse::<EntityKind>().unwrap(), kind, "{name}");
+            assert_eq!(EntityKind::builtin(name), Some(kind), "{name}");
+        }
+        assert_eq!(EntityKind::builtin("secrets"), None);
+        assert_eq!(
+            "Codename".parse::<EntityKind>().unwrap(),
+            EntityKind::Custom("Codename".into())
+        );
+    }
+
+    #[test]
+    fn tag_labels_are_short_and_friendly() {
+        assert_eq!(EntityKind::Person.tag_label(), "NAME");
+        assert_eq!(EntityKind::Email.tag_label(), "EMAIL");
+        assert_eq!(EntityKind::Aadhaar.tag_label(), "AADHAAR");
+        assert_eq!(EntityKind::CreditCard.tag_label(), "CARD");
+        assert_eq!(EntityKind::BankAccount.tag_label(), "ACCOUNT");
+        assert_eq!(EntityKind::IpAddress.tag_label(), "IP");
+        assert_eq!(EntityKind::DateOfBirth.tag_label(), "DOB");
+        assert_eq!(
+            EntityKind::Custom("employee id".into()).tag_label(),
+            "EMPLOYEE_ID"
+        );
+        for k in EntityKind::all() {
+            let t = k.tag_label();
+            assert!(
+                !t.is_empty() && t.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "{k:?} -> {t}"
+            );
+        }
     }
 
     #[test]

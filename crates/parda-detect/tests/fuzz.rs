@@ -5,7 +5,10 @@ use parda_detect::{AllowList, Detector, DictionaryDetector, PersonBlock, RuleDet
 use proptest::prelude::*;
 
 fn rules() -> RuleDetector {
-    RuleDetector::new(&["global", "india", "us_uk", "secrets"].map(String::from), true)
+    RuleDetector::new(
+        &["global", "india", "us_uk", "secrets"].map(String::from),
+        true,
+    )
 }
 
 fn text() -> impl Strategy<Value = String> {

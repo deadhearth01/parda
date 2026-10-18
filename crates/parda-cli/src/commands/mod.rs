@@ -1,10 +1,13 @@
 //! Subcommands, and the shared "talk to the daemon, else run in-process"
 //! plumbing.
 
+pub mod ca;
 pub mod daemon;
 pub mod doctor;
 pub mod env;
+pub mod intercept;
 pub mod model;
+pub mod protection;
 pub mod redact;
 pub mod rules;
 pub mod service;

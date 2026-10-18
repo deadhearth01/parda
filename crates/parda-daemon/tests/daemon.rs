@@ -149,3 +149,199 @@ async fn second_daemon_refuses_to_start() {
         .unwrap()
         .unwrap();
 }
+
+const BASE_CONFIG: &str =
+    "[detect]\nmodel = \"none\"\n[clipboard]\nenabled = false\n[vault]\nuse_keyring = false\n";
+
+fn home_with(config: &str) -> (tempfile::TempDir, Paths) {
+    let home = tempfile::tempdir().unwrap();
+    let paths = Paths::under(home.path().to_path_buf());
+    paths.ensure().unwrap();
+    write_private(&paths.config_file(), config).unwrap();
+    (home, paths)
+}
+
+/// A minimal HTTP/1.1 POST; returns (status, body).
+fn http_post(addr: &str, path: &str, body: &str) -> (u16, String) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    write!(
+        s,
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         anthropic-version: 2023-06-01\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    let status = out[9..12].parse().unwrap();
+    let body = out
+        .split_once("\r\n\r\n")
+        .map(|x| x.1)
+        .unwrap_or("")
+        .to_string();
+    (status, body)
+}
+
+const ALL: RunOptions = RunOptions {
+    proxy: true,
+    clipboard: false,
+    ipc: true,
+    hotkey: false,
+};
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_settings_apply_without_restart() {
+    let config = format!(
+        "{BASE_CONFIG}[proxy]\nlisten = \"127.0.0.1:0\"\nanthropic_upstream = \"http://127.0.0.1:9\"\n"
+    );
+    let (_home, paths) = home_with(&config);
+    let daemon = tokio::spawn(run(paths.clone(), ALL));
+    let p = paths.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut c = wait_for_client(&p);
+        let addr = std::fs::read_to_string(p.proxy_addr_file()).unwrap();
+        let image = r#"{"model":"m","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}"#;
+        // Forwarded (and the closed upstream port answers 502).
+        assert_eq!(http_post(&addr, "/v1/messages", image).0, 502);
+
+        let toml = format!("{config}unscanned_media = \"block\"\n");
+        let res = c.call(Request::ConfigSet { toml }).unwrap();
+        assert_eq!(res["restart_required"], false);
+        let (status, body) = http_post(&addr, "/v1/messages", image);
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("parda_unscanned_media"), "{body}");
+
+        // A new listen address does need a restart.
+        let toml = config.replace("127.0.0.1:0", "127.0.0.1:1");
+        let res = c.call(Request::ConfigSet { toml }).unwrap();
+        assert_eq!(res["restart_required"], true);
+        c.call(Request::Shutdown).unwrap();
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), daemon)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_loopback_listen_is_refused_without_the_flag() {
+    let (_home, paths) = home_with(&format!("{BASE_CONFIG}[proxy]\nlisten = \"0.0.0.0:0\"\n"));
+    let res = tokio::time::timeout(Duration::from_secs(10), run(paths.clone(), ALL))
+        .await
+        .expect("daemon returns");
+    let err = format!("{:#}", res.unwrap_err());
+    assert!(err.contains("allow_non_loopback"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_daemon_leaves_the_first_daemons_files_alone() {
+    let (_home, paths) = home_with(&format!("{BASE_CONFIG}[proxy]\nlisten = \"127.0.0.1:0\"\n"));
+    let first = tokio::spawn(run(paths.clone(), ALL));
+    let p = paths.clone();
+    let mut c = tokio::task::spawn_blocking(move || wait_for_client(&p))
+        .await
+        .unwrap();
+    let addr = std::fs::read_to_string(paths.proxy_addr_file()).unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(10), run(paths.clone(), ALL))
+        .await
+        .expect("second daemon returns");
+    let err = format!("{:#}", second.unwrap_err());
+    assert!(err.contains("already running"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(paths.proxy_addr_file()).unwrap(),
+        addr
+    );
+    tokio::task::spawn_blocking(move || {
+        c.call(Request::Status).unwrap();
+        c.call(Request::Shutdown).unwrap();
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), first)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+/// A stand-in for something that holds the IPC socket but is not a daemon
+/// this version can talk to. `reply` answers the first line (None: never).
+#[cfg(unix)]
+fn fake_listener(paths: &Paths, reply: Option<&'static str>) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    let listener = UnixListener::bind(paths.runtime_dir.join("parda.sock")).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+                match reply {
+                    Some(r) => {
+                        let _ = stream.write_all(r.as_bytes());
+                    }
+                    None => std::thread::sleep(Duration::from_secs(6)),
+                }
+            });
+        }
+    });
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_of_another_protocol_version_counts_as_running() {
+    let (_home, paths) = home_with(&format!("{BASE_CONFIG}[proxy]\nlisten = \"127.0.0.1:0\"\n"));
+    fake_listener(
+        &paths,
+        Some("{\"kind\":\"Err\",\"code\":\"version_mismatch\",\"message\":\"expected 99\"}\n"),
+    );
+    let res = tokio::time::timeout(Duration::from_secs(10), run(paths.clone(), ALL))
+        .await
+        .expect("daemon returns");
+    let err = format!("{:#}", res.unwrap_err());
+    assert!(err.contains("not a compatible parda daemon"), "{err}");
+    // Nothing was started, nothing of the other process was touched.
+    assert!(!paths.proxy_addr_file().exists());
+    assert!(paths.runtime_dir.join("parda.sock").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_that_does_not_answer_counts_as_running() {
+    let (_home, paths) = home_with(&format!("{BASE_CONFIG}[proxy]\nlisten = \"127.0.0.1:0\"\n"));
+    fake_listener(&paths, None);
+    let res = tokio::time::timeout(Duration::from_secs(15), run(paths.clone(), ALL))
+        .await
+        .expect("daemon returns");
+    let err = format!("{:#}", res.unwrap_err());
+    assert!(err.contains("not a compatible parda daemon"), "{err}");
+    assert!(!paths.proxy_addr_file().exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_socket_file_is_not_a_running_daemon() {
+    let (_home, paths) = home_with(&format!("{BASE_CONFIG}[proxy]\nlisten = \"127.0.0.1:0\"\n"));
+    // A leftover socket nobody listens on: the daemon starts and replaces it.
+    #[cfg(unix)]
+    drop(std::os::unix::net::UnixListener::bind(paths.runtime_dir.join("parda.sock")).unwrap());
+    let first = tokio::spawn(run(paths.clone(), ALL));
+    let p = paths.clone();
+    let mut c = tokio::task::spawn_blocking(move || wait_for_client(&p))
+        .await
+        .unwrap();
+    tokio::task::spawn_blocking(move || {
+        c.call(Request::Shutdown).unwrap();
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), first)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}

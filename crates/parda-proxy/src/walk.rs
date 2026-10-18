@@ -1,44 +1,59 @@
-//! Generic JSON walking helpers shared by the provider adapters.
+//! JSON walking for the provider adapters. The generic helpers live in
+//! `parda-wire`.
 //!
 //! A walker visits every redactable string as `&mut String`. Redaction runs
 //! it twice in the same order: once to collect the texts (one engine batch),
 //! once to write the results back.
 
+pub(crate) use parda_wire::walk::{
+    Visit, json_string, leaves, preserve_numbers, str_field, type_of,
+};
+#[cfg(test)]
 use serde_json::Value;
 
-pub(crate) type Visit<'a> = &'a mut dyn FnMut(&mut String);
+/// What a request walker had to forward without scanning.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Unscanned {
+    /// Images, audio, binary documents, token ids.
+    pub media: u32,
+    /// Blocks / parts / items of a type parda does not know.
+    pub unknown: u32,
+}
 
-/// Every string leaf (values, not keys).
-pub(crate) fn leaves(v: &mut Value, f: Visit<'_>) {
-    match v {
-        Value::String(s) => f(s),
-        Value::Array(a) => a.iter_mut().for_each(|x| leaves(x, f)),
-        Value::Object(m) => m.values_mut().for_each(|x| leaves(x, f)),
-        _ => {}
+impl Unscanned {
+    pub(crate) const NONE: Unscanned = Unscanned {
+        media: 0,
+        unknown: 0,
+    };
+    pub(crate) const MEDIA: Unscanned = Unscanned {
+        media: 1,
+        unknown: 0,
+    };
+    pub(crate) const UNKNOWN: Unscanned = Unscanned {
+        media: 0,
+        unknown: 1,
+    };
+
+    pub(crate) fn total(self) -> u32 {
+        self.media + self.unknown
     }
 }
 
-/// A JSON document carried as a string (tool-call `arguments`): visit its
-/// string leaves and re-serialise it; text that is not a JSON object/array
-/// is visited as plain text.
-pub(crate) fn json_string(s: &mut String, f: Visit<'_>) {
-    match serde_json::from_str::<Value>(s) {
-        Ok(mut v) if v.is_object() || v.is_array() => {
-            leaves(&mut v, f);
-            *s = v.to_string();
+impl std::ops::AddAssign for Unscanned {
+    fn add_assign(&mut self, o: Unscanned) {
+        self.media += o.media;
+        self.unknown += o.unknown;
+    }
+}
+
+impl std::iter::Sum for Unscanned {
+    fn sum<I: Iterator<Item = Unscanned>>(iter: I) -> Unscanned {
+        let mut t = Unscanned::NONE;
+        for u in iter {
+            t += u;
         }
-        _ => f(s),
+        t
     }
-}
-
-pub(crate) fn str_field(v: &mut Value, key: &str, f: Visit<'_>) {
-    if let Some(Value::String(s)) = v.get_mut(key) {
-        f(s);
-    }
-}
-
-pub(crate) fn type_of(v: &Value) -> &str {
-    v.get("type").and_then(Value::as_str).unwrap_or("")
 }
 
 /// Collect the texts a walker visits (test helper).
@@ -47,23 +62,4 @@ pub(crate) fn collect(v: &mut Value, walker: impl Fn(&mut Value, Visit<'_>)) -> 
     let mut texts = Vec::new();
     walker(v, &mut |s: &mut String| texts.push(s.clone()));
     texts
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn leaves_and_json_strings() {
-        let mut v = json!({"a": "x", "b": [1, "y", {"c": "z"}], "k": true});
-        let got = collect(&mut v, |v, f| leaves(v, f));
-        assert_eq!(got, ["x", "y", "z"]);
-        let mut s = String::from(r#"{"to":"ravi@x.in","n":2}"#);
-        json_string(&mut s, &mut |t| *t = t.to_uppercase());
-        assert_eq!(s, r#"{"to":"RAVI@X.IN","n":2}"#);
-        let mut plain = String::from("not json");
-        json_string(&mut plain, &mut |t| t.push('!'));
-        assert_eq!(plain, "not json!");
-    }
 }

@@ -7,11 +7,12 @@
 use serde_json::{Value, json};
 
 use crate::sse::{Restorers, SseEvent, StreamRewriter};
-use crate::walk::{Visit, leaves, str_field, type_of};
+use crate::walk::{Unscanned, Visit, leaves, str_field, type_of};
 
-/// Visit the request's text; returns how many media blocks go unscanned.
-pub(crate) fn walk_request(v: &mut Value, f: Visit<'_>) -> u32 {
-    let mut unscanned = 0;
+/// Visit the request's text; returns what had to go unscanned.
+pub(crate) fn walk_request(v: &mut Value, f: Visit<'_>) -> Unscanned {
+    let mut unscanned = Unscanned::NONE;
+    tool_descriptions(v, f);
     match v.get_mut("system") {
         Some(Value::String(s)) => f(s),
         Some(Value::Array(blocks)) => {
@@ -37,60 +38,81 @@ pub(crate) fn walk_request(v: &mut Value, f: Visit<'_>) -> u32 {
     unscanned
 }
 
-#[cfg(test)]
-pub(crate) fn count_unscanned(v: &mut Value) -> u32 {
-    walk_request(v, &mut |_| {})
+/// `tools[].description` (custom tools; server tools have none).
+fn tool_descriptions(v: &mut Value, f: Visit<'_>) {
+    if let Some(Value::Array(tools)) = v.get_mut("tools") {
+        for t in tools {
+            str_field(t, "description", f);
+        }
+    }
 }
 
-fn request_block(b: &mut Value, f: Visit<'_>) -> u32 {
+#[cfg(test)]
+pub(crate) fn count_unscanned(v: &mut Value) -> u32 {
+    walk_request(v, &mut |_| {}).total()
+}
+
+fn blocks(content: Option<&mut Value>, f: Visit<'_>) -> Unscanned {
+    match content {
+        Some(Value::String(s)) => {
+            f(s);
+            Unscanned::NONE
+        }
+        Some(Value::Array(inner)) => inner.iter_mut().map(|x| request_block(x, f)).sum(),
+        _ => Unscanned::NONE,
+    }
+}
+
+fn request_block(b: &mut Value, f: Visit<'_>) -> Unscanned {
     match type_of(b) {
         "text" => {
             str_field(b, "text", f);
-            0
+            Unscanned::NONE
         }
-        "tool_result" => match b.get_mut("content") {
-            Some(Value::String(s)) => {
-                f(s);
-                0
-            }
-            Some(Value::Array(inner)) => inner.iter_mut().map(|x| request_block(x, f)).sum(),
-            _ => 0,
-        },
-        "tool_use" => {
+        "tool_result" => blocks(b.get_mut("content"), f),
+        // Tool calls the model made. Their inputs are restored in answers,
+        // so the client's copy holds real values: redact them again.
+        "tool_use" | "server_tool_use" | "mcp_tool_use" => {
             if let Some(input) = b.get_mut("input") {
                 leaves(input, f);
             }
-            0
+            Unscanned::NONE
         }
         "document" => {
+            str_field(b, "title", f);
+            str_field(b, "context", f);
             let source_type = b.get("source").map(type_of).unwrap_or_default().to_string();
             match source_type.as_str() {
                 "text" => {
                     if let Some(src) = b.get_mut("source") {
                         str_field(src, "data", f);
                     }
-                    0
+                    Unscanned::NONE
                 }
-                "content" => match b.get_mut("source").and_then(|s| s.get_mut("content")) {
-                    Some(Value::String(s)) => {
-                        f(s);
-                        0
-                    }
-                    Some(Value::Array(inner)) => {
-                        inner.iter_mut().map(|x| request_block(x, f)).sum()
-                    }
-                    _ => 0,
-                },
-                _ => 1,
+                "content" => blocks(b.get_mut("source").and_then(|s| s.get_mut("content")), f),
+                // base64 / url / file: binary or remote documents.
+                _ => Unscanned::MEDIA,
             }
         }
-        "search_result" => match b.get_mut("content") {
-            Some(Value::Array(inner)) => inner.iter_mut().map(|x| request_block(x, f)).sum(),
-            _ => 0,
-        },
-        "image" => 1,
-        // thinking, redacted_thinking, server tool blocks, future types.
-        _ => 0,
+        "search_result" => {
+            str_field(b, "title", f);
+            blocks(b.get_mut("content"), f)
+        }
+        "image" => Unscanned::MEDIA,
+        // Signed reasoning, and results of tools that ran on the provider's
+        // side (it produced them, so it already has them): left as is.
+        "thinking"
+        | "redacted_thinking"
+        | "mcp_tool_result"
+        | "web_search_tool_result"
+        | "web_fetch_tool_result"
+        | "code_execution_tool_result"
+        | "bash_code_execution_tool_result"
+        | "text_editor_code_execution_tool_result"
+        | "tool_search_tool_result"
+        | "container_upload" => Unscanned::NONE,
+        // A type parda does not know: forwarded unscanned, with a warning.
+        _ => Unscanned::UNKNOWN,
     }
 }
 
@@ -100,7 +122,9 @@ pub(crate) fn walk_response(v: &mut Value, f: Visit<'_>) {
         for b in blocks {
             match type_of(b) {
                 "text" => str_field(b, "text", f),
-                "tool_use" => {
+                // Must match the request walker: whatever is restored here
+                // comes back in the next request and is redacted there.
+                "tool_use" | "server_tool_use" | "mcp_tool_use" => {
                     if let Some(input) = b.get_mut("input") {
                         leaves(input, f);
                     }
@@ -113,9 +137,23 @@ pub(crate) fn walk_response(v: &mut Value, f: Visit<'_>) {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BlockKind {
+    /// `text`: `text_delta.text` is restored.
     Text,
+    /// A tool call (`tool_use`, `server_tool_use`, `mcp_tool_use`):
+    /// `input_json_delta.partial_json` is restored.
     Json,
+    /// Anything else (thinking, tool results, future types): untouched.
     Other,
+}
+
+impl BlockKind {
+    fn of_block(block_type: &str) -> Self {
+        match block_type {
+            "text" => BlockKind::Text,
+            "tool_use" | "server_tool_use" | "mcp_tool_use" => BlockKind::Json,
+            _ => BlockKind::Other,
+        }
+    }
 }
 
 pub(crate) struct AnthropicStream {
@@ -138,29 +176,37 @@ impl AnthropicStream {
         }
     }
 
-    fn flush(&mut self, index: u64, out: &mut Vec<SseEvent>) {
-        let kind = self.blocks.get(&index).copied().unwrap_or(BlockKind::Text);
-        let rest = self.restorers.finish(&Self::key(index, kind));
+    /// Flush one restorer key; the delta type follows the key it was pushed
+    /// under, never the block's recorded kind.
+    fn flush_key(&mut self, key: &str, out: &mut Vec<SseEvent>) {
+        let Some((prefix, index)) = key.split_once(':') else {
+            return;
+        };
+        let Ok(index) = index.parse::<u64>() else {
+            return;
+        };
+        let rest = self.restorers.finish(key);
         if rest.is_empty() {
             return;
         }
-        let delta = match kind {
-            BlockKind::Json => json!({"type": "input_json_delta", "partial_json": rest}),
-            _ => json!({"type": "text_delta", "text": rest}),
+        let delta = if prefix == "json" {
+            json!({"type": "input_json_delta", "partial_json": rest})
+        } else {
+            json!({"type": "text_delta", "text": rest})
         };
         let data = json!({"type": "content_block_delta", "index": index, "delta": delta});
         out.push(SseEvent::new(Some("content_block_delta"), data.to_string()));
     }
 
+    fn flush(&mut self, index: u64, out: &mut Vec<SseEvent>) {
+        for kind in [BlockKind::Text, BlockKind::Json] {
+            self.flush_key(&Self::key(index, kind), out);
+        }
+    }
+
     fn flush_all(&mut self, out: &mut Vec<SseEvent>) {
-        let open: Vec<u64> = self
-            .restorers
-            .open_keys()
-            .iter()
-            .filter_map(|k| k.split_once(':')?.1.parse().ok())
-            .collect();
-        for index in open {
-            self.flush(index, out);
+        for key in self.restorers.open_keys() {
+            self.flush_key(&key, out);
         }
     }
 }
@@ -175,11 +221,7 @@ impl StreamRewriter for AnthropicStream {
         match type_of(&v) {
             "content_block_start" => {
                 let block = v.get("content_block").map(type_of).unwrap_or_default();
-                let kind = match block {
-                    "text" => BlockKind::Text,
-                    "tool_use" => BlockKind::Json,
-                    _ => BlockKind::Other,
-                };
+                let kind = BlockKind::of_block(block);
                 self.blocks.insert(index, kind);
                 if kind == BlockKind::Text
                     && let Some(Value::String(t)) =
@@ -203,14 +245,23 @@ impl StreamRewriter for AnthropicStream {
                         return;
                     }
                 };
-                self.blocks.entry(index).or_insert(kind);
+                // Only restore deltas of blocks whose type says so (a block
+                // never announced is judged by its delta).
+                if *self.blocks.entry(index).or_insert(kind) != kind {
+                    out.push(ev);
+                    return;
+                }
                 let key = Self::key(index, kind);
                 let Some(Value::String(t)) = v.get_mut("delta").and_then(|d| d.get_mut(field))
                 else {
                     out.push(ev);
                     return;
                 };
-                let restored = self.restorers.push(&key, t);
+                let restored = if kind == BlockKind::Json {
+                    self.restorers.push_json(&key, t)
+                } else {
+                    self.restorers.push(&key, t)
+                };
                 if restored.is_empty() {
                     return; // everything held back for now
                 }
@@ -262,6 +313,24 @@ mod tests {
             walk_request(v, f);
         });
         assert_eq!(texts, ["S", "U", "I", "R", "D"]);
-        assert_eq!(count_unscanned(&mut v), 1);
+        // The image, and the unknown future block.
+        assert_eq!(count_unscanned(&mut v), 2);
+    }
+
+    #[test]
+    fn request_walk_covers_titles_contexts_and_tool_descriptions() {
+        let mut v = json!({
+            "tools": [{"name": "crm", "description": "Look up Ravi", "input_schema": {}},
+                      {"type": "web_search_20250305", "name": "web_search"}],
+            "messages": [{"role": "user", "content": [
+                {"type": "document", "title": "T", "context": "C", "source": {"type": "text", "data": "D"}},
+                {"type": "search_result", "title": "ST", "source": "https://x", "content": [{"type": "text", "text": "SR"}]},
+                {"type": "mcp_tool_result", "tool_use_id": "m", "content": [{"type": "text", "text": "from server"}]}
+            ]}]
+        });
+        let texts = collect(&mut v, |v, f| {
+            walk_request(v, f);
+        });
+        assert_eq!(texts, ["Look up Ravi", "T", "C", "D", "ST", "SR"]);
     }
 }

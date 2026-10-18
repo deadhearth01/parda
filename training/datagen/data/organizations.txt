@@ -1,0 +1,119 @@
+# Real organisations (companies, hospitals, banks, NGOs, universities) used as `organization` entities.
+# Coverage: Indian IT/finance/telecom/consumer firms, PSUs, hospitals and global companies/institutions.
+Infosys
+Wipro
+Tata Consultancy Services
+HCL Technologies
+Tech Mahindra
+Reliance Industries
+Larsen & Toubro
+HDFC Bank
+ICICI Bank
+Axis Bank
+Kotak Mahindra Bank
+State Bank of India
+Bajaj Finserv
+Asian Paints
+Hindustan Unilever
+ITC Limited
+Bharti Airtel
+Mahindra Logistics
+Zoho Corporation
+Freshworks
+Razorpay
+Zerodha
+Swiggy
+Zomato
+Flipkart Internet
+Paytm Payments Bank
+PhonePe Private Limited
+Ola Electric
+Nykaa
+Dream11
+Byju's
+Unacademy
+Meesho
+CRED
+Groww
+Lenskart
+Apollo Hospitals
+Fortis Healthcare
+Manipal Hospitals
+Narayana Health
+Cipla
+Sun Pharma
+Dr. Reddy's Laboratories
+Biocon
+Godrej Properties
+DLF Limited
+Adani Ports
+JSW Steel
+Hindalco
+Maruti Suzuki India
+IIT Bombay
+IIT Madras
+IIM Ahmedabad
+Delhi University
+Anna University
+BITS Pilani
+Christ University
+Symbiosis International
+AIIMS Delhi
+Indian Railways
+Bharat Petroleum
+Indian Oil Corporation
+NTPC Limited
+Accenture
+Deloitte
+KPMG
+PricewaterhouseCoopers
+Ernst & Young
+McKinsey & Company
+Boston Consulting Group
+Goldman Sachs
+JPMorgan Chase
+Morgan Stanley
+Barclays
+HSBC
+Standard Chartered
+Deutsche Bank
+Siemens
+Bosch
+SAP
+Philips
+Unilever
+Nestlé
+Shell
+BP
+Microsoft
+Oracle
+IBM
+Intel
+Cisco Systems
+Salesforce
+Adobe
+Atlassian
+Shopify
+Stripe
+Airbnb
+Spotify
+Netflix
+Uber Technologies
+Toyota Motor Corporation
+Sony Group
+Samsung Electronics
+LG Electronics
+Alibaba Group
+Tencent
+Mercado Libre
+Nubank
+Safaricom
+MTN Group
+Emirates Group
+Qatar Airways
+University of Oxford
+Stanford University
+Massachusetts General Hospital
+Mayo Clinic
+Red Cross
+UNICEF

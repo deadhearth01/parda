@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- Protection on/off switch (`[protection] enabled`, `parda on` / `parda off`, `p` or a click in the TUI). While off, text passes through unchanged on every surface with a warning event, and earlier stand-ins still restore.
+- TUI mouse support: click tabs, rows and the protection switch; the wheel scrolls lists and the live feed.
+- TUI *Settings* tab (was *Setup*) listing every configuration option, changed with Enter/Space/click; restart-only options are marked, and enabling `privacy.log_values` asks first.
+- `parda-pii-edge` fine-tuning pipeline: synthetic India-first data generator (`training/datagen`, see DATA_CARD.md), CPU fine-tuning, evaluation and ONNX export scripts.
+
 ## [0.1.0] - unreleased
 
 ### Added

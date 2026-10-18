@@ -32,6 +32,72 @@ pub(crate) fn case_insensitive(kind: &EntityKind) -> bool {
     )
 }
 
+/// Characters that make a run URL-like.
+const URL_RUN_CHARS: &[char] = &['/', '?', '=', '&', '%', '\\', ':', '@'];
+/// A run longer than this (in bytes) counts as URL-like.
+const MAX_CLEAN_RUN: usize = 2048;
+
+/// The URL rule used by url-safe restore: the run of non-ASCII-whitespace
+/// characters before a position is URL-like when it holds any of
+/// `/ ? = & % \ : @`, follows `www.`, or is longer than 2 KiB. A surrogate
+/// after a URL-like run is never restored, so a value cannot be put back
+/// into a link, image or query, whatever the syntax around it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UrlRun {
+    url_like: bool,
+    len: usize,
+    /// The last four characters, ASCII-lower-cased (0 for others).
+    tail: u32,
+}
+
+impl UrlRun {
+    pub(crate) fn feed(&mut self, c: char) {
+        if c.is_ascii_whitespace() {
+            *self = UrlRun::default();
+            return;
+        }
+        self.len += c.len_utf8();
+        let b = if c.is_ascii() {
+            u32::from(c.to_ascii_lowercase() as u8)
+        } else {
+            0
+        };
+        self.tail = (self.tail << 8) | b;
+        if self.len > MAX_CLEAN_RUN
+            || URL_RUN_CHARS.contains(&c)
+            || self.tail == u32::from_be_bytes(*b"www.")
+        {
+            self.url_like = true;
+        }
+    }
+
+    pub(crate) fn advance(&mut self, text: &str) {
+        text.chars().for_each(|c| self.feed(c));
+    }
+
+    pub(crate) fn url_like(&self) -> bool {
+        self.url_like
+    }
+}
+
+/// The matches of `found` (sorted, inside `text`) that do not follow a
+/// URL-like run; `run` is the state at the start of `text` and is not
+/// changed.
+pub(crate) fn not_url_like(text: &str, found: &[Found], run: &UrlRun) -> Vec<Found> {
+    let mut run = run.clone();
+    let mut pos = 0;
+    let mut out = Vec::with_capacity(found.len());
+    for f in found {
+        run.advance(&text[pos..f.start]);
+        if !run.url_like() {
+            out.push(*f);
+        }
+        run.advance(&text[f.start..f.end]);
+        pos = f.end;
+    }
+    out
+}
+
 /// A surrogate occurrence: byte span and pattern id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Found {
@@ -97,6 +163,11 @@ impl RestoreTable {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.ac.is_none()
+    }
+
+    /// Is `s` (ignoring ASCII case) one of the surrogates?
+    pub(crate) fn contains(&self, s: &str) -> bool {
+        self.sorted.binary_search(&s.to_ascii_lowercase()).is_ok()
     }
 
     fn bounded(
@@ -175,6 +246,11 @@ impl RestoreTable {
         if let Some(e) = entries.iter().find(|e| e.surrogate == matched) {
             return e.real.clone();
         }
+        // A tag (`[NAME_1]`) echoed in another case: its case says nothing
+        // about the value's, so the value comes back as written.
+        if matched.starts_with('[') && matched.ends_with(']') {
+            return entries[0].real.clone();
+        }
         match entries.iter().find(|e| case_insensitive(&e.kind)) {
             Some(e) => apply_case(matched, &e.real),
             None => entries[0].real.clone(),
@@ -208,6 +284,20 @@ impl RestoreTable {
     pub(crate) fn apply(&self, text: &str, prev: Option<char>) -> String {
         let found = self.find(text, prev);
         self.apply_found(text, &found)
+    }
+
+    /// Restore the surrogates of `text` that do not follow a URL-like run
+    /// ([`UrlRun`]); `run` is the state before `text` and is advanced over it.
+    pub(crate) fn apply_url_safe(
+        &self,
+        text: &str,
+        prev: Option<char>,
+        run: &mut UrlRun,
+    ) -> String {
+        let found = self.find(text, prev);
+        let kept = not_url_like(text, &found, run);
+        run.advance(text);
+        self.apply_found(text, &kept)
     }
 
     /// Start of the longest suffix of `text` that is (ignoring ASCII case) a
@@ -289,8 +379,59 @@ mod tests {
     }
 
     #[test]
+    fn a_tag_in_any_case_restores_the_value_as_written() {
+        // A model may echo `[name_1]`; the tag's case says nothing about the
+        // value's case.
+        let t = table(&[("[NAME_1]", "Ravi Kumar"), ("[NAME_2]", "ravi@x.in")]);
+        assert_eq!(
+            t.apply("[name_1], [Name_1], [NAME_1] / [name_2]", None),
+            "Ravi Kumar, Ravi Kumar, Ravi Kumar / ravi@x.in"
+        );
+    }
+
+    fn url_safe(t: &RestoreTable, text: &str) -> String {
+        t.apply_url_safe(text, None, &mut UrlRun::default())
+    }
+
+    #[test]
+    fn url_safe_restore_skips_matches_after_url_like_runs() {
+        let t = table(&[("[NAME_1]", "Ravi Kumar")]);
+        let text = "Hi [NAME_1], https://e/?d=[NAME_1] x/[NAME_1] Name:[NAME_1] \
+                    www.e[NAME_1] ?d=\u{a0}[NAME_1] (see [NAME_1]) <http:e/[NAME_1]> \
+                    a@b[NAME_1] 50%[NAME_1] k=[NAME_1] a&[NAME_1] \\[NAME_1] [NAME_1]/x";
+        assert_eq!(
+            url_safe(&t, text),
+            "Hi Ravi Kumar, https://e/?d=[NAME_1] x/[NAME_1] Name:[NAME_1] \
+             www.e[NAME_1] ?d=\u{a0}[NAME_1] (see Ravi Kumar) <http:e/[NAME_1]> \
+             a@b[NAME_1] 50%[NAME_1] k=[NAME_1] a&[NAME_1] \\[NAME_1] Ravi Kumar/x"
+        );
+        // Only ASCII whitespace ends a run; a run longer than 2 KiB counts as
+        // URL-like.
+        let long = format!("{}[NAME_1] [NAME_1]", "x".repeat(3000));
+        assert_eq!(
+            url_safe(&t, &long),
+            format!("{}[NAME_1] Ravi Kumar", "x".repeat(3000))
+        );
+        // A stand-in that itself holds `@` restores on its own, not after a URL.
+        let t = table(&[("arjun@x.org", "ravi@y.in")]);
+        assert_eq!(
+            url_safe(&t, "mail arjun@x.org or ?d=arjun@x.org"),
+            "mail ravi@y.in or ?d=arjun@x.org"
+        );
+        // The run carries over from earlier text.
+        let mut run = UrlRun::default();
+        run.advance("see https://e/?d=");
+        assert_eq!(
+            t.apply_url_safe("arjun@x.org", None, &mut run),
+            "arjun@x.org"
+        );
+        run.advance(" ");
+        assert_eq!(t.apply_url_safe("arjun@x.org", None, &mut run), "ravi@y.in");
+    }
+
+    #[test]
     fn non_alnum_edges_skip_boundary_checks() {
-        let t = table(&[("⟦PERSON_1⟧", "Ravi")]);
-        assert_eq!(t.apply("hi⟦PERSON_1⟧'s", None), "hiRavi's");
+        let t = table(&[("[NAME_1]", "Ravi")]);
+        assert_eq!(t.apply("hi[NAME_1]'s", None), "hiRavi's");
     }
 }

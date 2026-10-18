@@ -1,0 +1,111 @@
+# Product and brand names used as NON-entity fillers and hard negatives (cars, bikes, apps, gadgets, FMCG).
+# Disjoint from organizations.txt so the model learns products are not personal data.
+Tata Nexon
+Hyundai Creta
+Maruti Swift
+Mahindra Thar
+Kia Seltos
+Honda City
+Royal Enfield Classic 350
+Bajaj Pulsar
+TVS Apache
+Ather 450X
+iPhone 15
+iPhone 16 Pro
+Galaxy S24
+Pixel 9
+OnePlus 12
+Redmi Note 13
+MacBook Air
+ThinkPad X1
+Kindle Paperwhite
+AirPods Pro
+PlayStation 5
+Nintendo Switch
+Apple Watch
+Fire TV Stick
+Echo Dot
+JioFiber
+Airtel Xstream
+Maggi
+Amul Butter
+Parle-G
+Britannia Good Day
+Haldiram's Bhujia
+Dettol
+Colgate
+Surf Excel
+Tide
+Vim Bar
+Lifebuoy
+Dabur Chyawanprash
+Horlicks
+Bournvita
+Frooti
+Thums Up
+Limca
+Paper Boat
+Red Bull
+Coca-Cola
+Pepsi
+Nescafé Gold
+Tata Tea Premium
+Taj Mahal Tea
+Kissan Jam
+Lays Magic Masala
+Kurkure
+Bingo Mad Angles
+Dairy Milk Silk
+KitKat
+Excel
+PowerPoint
+Google Sheets
+Notion
+Slack
+Zoom
+Microsoft Teams
+WhatsApp Business
+Instagram Reels
+YouTube Shorts
+Netflix Premium
+Spotify Duo
+Hotstar
+JioCinema
+Prime Video
+Swiggy Instamart
+Zepto
+Blinkit
+BigBasket
+Uber Go
+Ola Mini
+Rapido
+IRCTC Tatkal
+MakeMyTrip
+Visual Studio Code
+PostgreSQL
+Kubernetes
+Docker Desktop
+Terraform
+React Native
+Tailwind CSS
+Next.js
+Django
+Spring Boot
+Rust 1.80
+Python 3.12
+Node.js 20
+Android 15
+iOS 18
+Windows 11
+Ubuntu 24.04
+ChatGPT Plus
+Claude Pro
+Gemini Advanced
+Copilot Pro
+Canva Pro
+Figma
+Toyota Innova
+Hyundai Venue
+Tata Punch
+Mahindra XUV700
+Kia Sonet

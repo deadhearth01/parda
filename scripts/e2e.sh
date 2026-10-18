@@ -54,6 +54,11 @@ openai_upstream = "http://127.0.0.1:$MOCK_PORT"
 
 [detect]
 model = "$MODEL"
+# The load test runs 16 concurrent requests on small CI runners; with the
+# default 250 ms budget, queued model calls time out and strict mode
+# (correctly) refuses them. Give the model room so the test measures
+# throughput rather than the budget.
+ml_timeout_ms = ${E2E_ML_TIMEOUT_MS:-2000}
 
 [vault]
 use_keyring = false

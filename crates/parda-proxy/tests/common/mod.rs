@@ -41,6 +41,8 @@ pub enum Reply {
     /// (delay before sending in ms, raw SSE text)
     Sse(Vec<(u64, String)>),
     Gzip(Value),
+    /// 307 redirect to the given absolute URL.
+    Redirect(String),
 }
 
 pub type Responder = Arc<dyn Fn(&Seen) -> Reply + Send + Sync>;
@@ -99,6 +101,12 @@ pub async fn mock(responder: Responder) -> Mock {
                         .body(Body::from_stream(stream))
                         .unwrap()
                 }
+                Reply::Redirect(to) => (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [(http::header::LOCATION, to)],
+                    String::new(),
+                )
+                    .into_response(),
                 Reply::Gzip(v) => {
                     let mut enc =
                         flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -126,6 +134,7 @@ pub struct Setup {
     pub events: broadcast::Receiver<ProxyEvent>,
     pub mock: Mock,
     pub client: reqwest::Client,
+    pub state: Arc<ProxyState>,
 }
 
 impl Setup {
@@ -145,10 +154,17 @@ impl Setup {
     }
 }
 
+/// A custom term whose real value needs JSON escaping.
+pub const ADDRESS: &str = "Flat 4\\B, \"Lotus\"\nPune";
+
 pub fn rules() -> RulesFile {
     RulesFile {
         person: vec![PersonBlock {
             name: "Ravi Kumar".into(),
+            ..Default::default()
+        }],
+        term: vec![parda_detect::Term {
+            text: ADDRESS.into(),
             ..Default::default()
         }],
         ..Default::default()
@@ -169,6 +185,9 @@ pub async fn setup_with(
     config.detect.model = "none".into();
     config.proxy.anthropic_upstream = format!("http://{}", mock.addr);
     config.proxy.openai_upstream = format!("http://{}", mock.addr);
+    // Most tests locate the stand-in by shape (e.g. an e-mail address); tag
+    // style has its own tests and is selected through `tweak`.
+    config.replace.style = parda_core::Style::Surrogate;
     tweak(&mut config);
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::open(
@@ -185,7 +204,8 @@ pub async fn setup_with(
     let state = ProxyState::new(engine.clone(), config.proxy.clone(), tx).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = listener.local_addr().unwrap();
-    tokio::spawn(async move { parda_proxy::serve(listener, state).await.unwrap() });
+    let served = state.clone();
+    tokio::spawn(async move { parda_proxy::serve(listener, served).await.unwrap() });
     Setup {
         _dir: dir,
         engine,
@@ -193,6 +213,7 @@ pub async fn setup_with(
         events: rx,
         mock,
         client: reqwest::Client::new(),
+        state,
     }
 }
 
