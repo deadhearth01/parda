@@ -7,10 +7,12 @@
 //! they would miss. A key listed here is never redacted, so a list must
 //! never name a field that can hold what the user typed.
 
-/// One site: its hosts (subdomains included), extra keys to skip, and the
-/// answers parda restores.
+/// One site: its hosts, extra keys to skip, and the answers parda restores.
 #[derive(Debug)]
 pub(crate) struct Site {
+    /// Exact host names. Requests to their subdomains use this site's keys
+    /// too, but answers are restored only on the hosts named here: a
+    /// subdomain is part of the site for that only when it is listed.
     pub(crate) hosts: &'static [&'static str],
     /// Key patterns (`*` matches any run of characters), case-insensitive.
     pub(crate) skip_keys: &'static [&'static str],
@@ -43,10 +45,11 @@ pub(crate) enum Restore {
     Never,
     /// Every format parda reads.
     Answer,
-    /// Only a stream (`text/event-stream`, NDJSON, or several JSON values
-    /// under a JSON type). A single JSON document or a text body passes
-    /// through: an AI answer to a send streams, while a document may be
-    /// anybody's content (a GraphQL query for a public page, a bot card).
+    /// Only a stream by its content type (`text/event-stream` or an NDJSON
+    /// type). Any JSON-typed body (one document, or one followed by more
+    /// lines, as a GraphQL answer ends in `{"extensions":…}`) or text body
+    /// passes through: an AI answer to a send streams, while a document may
+    /// be anybody's content (a GraphQL query for a public page, a bot card).
     Streamed,
 }
 
@@ -116,7 +119,7 @@ pub(crate) static SITES: &[Site] = &[
         answers: Answers::StreamedSends,
     },
     Site {
-        hosts: &["perplexity.ai"],
+        hosts: &["perplexity.ai", "www.perplexity.ai"],
         skip_keys: &[
             "frontend_*",
             "version",
@@ -147,7 +150,7 @@ pub(crate) static SITES: &[Site] = &[
     Site {
         // GraphQL over form posts: the prompt is inside `variables` (JSON
         // in a string); the rest is request plumbing.
-        hosts: &["meta.ai"],
+        hosts: &["meta.ai", "www.meta.ai"],
         skip_keys: &[
             "fb_*",
             "__*",
@@ -167,12 +170,16 @@ pub(crate) static SITES: &[Site] = &[
     },
 ];
 
-/// What to restore in the answer to `method path` on `host`. A site parda
-/// knows by its endpoints restores only those; every other listed host gets
-/// back only streamed answers to POST requests.
+/// What to restore in the answer to `method path` on `host`. Only a host a
+/// site names exactly gets anything back (a subdomain it does not name, or
+/// a host no site names, keeps its tags): a site parda knows by its
+/// endpoints restores only those; the other sites only streamed answers to
+/// POST requests.
 pub(crate) fn restore_rule(host: &str, method: &http::Method, path: &str) -> Restore {
-    let answers = for_host(host).map_or(&Answers::StreamedSends, |s| &s.answers);
-    match answers {
+    let Some(site) = exact_site(host) else {
+        return Restore::Never;
+    };
+    match &site.answers {
         Answers::StreamedSends if *method == http::Method::POST => Restore::Streamed,
         Answers::StreamedSends => Restore::Never,
         Answers::Listed { send, history } => {
@@ -220,9 +227,24 @@ fn matches(pattern: &str, segs: &[String]) -> bool {
             .all(|(p, s)| *p == "*" || p.eq_ignore_ascii_case(s))
 }
 
-/// The site entry for `host` (exact or a subdomain), if parda knows it.
+/// The site that names `host` exactly (ASCII case and a trailing dot
+/// aside), if any.
+fn exact_site(host: &str) -> Option<&'static Site> {
+    let host = normalize(host);
+    SITES.iter().find(|s| s.hosts.contains(&host.as_str()))
+}
+
+/// `host` lowercased, without a trailing dot: the form a vault scope and
+/// the site lists use.
+pub(crate) fn normalize(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The site entry for `host` (exact or a subdomain), if parda knows it:
+/// the keys its requests skip. Restoring needs the exact host
+/// ([`restore_rule`]).
 pub(crate) fn for_host(host: &str) -> Option<&'static Site> {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let host = normalize(host);
     SITES.iter().find(|s| {
         s.hosts
             .iter()
@@ -296,7 +318,7 @@ mod tests {
     #[test]
     fn known_and_unknown_sites_have_their_rules() {
         let rule = |host: &str, m: Method, path: &str| restore_rule(host, &m, path);
-        assert_eq!(rule("example.com", Method::POST, "/x"), Restore::Streamed);
+        assert_eq!(rule("example.com", Method::POST, "/x"), Restore::Never);
         assert_eq!(rule("example.com", Method::GET, "/x"), Restore::Never);
         assert_eq!(rule("example.com", Method::PUT, "/x"), Restore::Never);
         assert_eq!(
@@ -343,6 +365,49 @@ mod tests {
             ),
             Restore::Never
         );
+    }
+
+    /// Review F3: a subdomain of a listed site is decrypted and filtered,
+    /// but only the exact hosts a site names get answers restored.
+    #[test]
+    fn only_exact_site_hosts_restore() {
+        let send = |host: &str| restore_rule(host, &Method::POST, "/backend-api/conversation");
+        assert_eq!(send("chatgpt.com"), Restore::Answer);
+        assert_eq!(send("CHATGPT.COM."), Restore::Answer);
+        assert_eq!(send("chat.openai.com"), Restore::Answer);
+        for host in [
+            "x.chatgpt.com",
+            "a.b.chatgpt.com",
+            "X.ChatGPT.com.",
+            "x.chat.openai.com",
+            "openai.com",
+            "evilchatgpt.com",
+            "chatgpt.com.evil.test",
+        ] {
+            assert_eq!(send(host), Restore::Never, "{host}");
+        }
+        let post = |host: &str| restore_rule(host, &Method::POST, "/api/graphql/");
+        // Subdomains a site names explicitly are that site.
+        assert_eq!(post("meta.ai"), Restore::Streamed);
+        assert_eq!(post("www.meta.ai"), Restore::Streamed);
+        assert_eq!(post("www.perplexity.ai"), Restore::Streamed);
+        for host in [
+            "x.meta.ai",
+            "x.www.meta.ai",
+            "api.perplexity.ai",
+            "x.chat.deepseek.com",
+            "deepseek.com",
+            "x.claude.ai",
+            "x.gemini.google.com",
+            "google.com",
+            // A host no site names (added to `hosts` by the user).
+            "example.com",
+            "chat.test",
+        ] {
+            assert_eq!(post(host), Restore::Never, "{host}");
+        }
+        // Requests to subdomains still use the site's keys.
+        assert!(for_host("x.chatgpt.com").is_some());
     }
 
     #[test]

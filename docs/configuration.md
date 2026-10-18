@@ -49,7 +49,7 @@ enabled = false
 listen = "127.0.0.1:8788"
 hosts = ["chatgpt.com", "chat.openai.com", "claude.ai", "gemini.google.com", "copilot.microsoft.com",
          "perplexity.ai", "chat.deepseek.com", "chat.mistral.ai", "grok.com", "meta.ai", "poe.com"]
-scope = "per-host"                 # each site its own scope; or a fixed name, e.g. "global"
+scope = "per-host"                 # per-host (each host its own scope) | global | fixed:<name>
 unscanned = "allow"                # allow | block — file uploads and binary bodies
 skip_keys = []                     # extra identifier keys, e.g. ["trace_tag"]: identifier-shaped
                                    # values under them skip only the name model (rules still apply)
@@ -90,11 +90,14 @@ passthrough_paths = ["/api/*"]
 Only the listed hosts and their subdomains are decrypted; everything else is tunnelled untouched.
 Tags follow `replace.style` (there is no separate style for intercept).
 
-- **Scope**: with `scope = "per-host"` (the default) each listed site gets its own vault scope,
-  `intercept:<host>` (for example `intercept:chatgpt.com`). A site's answers can only restore tags
-  that were issued for text sent to that same site — never names you sent to another site, the
-  clipboard or the agent proxy. Any other value is a fixed scope shared by every site (`global` also
-  shares tags with the clipboard and the agent proxy).
+- **Scope**: with `scope = "per-host"` (the default) each host gets its own vault scope,
+  `intercept:<host>` named by the exact host (for example `intercept:chatgpt.com`; a subdomain such
+  as `x.chatgpt.com` gets a scope of its own). A site's answers can only restore tags that were
+  issued for text sent to that same host — never names you sent to another site or subdomain, the
+  clipboard or the agent proxy. `scope = "global"` shares one scope, `global`, across every site, the
+  clipboard and the agent proxy; `scope = "fixed:<name>"` shares the scope `<name>` across every site
+  (a name is 1 to 64 of `A-Z a-z 0-9 _ . : -`). Any other value (`per_host`, `web`) is an error when
+  the config loads, naming these three forms, so a typo never quietly shares one scope.
 - **Requests** to a listed site:
   - *What is read.* Every JSON string value and every JSON object key, at any depth (a key that holds
     a name is renamed where it stands). Form and query-string values, keys and value-less pieces
@@ -158,16 +161,21 @@ Tags follow `replace.style` (there is no separate style for intercept).
     | `403 parda_blocked` | a kind whose action is `block` (the message names kinds, not values) |
     | `500 parda_internal` | anything else that went wrong while filtering |
 
-- **Answers** get the real values back only where they are the user's own:
+- **Answers** get the real values back only where they are the user's own, and only on the exact
+  hosts parda knows (those named below, plus `www.meta.ai` and `www.perplexity.ai`). Requests to
+  a subdomain of a listed host (`x.chatgpt.com`) and to a host you added yourself are filtered as
+  usual, but their answers keep their tags:
   - *chatgpt.com, chat.openai.com, claude.ai, gemini.google.com:* only the answers to sending a
     message (chatgpt `/backend-api/conversation` and `/backend-api/f/conversation`; claude
     `…/chat_conversations/*/completion` and `…/retry_completion`; Gemini `StreamGenerate`), and the
     user's own history (chatgpt `GET /backend-api/conversation/*` and `/backend-api/conversations`;
     claude `GET /api/organizations/*/chat_conversations[/*]`). Gemini history comes from
     `batchexecute`, which is never restored, so **old Gemini chats show tags**.
-  - *Every other listed site:* only answers to a `POST` that stream (server-sent events, NDJSON, or
-    several JSON values in a row). A single JSON document, a text body or anything a `GET` returns
-    keeps its tags.
+  - *copilot.microsoft.com, perplexity.ai, chat.deepseek.com, chat.mistral.ai, grok.com, meta.ai,
+    poe.com:* only answers to a `POST` that stream, by their content type
+    (`text/event-stream` or an NDJSON type such as `application/x-ndjson`). Anything typed as JSON
+    (a single document, or one followed by more lines, as a GraphQL answer ends in
+    `{"extensions":…}`), a text body or anything a `GET` returns keeps its tags.
   - Shared conversations, GPT or bot descriptions and public pages therefore keep their tags: a
     page someone else wrote cannot make your browser show (or send on) your real values. Paths are
     matched decoded once, case-insensitively, without the query; a path with an empty, `.` or `..`
@@ -177,9 +185,13 @@ Tags follow `replace.style` (there is no separate style for intercept).
     strings (escaped as JSON) or plain text; data that looks like JSON but does not parse passes
     through with its tags. A streamed text is JSON text once it reaches a string or an object
     (`{"`, `["`), not because it starts with a bracket (`[NAME_1] said`, `[1] see` are text); JSON
-    text that turns into prose goes on unrestored. HTML pages and other types pass through
-    unchanged. A single event, line or frame larger than 16 MiB passes through, with the rest of
-    that answer, unrestored.
+    text that turns into prose goes on unrestored. A line break (CR, LF or CRLF) in a real value
+    restored into event-stream text starts a new `data:` line, so it never splits the event; it
+    reads back as LF. HTML pages and other types pass through unchanged, and so does an answer with
+    several `Content-Type` headers that name different types, or one that lists several types (a
+    comma outside a quoted string), is empty or does not parse: a browser might read it as another
+    type than parda did. A single event, line or frame larger than 16 MiB passes through, with the
+    rest of that answer, unrestored.
   - **A tag inside a URL is never restored**, so a prompt-injected image or link cannot carry your
     real data to another server. URLs are read as markdown renderers and browsers read them:
     markdown link and image targets (`](…)`, `](<…>)`, backslash escapes, spaces in `<…>`) and

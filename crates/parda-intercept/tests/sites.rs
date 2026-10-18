@@ -62,9 +62,14 @@ fn site() -> Responder {
             ]),
         ),
         // Meta AI GraphQL: one JSON document, or several values (one per
-        // line) when the query asks for a stream.
+        // line) when the query asks for a stream, typed as NDJSON when it
+        // asks for that too, else as JSON.
         "/api/graphql/" if seen.text().contains("\"stream\":true") => Reply::new(
-            "application/json",
+            if seen.text().contains("\"ndjson\":true") {
+                "application/x-ndjson"
+            } else {
+                "application/json"
+            },
             vec![
                 format!("{}\n", json!({"seq": 1, "delta": "Hi [NAME_1]"})),
                 format!("{}\n", json!({"seq": 2, "delta": " bye"})),
@@ -689,11 +694,27 @@ async fn other_sites_get_back_streamed_answers_to_sends_only() {
         .unwrap();
     let v: Value = res.json().await.unwrap();
     assert_eq!(v["data"]["node"]["text"], "Hi [NAME_1]");
-    // ...while values streamed one per line under a JSON type are an
-    // answer being written: restored.
+    // ...and so do values one per line under a JSON type (a GraphQL
+    // document followed by `{"extensions":…}` looks just like that)...
     let res = c
         .post(&meta)
         .json(&json!({"variables": {"message": "Ravi Kumar again"}, "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    let body = res.text().await.unwrap();
+    let deltas: Vec<Value> = body
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(deltas[0]["delta"], "Hi [NAME_1]", "{body}");
+    // ...while the same values typed as NDJSON are an answer being
+    // written: restored.
+    let res = c
+        .post(&meta)
+        .json(
+            &json!({"variables": {"message": "Ravi Kumar again"}, "stream": true, "ndjson": true}),
+        )
         .send()
         .await
         .unwrap();
@@ -706,7 +727,7 @@ async fn other_sites_get_back_streamed_answers_to_sends_only() {
     assert_eq!(deltas[1]["delta"], " bye", "{body}");
 
     let seen = up.seen();
-    assert_eq!(seen.len(), 4);
+    assert_eq!(seen.len(), 5);
     assert!(
         seen[0].text().contains("I am [NAME_1]"),
         "{}",
@@ -717,11 +738,9 @@ async fn other_sites_get_back_streamed_answers_to_sends_only() {
         "{}",
         seen[2].text()
     );
-    assert!(
-        seen[3].text().contains("[NAME_1] again"),
-        "{}",
-        seen[3].text()
-    );
+    for r in &seen[3..] {
+        assert!(r.text().contains("[NAME_1] again"), "{}", r.text());
+    }
 }
 
 /// Reviewer probe (I4): a page opened as `chatgpt.com/?q=<prompt>` would
@@ -760,6 +779,70 @@ async fn referer_loses_its_query_and_fragment() {
         let seen = up.seen();
         for s in &seen[seen.len() - 2..] {
             assert_eq!(s.referer.as_deref(), Some(want), "{} {referer}", s.method);
+        }
+    }
+}
+
+/// Review F5: a response with several `Content-Type` headers was restored
+/// by the first one, while a browser may read it by another (an
+/// `application/json` document read as `text/html`, say). Headers that
+/// disagree on the media type pass the answer through unrestored; the same
+/// media type repeated (ASCII case and parameters aside) is still one type.
+#[tokio::test]
+async fn conflicting_content_types_pass_through_unrestored() {
+    let doc = json!({"t": "hi [NAME_1]"}).to_string();
+    let cases: Vec<(&'static str, Vec<&'static str>, bool)> = vec![
+        ("application/json", vec![], true),
+        ("application/json", vec!["text/html"], false),
+        ("text/html", vec!["application/json"], false),
+        ("application/json", vec!["text/plain"], false),
+        (
+            "application/json",
+            vec!["application/json", "text/html"],
+            false,
+        ),
+        ("application/json", vec![""], false),
+        (
+            "application/json",
+            vec!["APPLICATION/JSON; charset=utf-8"],
+            true,
+        ),
+        (
+            "application/json; charset=utf-8",
+            vec!["application/json"],
+            true,
+        ),
+        // One header listing several types (a comma outside quotes), or an
+        // empty one: unrestored too.
+        ("text/event-stream, text/html", vec![], false),
+        ("application/json,text/html", vec![], false),
+        ("application/json; charset=utf-8, text/html", vec![], false),
+        ("application/json; x=\"a,b\", text/html", vec![], false),
+        ("", vec![], false),
+        ("application/json; x=\"a,b\"", vec![], true),
+    ];
+    for (first, more, want) in cases {
+        let (first2, more2, doc2) = (first, more.clone(), doc.clone());
+        let up = start_upstream(Arc::new(move |_: &Seen| {
+            let mut r = Reply::new(first2, vec![doc2.clone()]);
+            r.more_content_types = more2.clone();
+            r
+        }))
+        .await;
+        let parda = start_parda(&up, |_| {}, None).await;
+        let c = parda.client();
+        let url = format!("https://chatgpt.com:{}/backend-api/conversation", up.port);
+        let res = c
+            .post(&url)
+            .json(&json!({"prompt": "I am Ravi Kumar"}))
+            .send()
+            .await
+            .unwrap();
+        let body = res.text().await.unwrap();
+        let restored = body.contains("Ravi Kumar");
+        assert_eq!(restored, want, "{first} {more:?}: {body}");
+        if !want {
+            assert_eq!(body, doc, "{first} {more:?}");
         }
     }
 }

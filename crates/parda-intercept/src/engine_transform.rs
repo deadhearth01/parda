@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use bytes::Bytes;
 use http::HeaderMap;
 use http::header::CONTENT_TYPE;
-use parda_core::{INTERCEPT_SCOPE_PER_HOST, InterceptConfig, UnscannedMedia};
+use parda_core::{InterceptConfig, InterceptScope, UnscannedMedia};
 use parda_engine::{Engine, EngineError};
 use parda_wire::body::{self, BodyError};
 
@@ -24,7 +24,7 @@ use crate::{BodyTransform, Refusal, StreamTransform};
 
 /// The settings one request uses (a snapshot of `[intercept]`).
 struct Settings {
-    /// A fixed vault scope, or `None` for one scope per site.
+    /// A fixed vault scope, or `None` for one scope per host.
     scope: Option<String>,
     unscanned: UnscannedMedia,
     skip_keys: Vec<String>,
@@ -32,24 +32,25 @@ struct Settings {
 }
 
 impl Settings {
-    /// The vault scope of `host`: `intercept:<listed host>` per site, so a
-    /// site's answers only restore tags issued for text sent to it.
+    /// The vault scope of `host`: `intercept:<host>` per exact host
+    /// (lowercased, no trailing dot), so a host's answers only restore tags
+    /// issued for text sent to that same host, never to a subdomain or a
+    /// parent of it.
     fn scope_for(&self, host: &str) -> String {
         match &self.scope {
             Some(fixed) => fixed.clone(),
-            None => {
-                let site = self.hosts.entry_for(host).map_or_else(
-                    || host.trim_end_matches('.').to_ascii_lowercase(),
-                    str::to_string,
-                );
-                format!("intercept:{site}")
-            }
+            None => format!("intercept:{}", sites::normalize(host)),
         }
     }
 
     fn from_config(cfg: &InterceptConfig) -> Self {
         Settings {
-            scope: (cfg.scope != INTERCEPT_SCOPE_PER_HOST).then(|| cfg.scope.clone()),
+            // A value the config loader would refuse (only possible when
+            // built in code) gets the narrowest scopes: one per host.
+            scope: match InterceptScope::parse(&cfg.scope) {
+                Ok(InterceptScope::Fixed(name)) => Some(name),
+                Ok(InterceptScope::PerHost) | Err(_) => None,
+            },
             unscanned: cfg.unscanned,
             skip_keys: cfg.skip_keys.clone(),
             hosts: HostList::new(&cfg.hosts),
@@ -428,11 +429,12 @@ impl BodyTransform for EngineTransform {
     }
 
     /// Answers are restored only where they are the user's own (see
-    /// `sites::restore_rule`): on chatgpt.com, claude.ai and Gemini the
-    /// allowlisted send (POST) and history (GET) endpoints; on any other
-    /// listed host streamed answers to POST requests. Everything else
-    /// passes through with its tags, so a page someone else wrote never
-    /// gets the viewer's values.
+    /// `sites::restore_rule`), and only on a host a site names exactly: on
+    /// chatgpt.com, claude.ai and Gemini the allowlisted send (POST) and
+    /// history (GET) endpoints; on the other known sites streamed answers
+    /// to POST requests. Everything else (subdomains a site does not name,
+    /// hosts no site names) passes through with its tags, so a page
+    /// someone else wrote never gets the viewer's values.
     fn response_stream(
         &self,
         method: &http::Method,
@@ -1797,16 +1799,12 @@ pub(crate) mod tests {
         for host in [
             "chat.deepseek.com",
             "meta.ai",
+            "www.meta.ai",
             "perplexity.ai",
-            "example.com",
         ] {
             for path in ["/api/v0/chat/completion", "/api/graphql/", "/"] {
                 // Streamed answers to the user's sends.
-                for ct in [
-                    "text/event-stream",
-                    "application/x-ndjson",
-                    "application/json; lines",
-                ] {
+                for ct in ["text/event-stream", "application/x-ndjson"] {
                     assert!(
                         restored(&t, &Method::POST, host, path, ct),
                         "{host}{path} {ct}"
@@ -1820,11 +1818,21 @@ pub(crate) mod tests {
                         "{host}{path} {ct}"
                     );
                 }
-                // A single document (a GraphQL answer, a page) never.
-                for ct in ["application/json", "text/plain"] {
+                // A single document (a GraphQL answer, a page) never, nor
+                // JSON values one per line under a JSON type.
+                for ct in ["application/json", "application/json; lines", "text/plain"] {
                     for m in [Method::POST, Method::GET] {
                         assert!(!restored(&t, &m, host, path, ct), "{m} {host}{path} {ct}");
                     }
+                }
+            }
+        }
+        // A host no site names (one the user added) or a subdomain a site
+        // does not name: nothing is restored.
+        for host in ["example.com", "x.meta.ai", "x.chat.deepseek.com"] {
+            for ct in ALL_TYPES {
+                for m in [Method::POST, Method::GET] {
+                    assert!(!restored(&t, &m, host, "/", ct), "{m} {host} {ct}");
                 }
             }
         }
@@ -1834,6 +1842,113 @@ pub(crate) mod tests {
         let mut out = r.push(framed.as_bytes()).to_vec();
         out.extend_from_slice(&r.finish());
         assert_eq!(out, framed.as_bytes());
+    }
+
+    /// Review F2: on a site restored only where it streams, a JSON
+    /// document followed by another line (meta.ai's GraphQL answers end in
+    /// `{"extensions":{"is_final":true}}`) was read as a stream of JSON
+    /// values and restored. Only event streams and NDJSON types stream
+    /// there; JSON values one per line stay a stream on a known site's own
+    /// endpoints.
+    #[test]
+    fn json_documents_with_trailing_lines_are_not_streams_on_other_sites() {
+        use http::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let t = global(dir.path());
+        let run = |host: &str, path: &str, ct: &str, body: &str| {
+            let mut r = t.response_stream(&Method::POST, host, path, ct);
+            let mut out = Vec::new();
+            for b in body.as_bytes().chunks(9) {
+                out.extend_from_slice(&r.push(b));
+            }
+            out.extend_from_slice(&r.finish());
+            String::from_utf8(out).unwrap()
+        };
+        let doc = json!({"data": {"bot": {"description": "Public bot: hi [NAME_1]"}}}).to_string();
+        let fin = "{\"extensions\":{\"is_final\":true}}";
+        for body in [
+            doc.clone(),
+            format!("{doc}\r\n{fin}"),
+            format!("{doc}\n{fin}\n"),
+            format!("{doc}\n{doc}\n"),
+            format!("{doc}\nx"),
+            format!("{doc}\n0"),
+        ] {
+            for host in ["meta.ai", "poe.com", "chat.deepseek.com"] {
+                for ct in [
+                    "application/json",
+                    "application/json; charset=utf-8",
+                    "text/json",
+                    "application/graphql-response+json",
+                    "text/plain",
+                ] {
+                    assert_eq!(run(host, "/api/graphql/", ct, &body), body, "{host} {ct}");
+                }
+            }
+        }
+        // The same lines as NDJSON or events do stream.
+        let nd = format!("{doc}\n{fin}\n");
+        assert!(
+            run("meta.ai", "/api/graphql/", "application/x-ndjson", &nd).contains("Ravi Kumar")
+        );
+        let ev = format!("data: {doc}\n\n");
+        assert!(run("meta.ai", "/api/graphql/", "text/event-stream", &ev).contains("Ravi Kumar"));
+        // A known site's send endpoint still reads JSON lines as a stream.
+        let out = run(
+            "chatgpt.com",
+            "/backend-api/conversation",
+            "application/json",
+            &nd,
+        );
+        assert!(out.contains("Ravi Kumar"), "{out}");
+    }
+
+    /// Review F3: subdomains shared their site's scope and got its answers
+    /// restored. A scope is the exact host; a subdomain no site names is
+    /// filtered but never restored, whatever the scope setting.
+    #[test]
+    fn subdomains_are_filtered_but_never_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path());
+        let t = transform(&e, |_| {});
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "text/plain",
+            Bytes::from("I am Ravi Kumar"),
+        );
+        assert_eq!(out.body, "I am [NAME_1]");
+        for host in ["x.chatgpt.com", "a.b.chatgpt.com", "X.CHATGPT.COM."] {
+            assert_eq!(answer(&t, host, "hi [NAME_1]"), "hi [NAME_1]", "{host}");
+        }
+        // Requests to a subdomain are still redacted, under its own scope.
+        let out = rewrite(
+            &t,
+            "x.chatgpt.com",
+            "text/plain",
+            Bytes::from("Ravi Kumar here"),
+        );
+        assert_eq!(out.body, "[NAME_1] here");
+        assert_eq!(
+            e.restore("[NAME_1]", "intercept:x.chatgpt.com"),
+            "Ravi Kumar"
+        );
+        assert_eq!(answer(&t, "x.chatgpt.com", "hi [NAME_1]"), "hi [NAME_1]");
+        let st = t.settings();
+        assert_eq!(st.scope_for("X.ChatGPT.com."), "intercept:x.chatgpt.com");
+        assert_eq!(st.scope_for("chatgpt.com"), "intercept:chatgpt.com");
+        // A fixed scope does not open subdomains either.
+        let dir2 = tempfile::tempdir().unwrap();
+        let t2 = global(dir2.path());
+        assert_eq!(answer(&t2, "chatgpt.com", "hi [NAME_1]"), "hi Ravi Kumar");
+        assert_eq!(answer(&t2, "x.chatgpt.com", "hi [NAME_1]"), "hi [NAME_1]");
+        let out = rewrite(
+            &t2,
+            "x.chatgpt.com",
+            "text/plain",
+            Bytes::from("Ravi Kumar"),
+        );
+        assert_eq!(out.body, "[NAME_1]");
     }
 
     #[test]
@@ -1848,10 +1963,9 @@ pub(crate) mod tests {
             Bytes::from("I am Ravi Kumar"),
         );
         assert_eq!(out.body, "I am [NAME_1]");
-        // Only the site the tag was issued for gets the value back
-        // (subdomains are the same site).
+        // Only the site the tag was issued for gets the value back.
         assert_eq!(answer(&t, "chatgpt.com", "hi [NAME_1]"), "hi Ravi Kumar");
-        assert_eq!(answer(&t, "ab.chatgpt.com", "hi [NAME_1]"), "hi Ravi Kumar");
+        assert_eq!(answer(&t, "CHATGPT.com.", "hi [NAME_1]"), "hi Ravi Kumar");
         assert_eq!(answer(&t, "claude.ai", "hi [NAME_1]"), "hi [NAME_1]");
         assert_eq!(e.restore("[NAME_1]", "intercept:chatgpt.com"), "Ravi Kumar");
         // Tags from other surfaces (the clipboard, the agent proxy) are not
@@ -1861,7 +1975,21 @@ pub(crate) mod tests {
         assert_eq!(e2.redact("Ravi Kumar", "global").unwrap().text, "[NAME_1]");
         let t2 = transform(&e2, |_| {});
         assert_eq!(answer(&t2, "claude.ai", "hi [NAME_1]"), "hi [NAME_1]");
-        // A fixed scope name is shared by every site.
+        // A fixed scope name is shared by every site: `global`, or
+        // `fixed:<name>` for the scope `<name>`; a value the config loader
+        // refuses gets one scope per host.
+        for (scope, want) in [
+            ("per-host", "intercept:claude.ai"),
+            ("global", "global"),
+            ("fixed:web", "web"),
+            ("fixed:global", "global"),
+            ("per_host", "intercept:claude.ai"),
+            ("web", "intercept:claude.ai"),
+            ("fixed:", "intercept:claude.ai"),
+        ] {
+            let t = transform(&e2, |c| c.scope = scope.into());
+            assert_eq!(t.settings().scope_for("claude.ai"), want, "{scope}");
+        }
         let t3 = transform(&e2, |c| c.scope = "global".into());
         assert_eq!(answer(&t3, "claude.ai", "hi [NAME_1]"), "hi Ravi Kumar");
         let out = rewrite(&t3, "claude.ai", "text/plain", Bytes::from("Ravi Kumar"));

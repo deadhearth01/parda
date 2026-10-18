@@ -1,4 +1,6 @@
 //! Which hosts parda decrypts: the listed AI hosts and their subdomains.
+//! Decrypted requests are filtered; answers are restored only on the exact
+//! hosts a known site names (`sites::restore_rule`).
 
 /// The hosts parda intercepts. An entry matches itself and every subdomain,
 /// case-insensitively. Entries are host names without a port.

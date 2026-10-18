@@ -11,8 +11,8 @@ pub mod validators;
 
 pub use config::{
     Action, ClipboardConfig, Config, DEFAULT_INTERCEPT_HOSTS, DetectConfig,
-    INTERCEPT_SCOPE_PER_HOST, InterceptConfig, Mode, PrivacyConfig, ProtectionConfig, ProxyConfig,
-    ReplaceConfig, Style, UnscannedMedia, VaultConfig,
+    INTERCEPT_SCOPE_PER_HOST, InterceptConfig, InterceptScope, Mode, PrivacyConfig,
+    ProtectionConfig, ProxyConfig, ReplaceConfig, Style, UnscannedMedia, VaultConfig,
 };
 pub use detection::{Detection, Source, Span};
 pub use error::{Error, Result};

@@ -268,13 +268,34 @@ pub fn serialize(ev: &SseEvent) -> Bytes {
         s.push_str(e);
         s.push('\n');
     }
-    for line in ev.data.split('\n') {
+    for line in data_lines(&ev.data) {
         s.push_str("data: ");
         s.push_str(line);
         s.push('\n');
     }
     s.push('\n');
     Bytes::from(s)
+}
+
+/// The `data:` lines that carry `data`: split on CRLF, CR or LF (a reader
+/// ends a line at each), every piece kept, empty ones included. A line
+/// break in the data reads back as LF.
+fn data_lines(data: &str) -> impl Iterator<Item = &str> {
+    let mut rest = Some(data);
+    std::iter::from_fn(move || {
+        let text = rest?;
+        match text.find(['\r', '\n']) {
+            Some(i) => {
+                let len = if text[i..].starts_with("\r\n") { 2 } else { 1 };
+                rest = Some(&text[i + len..]);
+                Some(&text[..i])
+            }
+            None => {
+                rest = None;
+                Some(text)
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -309,6 +330,30 @@ mod tests {
             serialize(&ev),
             Bytes::from_static(b"event: x\ndata: line1\ndata: line2\n\n")
         );
+    }
+
+    #[test]
+    fn data_with_any_line_ending_stays_one_event() {
+        // A reader splits lines on CRLF, CR or LF, so a CR in data must
+        // start a new `data:` line, never end the event or truncate it.
+        for (data, lines) in [
+            ("a\rb", "data: a\ndata: b\n"),
+            ("a\r\rdata: x", "data: a\ndata: \ndata: data: x\n"),
+            ("a\r\nevent: pwn", "data: a\ndata: event: pwn\n"),
+            ("a\n\nb\r", "data: a\ndata: \ndata: b\ndata: \n"),
+            ("\r\n\r", "data: \ndata: \ndata: \n"),
+        ] {
+            let mut ev = SseEvent::new(Some("x"), String::new());
+            ev.set_data(data.into());
+            let out = serialize(&ev);
+            assert_eq!(out, Bytes::from(format!("event: x\n{lines}\n")), "{data:?}");
+            let mut p = SseParser::default();
+            let evs = p.feed(&out);
+            assert_eq!(evs.len(), 1, "{data:?}");
+            assert_eq!(evs[0].event.as_deref(), Some("x"));
+            assert_eq!(evs[0].data, data.replace("\r\n", "\n").replace('\r', "\n"));
+            assert!(p.finish().is_none());
+        }
     }
 
     #[test]
