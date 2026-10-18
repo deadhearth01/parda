@@ -40,6 +40,11 @@ pub use worker::{Cmd, Msg, Starter};
 pub trait Backend {
     fn call(&mut self, req: Request) -> anyhow::Result<Value>;
 
+    /// What [`Backend::start_daemon`] would do, for the offline screen.
+    fn start_hint(&mut self) -> Option<String> {
+        None
+    }
+
     /// Start the daemon in the background (the offline screen's `s`).
     fn start_daemon(&mut self) -> anyhow::Result<String> {
         anyhow::bail!("start the daemon with `parda daemon` or `parda service install`")
@@ -97,7 +102,6 @@ pub fn run(runtime_dir: &Path, starter: Option<Starter>) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel::<UiEvent>();
     let mut app = App::new();
     app.theme = Theme::from_env();
-    app.start_hint = starter.as_ref().map(|s| s.hint.clone());
     let cmds = worker::spawn(
         worker::Live::new(runtime_dir, tx.clone(), starter),
         tx.clone(),

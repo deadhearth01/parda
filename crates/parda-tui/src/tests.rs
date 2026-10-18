@@ -20,6 +20,7 @@ struct Fake {
     calls: Vec<String>,
     online: bool,
     started: usize,
+    hint_calls: usize,
     vault: Vec<Value>,
 }
 
@@ -88,6 +89,11 @@ impl Backend for Fake {
         })
     }
 
+    fn start_hint(&mut self) -> Option<String> {
+        self.hint_calls += 1;
+        Some("runs `parda daemon` for PARDA_HOME /x/home".into())
+    }
+
     fn start_daemon(&mut self) -> anyhow::Result<String> {
         self.started += 1;
         self.online = true;
@@ -102,6 +108,7 @@ fn fake() -> Fake {
         calls: vec![],
         online: true,
         started: 0,
+        hint_calls: 0,
         vault: vec![
             json!({"scope": "global", "kind": "Person", "count": 5}),
             json!({"scope": "global", "kind": "Email", "count": 2}),
@@ -1232,8 +1239,13 @@ fn worker_thread_retries_offline_and_starts_only_when_asked() {
     std::fs::create_dir_all(&dir).unwrap();
     let started = Arc::new(AtomicUsize::new(0));
     let s2 = Arc::clone(&started);
+    let described = Arc::new(AtomicUsize::new(0));
+    let d2 = Arc::clone(&described);
     let starter = Starter {
-        hint: "test".into(),
+        describe: Box::new(move || {
+            d2.fetch_add(1, Ordering::SeqCst);
+            "runs `parda daemon` for PARDA_HOME /t".into()
+        }),
         start: Box::new(move || {
             s2.fetch_add(1, Ordering::SeqCst);
             Ok("started".into())
@@ -1261,6 +1273,11 @@ fn worker_thread_retries_offline_and_starts_only_when_asked() {
         t0.elapsed()
     );
     assert_eq!(started.load(Ordering::SeqCst), 0, "never starts by itself");
+    assert_eq!(
+        described.load(Ordering::SeqCst),
+        1,
+        "the service lookup runs once, on the worker, after the first failure"
+    );
     cmds.send(Cmd::StartDaemon).unwrap();
     loop {
         match rx
@@ -1277,4 +1294,23 @@ fn worker_thread_retries_offline_and_starts_only_when_asked() {
     assert_eq!(started.load(Ordering::SeqCst), 1);
     drop(cmds);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── fix round 1 ─────────────────────────────────────────────────────────
+
+#[test]
+fn c1_start_hint_comes_from_the_worker_once_offline() {
+    let mut b = fake();
+    let mut app = online(&mut b);
+    assert_eq!(
+        b.hint_calls, 0,
+        "no service lookup while the daemon answers"
+    );
+    assert!(app.start_hint.is_none());
+    b.online = false;
+    app.request_refresh();
+    app.sync(&mut b);
+    assert!(b.hint_calls >= 1);
+    let screen = render_text(&app, 80, 24);
+    assert!(screen.contains("PARDA_HOME /x/home"), "{screen}");
 }

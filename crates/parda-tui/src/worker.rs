@@ -87,6 +87,8 @@ pub enum Msg {
     },
     Redacted(Result<Redaction, String>),
     Started(Result<String, String>),
+    /// What the offline screen's start key would do.
+    StartHint(String),
     Event(Event),
 }
 
@@ -99,6 +101,9 @@ fn refresh(tab: Tab, b: &mut dyn Backend, out: &mut Vec<Msg>) {
         Ok(s) => out.push(Msg::Status(Ok(s))),
         Err(e) => {
             out.push(Msg::Status(Err(err(e))));
+            if let Some(h) = b.start_hint() {
+                out.push(Msg::StartHint(h));
+            }
             return;
         }
     }
@@ -207,8 +212,10 @@ pub fn exec(cmd: Cmd, b: &mut dyn Backend, out: &mut Vec<Msg>) {
 
 /// Starts the daemon when the user asks for it on the offline screen.
 pub struct Starter {
-    /// What pressing the key will do, shown on the offline screen.
-    pub hint: String,
+    /// What pressing the key would do, for the offline screen. Called on
+    /// the worker (it may read service files), only once the daemon is
+    /// found offline.
+    pub describe: Box<dyn FnMut() -> String + Send>,
     pub start: Box<dyn FnMut() -> anyhow::Result<String> + Send>,
 }
 
@@ -221,6 +228,8 @@ pub struct Live {
     /// Bumped per subscription; an older subscriber stops forwarding.
     sub_gen: Arc<AtomicU64>,
     starter: Option<Starter>,
+    /// The starter's description, worked out once per offline spell.
+    hint: Option<String>,
 }
 
 impl Live {
@@ -231,6 +240,7 @@ impl Live {
             tx,
             sub_gen: Arc::new(AtomicU64::new(0)),
             starter,
+            hint: None,
         }
     }
 
@@ -243,6 +253,7 @@ impl Live {
                 },
             )?;
             self.client = Some(c);
+            self.hint = None;
             self.subscribe();
         }
         Ok(self.client.as_mut().expect("connected"))
@@ -285,6 +296,13 @@ impl Backend for Live {
                 Ok(self.connect()?.call(req)?)
             }
         }
+    }
+
+    fn start_hint(&mut self) -> Option<String> {
+        if self.hint.is_none() {
+            self.hint = self.starter.as_mut().map(|s| (s.describe)());
+        }
+        self.hint.clone()
     }
 
     fn start_daemon(&mut self) -> anyhow::Result<String> {

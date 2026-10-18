@@ -603,6 +603,12 @@ impl App {
                     self.toast(format!("could not start the daemon: {e}"), Level::Error);
                 }
             },
+            Msg::StartHint(h) => {
+                if self.start_hint.as_deref() != Some(h.as_str()) {
+                    self.start_hint = Some(h);
+                    self.dirty = true;
+                }
+            }
             Msg::Event(e) => self.on_event(e),
         }
     }
