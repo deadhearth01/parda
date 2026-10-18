@@ -22,6 +22,7 @@ struct Fake {
     started: usize,
     hint_calls: usize,
     vault: Vec<Value>,
+    fail_rules_set: bool,
 }
 
 impl Backend for Fake {
@@ -58,6 +59,9 @@ impl Backend for Fake {
                 json!({"text": text.replace("Arjun Mehta", "Ravi Kumar")})
             }
             Request::RulesGet => json!({"toml": self.rules}),
+            Request::RulesSet { .. } if self.fail_rules_set => {
+                anyhow::bail!("rules: invalid rules.toml")
+            }
             Request::RulesSet { rules_toml } => {
                 self.rules = rules_toml;
                 json!({})
@@ -109,6 +113,7 @@ fn fake() -> Fake {
         online: true,
         started: 0,
         hint_calls: 0,
+        fail_rules_set: false,
         vault: vec![
             json!({"scope": "global", "kind": "Person", "count": 5}),
             json!({"scope": "global", "kind": "Email", "count": 2}),
@@ -1435,4 +1440,33 @@ fn i3_only_s_starts_the_daemon_not_enter() {
     press(&mut app, &mut b, KeyCode::Esc);
     press(&mut app, &mut b, KeyCode::Char('s'));
     assert_eq!(b.started, 1);
+}
+
+#[test]
+fn i4_a_failed_rules_save_leaves_no_phantom_rule() {
+    let mut b = fake();
+    let mut app = online(&mut b);
+    press(&mut app, &mut b, KeyCode::Char('4'));
+    b.fail_rules_set = true;
+    press(&mut app, &mut b, KeyCode::Char('a'));
+    typ(&mut app, &mut b, "Phantom Person");
+    press(&mut app, &mut b, KeyCode::Enter);
+    assert!(app.message().unwrap().contains("saving rules failed"));
+    assert!(!b.rules.contains("Phantom"));
+    assert!(
+        !app.rule_rows().iter().any(|(_, t)| t.contains("Phantom")),
+        "the list shows what the daemon has: {:?}",
+        app.rule_rows()
+    );
+    assert!(!render_text(&app, 80, 24).contains("Phantom"));
+    // A delete that fails comes back too.
+    press(&mut app, &mut b, KeyCode::Char('d'));
+    assert!(app.rule_rows().iter().any(|(_, t)| t.contains("Ravi Kumar")));
+    // And a later successful save applies normally.
+    b.fail_rules_set = false;
+    press(&mut app, &mut b, KeyCode::Char('w'));
+    typ(&mut app, &mut b, "Acme");
+    press(&mut app, &mut b, KeyCode::Enter);
+    assert!(b.rules.contains("Acme"));
+    assert!(app.rule_rows().iter().any(|(_, t)| t == "Acme"));
 }

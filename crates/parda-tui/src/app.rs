@@ -581,7 +581,10 @@ impl App {
             }
             Msg::RulesSaved(r) => match r {
                 Ok(()) => self.toast("rules saved", Level::Info),
-                Err(e) => self.toast(format!("saving rules failed: {e}"), Level::Error),
+                Err(e) => {
+                    self.rules_toml.clear();
+                    self.toast(format!("saving rules failed: {e}"), Level::Error)
+                }
             },
             Msg::VaultWiped { scope, result } => match (result, scope) {
                 (Ok(v), None) => {
@@ -1686,6 +1689,10 @@ impl App {
     fn save_rules(&mut self) {
         self.rebuild_rules_view();
         if let Some(t) = self.rules_toml_string() {
+            // Forget what we last read: the reload that follows the save
+            // always applies, so a failed save cannot leave local edits
+            // showing as if they were saved.
+            self.rules_toml.clear();
             self.send(Cmd::SetRules(t));
         }
     }
