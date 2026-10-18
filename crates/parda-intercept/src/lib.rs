@@ -7,6 +7,8 @@ pub mod ca;
 mod engine_transform;
 pub mod hosts;
 pub mod pac;
+#[cfg(test)]
+mod request_readings_tests;
 mod restore;
 pub mod server;
 mod sites;

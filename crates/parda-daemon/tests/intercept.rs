@@ -95,11 +95,16 @@ fn client(paths: &Paths, proxy: SocketAddr) -> reqwest::Client {
 
 /// A request to listed host `chat.test` that parda refuses before
 /// contacting the real server (so no network is needed); returns the status.
-async fn refused_request(paths: &Paths, proxy: SocketAddr, content_type: &str, body: &str) -> u16 {
+async fn refused_request(
+    paths: &Paths,
+    proxy: SocketAddr,
+    content_type: &str,
+    body: impl Into<reqwest::Body>,
+) -> u16 {
     client(paths, proxy)
         .post("https://chat.test/api/send?q=secret-query")
         .header("content-type", content_type)
-        .body(body.to_string())
+        .body(body)
         .send()
         .await
         .unwrap()
@@ -293,6 +298,10 @@ async fn without_a_ca_intercept_does_not_listen_and_says_why() {
     stop(&paths, daemon).await;
 }
 
+/// Binary data: never read as text, so unscanned (UTF-8 text is read
+/// whatever its declared type).
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\xff";
+
 /// An `[intercept]` section.
 fn section(enabled: bool, listen: &str, hosts: &str, unscanned: &str) -> String {
     config(&format!(
@@ -328,7 +337,7 @@ async fn intercept_settings_apply_live() {
     assert_eq!(res["restart_required"], false);
     assert_eq!(listening(&status(&paths).await), Some(addr));
     assert!(pac(addr).await.contains("\"other.test\""));
-    assert_eq!(refused_request(&paths, addr, "image/png", "x").await, 415);
+    assert_eq!(refused_request(&paths, addr, "image/png", PNG).await, 415);
 
     // A new listen address restarts the listener there.
     let free = TcpListener::bind("127.0.0.1:0")

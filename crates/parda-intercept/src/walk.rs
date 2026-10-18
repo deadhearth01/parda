@@ -1,22 +1,24 @@
-//! Which strings of an intercepted request are text to redact, and walking
-//! them in JSON, form-encoded and multipart bodies and in query strings.
+//! Which strings of an intercepted request are text to redact, and reading
+//! them in every way the site's server may read them.
 //!
 //! Redaction walks a request twice in the same order: once to collect the
 //! texts (one engine batch), once to write the results back.
 //!
-//! Nothing is skipped: every string and every key is visited. Identifiers a site needs
-//! verbatim (values under identifier keys, or identifier-looking values) are
-//! visited as [`Tier::Identifier`] — the engine's dictionary and rule tiers
-//! still see them, only the ML model does not — and only when they are
-//! identifier-shaped ([`id_shaped`]); anything else is text. Keys follow the
-//! same rule.
+//! Nothing is skipped: every string, key and number is visited. Identifiers a
+//! site needs verbatim (values under identifier keys, or identifier-looking
+//! values) are visited as [`Tier::Identifier`] — the engine's dictionary and
+//! rule tiers still see them, only the ML model does not — and only when they
+//! are identifier-shaped ([`id_shaped`]); anything else is text. Keys follow
+//! the same rule.
 //!
-//! A string that reads differently once form/URL-decoded (`%XX`, `+`) is
-//! visited in both readings: as it is, and component by component decoded
-//! (form keys and values, URL path segments, query and fragment). What
-//! either finds is replaced in the raw text, so a value survives in neither.
-//! Whole text bodies and multipart fields get both readings whenever they
-//! hold `%XX`, `+` or `=`.
+//! One reader serves every body, multipart field, form value and JSON string,
+//! whatever its declared type ([`read_text`]): a text is read literally, and
+//! as JSON of any kind (one value or one per line, after whitespace, BOMs and
+//! RFC 7464 record separators) or, when it holds `%XX`, `+` or `=`, decoded as
+//! a form; each string, key, number, form key and value inside is read the
+//! same ways in turn, a few levels deep. What any reading finds is replaced in
+//! the raw text, encoded as each layer needs, so no reading of what goes out
+//! holds it. Text that looks like escaped JSON but is not JSON is refused.
 
 use parda_wire::body::JsonError;
 use serde_json::Value;
@@ -69,28 +71,6 @@ impl<F: FnMut(&mut String, Tier)> Sink for F {
     }
 }
 
-/// Passes visits on to a sink, noting whether one changed its string.
-pub(crate) struct Tracking<'a, 'b> {
-    pub(crate) inner: &'a mut (dyn Sink + 'b),
-    pub(crate) changed: bool,
-}
-
-impl Sink for Tracking<'_, '_> {
-    fn visit(&mut self, s: &mut String, tier: Tier) {
-        let before = s.clone();
-        self.inner.visit(s, tier);
-        self.changed |= *s != before;
-    }
-
-    fn found(&self) -> Option<&[Found]> {
-        self.inner.found()
-    }
-
-    fn forget(&mut self, kind: &str) {
-        self.inner.forget(kind);
-    }
-}
-
 /// Visits one string to redact; may replace it.
 pub(crate) type Visit<'a> = &'a mut dyn Sink;
 
@@ -114,10 +94,6 @@ pub(crate) struct Rules<'a> {
     pub(crate) extra: &'a [String],
     pub(crate) site: Option<&'static Site>,
 }
-
-/// JSON carried inside strings is opened this many levels deep; deeper
-/// levels are text.
-const MAX_NESTED_JSON: usize = 4;
 
 /// Shortest hex string taken for an identifier.
 const MIN_HEX_ID: usize = 16;
@@ -279,122 +255,226 @@ impl Rules<'_> {
 }
 
 /// A request parda cannot filter safely: a multipart body it cannot split,
-/// JSON that names a key twice (here or inside a string), or two JSON keys
-/// that would become the same tag.
+/// JSON that names a key twice (here or inside a string), text that looks
+/// like escaped JSON but is not JSON, or a rewrite that would change the
+/// shape of the JSON (two keys that would become the same tag).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Malformed;
 
-/// Visit every text in a JSON document: its strings and its object keys.
-pub(crate) fn walk_json(v: &mut Value, rules: &Rules<'_>, f: Visit<'_>) -> Result<(), Malformed> {
-    walk_value(v, None, false, 0, Reading::Nested, rules, f)
-}
-
-/// `skipped`: the value sits under an identifier key (its strings and arrays
-/// of strings; objects inside it have their own keys).
-fn walk_value(
-    v: &mut Value,
-    key: Option<&str>,
-    skipped: bool,
-    depth: usize,
-    reading: Reading,
-    rules: &Rules<'_>,
-    f: Visit<'_>,
-) -> Result<(), Malformed> {
-    match v {
-        Value::String(s) => visit_at(
-            s,
-            key.is_some_and(is_content_key),
-            skipped,
-            depth,
-            reading,
-            rules,
-            f,
-        ),
-        Value::Array(items) => items
-            .iter_mut()
-            .try_for_each(|x| walk_value(x, key, skipped, depth, reading, rules, f)),
-        Value::Object(map) => {
-            // Keys are text too (`{"Ravi Kumar": …}`). A changed key is
-            // renamed after the walk, so both passes see the same order.
-            let mut renamed = Vec::new();
-            for (k, x) in map.iter_mut() {
-                let mut new_key = k.clone();
-                visit_key(&mut new_key, reading, rules, f);
-                walk_value(x, Some(k), rules.skip_key(k), depth, reading, rules, f)?;
-                if new_key != *k {
-                    renamed.push((k.clone(), new_key));
-                }
-            }
-            if !renamed.is_empty() {
-                let old = std::mem::take(map);
-                let mut renamed: std::collections::HashMap<_, _> = renamed.into_iter().collect();
-                for (k, x) in old {
-                    let k = renamed.remove(&k).unwrap_or(k);
-                    if map.contains_key(&k) {
-                        return Err(Malformed);
-                    }
-                    map.insert(k, x);
-                }
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Visit a multipart field named `key`: a body of its own, read literally
-/// or decoded as a form by the server (see [`Reading::Body`]).
-pub(crate) fn visit_field(
-    s: &mut String,
-    key: Option<&str>,
-    rules: &Rules<'_>,
-    f: Visit<'_>,
-) -> Result<(), Malformed> {
-    let content = key.is_some_and(is_content_key);
-    let skipped = key.is_some_and(|k| rules.skip_key(k));
-    visit_at(s, content, skipped, 0, Reading::Body, rules, f)
-}
-
-/// Visit a text body (any body not declared as a form or JSON): what the
-/// user typed, never an identifier, redacted as it reads literally and as
-/// it reads decoded as a form.
-pub(crate) fn visit_body_text(
-    s: &mut String,
-    rules: &Rules<'_>,
-    f: Visit<'_>,
-) -> Result<(), Malformed> {
-    visit_at(s, true, false, 0, Reading::Body, rules, f)
-}
-
-/// Visit a key (a JSON object key, a form or query key) by the rule values
-/// follow: it skips only the ML model when it is identifier-shaped and
-/// either looks like an identifier itself or is a known protocol key (the
-/// built-in identifier and content keys, the site's and `skip_keys`).
-/// Anything else is text, so a name used as a key reaches the model.
-fn visit_key(k: &mut String, reading: Reading, rules: &Rules<'_>, f: Visit<'_>) {
-    if k.trim().is_empty() {
-        return;
-    }
-    let known = rules.skip_key(k) || is_content_key(k) || rules.is_identifier(k);
-    let tier = if id_shaped(k) && known {
-        Tier::Identifier
-    } else {
-        Tier::Text
-    };
-    visit_views(k, tier, reading, f);
-}
-
-/// How a string may be read by whoever receives it.
+/// What a text is to the site: decides its tier, and how the texts read
+/// inside it are treated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reading {
-    /// A whole body or multipart field not declared as a form: some servers
-    /// read it literally, others decode it as a form. Any `%XX`, `+` or `=`
-    /// gives it a decoded reading.
+pub(crate) enum Role {
+    /// The value of a content key (`prompt`, `parts`, …): what the user
+    /// typed, always text. An object there has members by the key rules;
+    /// JSON in a string there is [`Role::Typed`].
+    Content,
+    /// Read inside what the user typed: always text. JSON in it is read too
+    /// (its keys get no say), but text that only looks like JSON is not
+    /// refused: what the user typed is not parsed by the site, and may well
+    /// be broken JSON (a question about code).
+    Typed,
+    /// A whole body, or a part of one read decoded: text. JSON in it
+    /// follows the key rules; a form in it does not (what a body holds is
+    /// what the user sent).
     Body,
-    /// A string inside a document. A `%XX` escape gives it a decoded
-    /// reading (a URL's path, query or fragment, a bare query string), and
-    /// so does a `+` or `=` in a string without whitespace.
-    Nested,
+    /// A declared form body or a query string: text, its keys and values
+    /// by the key rules.
+    Form,
+    /// A value under a key (`skipped`: an identifier key), an array item,
+    /// or a string in a document: an identifier when identifier-shaped and
+    /// under an identifier key or identifier-looking.
+    Value { skipped: bool },
+    /// An object or form key: an identifier when identifier-shaped and a
+    /// known protocol key or identifier-looking.
+    Key,
+    /// Read inside an identifier: an identifier too.
+    Ident,
+}
+
+impl Role {
+    fn tier(self, s: &str, rules: &Rules<'_>) -> Tier {
+        let id = match self {
+            Role::Content | Role::Typed | Role::Body | Role::Form => false,
+            Role::Ident => true,
+            Role::Value { skipped } => id_shaped(s) && (skipped || rules.is_identifier(s)),
+            Role::Key => {
+                id_shaped(s) && (rules.skip_key(s) || is_content_key(s) || rules.is_identifier(s))
+            }
+        };
+        if id { Tier::Identifier } else { Tier::Text }
+    }
+
+    /// A value under `key`: a JSON member, a form value, a multipart field.
+    pub(crate) fn member(self, key: &str, rules: &Rules<'_>) -> Role {
+        match self {
+            Role::Typed | Role::Ident => self,
+            _ if is_content_key(key) => Role::Content,
+            _ => Role::Value {
+                skipped: rules.skip_key(key),
+            },
+        }
+    }
+
+    fn key(self) -> Role {
+        match self {
+            Role::Typed | Role::Ident => self,
+            _ => Role::Key,
+        }
+    }
+
+    /// A JSON value read in a text with this role: a lone value is what the
+    /// text was (a body stays a body); JSON in a string starts afresh.
+    fn json_root(self) -> Role {
+        match self {
+            Role::Form => Role::Body,
+            Role::Content => Role::Typed,
+            Role::Value { .. } | Role::Key => Role::Value { skipped: false },
+            other => other,
+        }
+    }
+
+    /// The items of an array with this role.
+    fn item(self) -> Role {
+        match self {
+            Role::Body | Role::Form => Role::Value { skipped: false },
+            other => other,
+        }
+    }
+
+    /// What the user typed: never refused for looking like broken JSON, and
+    /// a key given twice in JSON there is read, not refused.
+    fn typed(self) -> bool {
+        matches!(self, Role::Content | Role::Typed)
+    }
+
+    /// Forms read in texts with this role follow the key rules: declared
+    /// forms, query strings, and strings in documents (URLs).
+    fn form_keys(self) -> bool {
+        matches!(self, Role::Form | Role::Value { .. } | Role::Key)
+    }
+}
+
+/// How many levels readings nest (a form-decoded part, a JSON string); past
+/// this a text is read literally only.
+const MAX_DEPTH: usize = 4;
+
+/// Characters a reader may skip around a JSON text: JSON and Unicode
+/// whitespace (`\f`, `\v`, NBSP, U+2028, …), a byte-order mark, and the
+/// separators FS, GS, RS (RFC 7464 records) and US, which Python's
+/// `strip()` drops.
+fn skippable(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{feff}' | '\u{1c}'..='\u{1f}' | '\u{180e}')
+}
+
+/// Characters that end a line of JSON values (none may stand raw in a JSON
+/// string).
+fn line_break(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{1c}'..='\u{1e}')
+}
+
+/// `s[start..end]` without skippable characters around it.
+fn trimmed(s: &str, start: usize, end: usize) -> std::ops::Range<usize> {
+    let t = &s[start..end];
+    let lead = t.len() - t.trim_start_matches(skippable).len();
+    start + lead..start + lead + t.trim_matches(skippable).len()
+}
+
+/// The lines of `s` (byte ranges, without their breaks).
+fn lines(s: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        if line_break(c) {
+            out.push((start, i));
+            start = i + c.len_utf8();
+        }
+    }
+    out.push((start, s.len()));
+    out
+}
+
+fn opens_json(t: &str) -> bool {
+    t.starts_with(['{', '[', '"'])
+}
+
+/// Is `json` one JSON value? One that names a key twice is refused when
+/// `strict` (parsers keep different ones of the two), else valid JSON.
+fn parses(json: &str, strict: bool) -> Result<bool, Malformed> {
+    match parda_wire::body::parse_json_unique(json.as_bytes()) {
+        Ok(_) => Ok(true),
+        Err(JsonError::DuplicateKey) if strict => Err(Malformed),
+        Err(JsonError::DuplicateKey) => {
+            Ok(serde_json::from_str::<serde::de::IgnoredAny>(json).is_ok())
+        }
+        Err(JsonError::Invalid) => Ok(false),
+    }
+}
+
+/// `text` as JSON: the byte ranges of its values. One value (after
+/// skippable characters), else every line that is one (JSON lines, RFC
+/// 7464 records, or a JSON line among text, such as a multipart field read
+/// as text); at least one of them a string, object or array. See
+/// [`parses`] for `strict`.
+fn json_docs(text: &str, strict: bool) -> Result<Vec<std::ops::Range<usize>>, Malformed> {
+    let whole = trimmed(text, 0, text.len());
+    if opens_json(&text[whole.clone()]) && parses(&text[whole.clone()], strict)? {
+        return Ok(vec![whole]);
+    }
+    let mut docs = Vec::new();
+    for (a, b) in lines(text) {
+        let r = trimmed(text, a, b);
+        if !r.is_empty() && parses(&text[r.clone()], strict)? {
+            docs.push(r);
+        }
+    }
+    if !docs.iter().any(|r| opens_json(&text[r.clone()])) {
+        docs.clear();
+    }
+    Ok(docs)
+}
+
+/// Is `text` one JSON value (after skippable characters)? For bodies and
+/// fields declared as JSON. A key given twice is refused.
+pub(crate) fn is_json_document(text: &str) -> Result<bool, Malformed> {
+    let r = trimmed(text, 0, text.len());
+    match parda_wire::body::parse_json_unique(text[r].as_bytes()) {
+        Ok(_) => Ok(true),
+        Err(JsonError::DuplicateKey) => Err(Malformed),
+        Err(JsonError::Invalid) => Ok(false),
+    }
+}
+
+/// Text (outside the JSON values `docs` of it) that looks like escaped
+/// JSON but is not JSON: a lenient reader would decode escapes that glue a
+/// letter to the value (`\n9876543210`) when read literally, so it cannot
+/// be filtered safely. In a whole body or field (`top`): the text when it
+/// starts like JSON, or a line of it that does, holding a backslash. In a
+/// text inside one: the whole text, bracketed like JSON (`{…}`, `[…]`,
+/// `"…"`) and holding a backslash.
+fn looks_like_escaped_json(text: &str, docs: &[std::ops::Range<usize>], top: bool) -> bool {
+    if !text.contains('\\') {
+        return false;
+    }
+    let t = &text[trimmed(text, 0, text.len())];
+    if docs.is_empty() && !top {
+        return t.len() >= 2
+            && matches!(
+                (t.as_bytes()[0], t.as_bytes()[t.len() - 1]),
+                (b'{', b'}') | (b'[', b']') | (b'"', b'"')
+            );
+    }
+    let read =
+        |r: &std::ops::Range<usize>| docs.iter().any(|d| d.start <= r.start && r.end <= d.end);
+    if !top {
+        return false;
+    }
+    (docs.is_empty() && opens_json(t))
+        || lines(text).into_iter().any(|(a, b)| {
+            let r = trimmed(text, a, b);
+            let line = &text[r.clone()];
+            line.contains('\\') && opens_json(line) && !read(&r)
+        })
 }
 
 /// A valid `%XX` escape is in `s`.
@@ -402,220 +482,6 @@ fn has_escape(s: &str) -> bool {
     s.as_bytes()
         .windows(3)
         .any(|w| w[0] == b'%' && w[1].is_ascii_hexdigit() && w[2].is_ascii_hexdigit())
-}
-
-/// Does `s` have a decoded reading besides its literal one?
-fn decodes(s: &str, reading: Reading) -> bool {
-    if has_escape(s) {
-        return true;
-    }
-    let form_like = s.contains(['+', '=']);
-    match reading {
-        Reading::Body => form_like,
-        Reading::Nested => form_like && !s.contains(char::is_whitespace),
-    }
-}
-
-/// `content`: what the user typed (a content key, a text body); `depth`:
-/// how many JSON-in-string or URL-query levels this string sits in.
-fn visit_at(
-    s: &mut String,
-    content: bool,
-    skipped: bool,
-    depth: usize,
-    reading: Reading,
-    rules: &Rules<'_>,
-    f: Visit<'_>,
-) -> Result<(), Malformed> {
-    if s.trim().is_empty() {
-        return Ok(());
-    }
-    // JSON inside a string is opened; past the depth limit (or when it does
-    // not parse) the string is text like any other. JSON typed into a
-    // message is text.
-    if !content && depth < MAX_NESTED_JSON && nested_json(s, depth, rules, f)? {
-        return Ok(());
-    }
-    let tier = plain_tier(s, content, skipped, rules);
-    // A body is one text in both of its readings.
-    if reading == Reading::Body && decodes(s, reading) {
-        visit_views(s, tier, reading, f);
-        return Ok(());
-    }
-    // The queries of URLs in it are walked as forms, with the key rules:
-    // percent-encoding hides an e-mail from the rules.
-    if depth < MAX_NESTED_JSON && url_queries(s, content, skipped, depth, rules, f)? {
-        return Ok(());
-    }
-    visit_views(s, tier, Reading::Nested, f);
-    Ok(())
-}
-
-/// The tier of `s` as one text: identifier-shaped values under identifier
-/// keys, or that look like identifiers, skip the ML model.
-fn plain_tier(s: &str, content: bool, skipped: bool, rules: &Rules<'_>) -> Tier {
-    if !content && id_shaped(s) && (skipped || rules.is_identifier(s)) {
-        Tier::Identifier
-    } else {
-        Tier::Text
-    }
-}
-
-/// Visit `s` (no JSON opened) as it reads literally and, when it reads
-/// differently decoded, as it reads decoded: each component (form keys,
-/// values and pieces, URL path segments, queries and fragments) that holds
-/// a `%XX` escape or a `+`, decoded on its own. What either reading finds
-/// is replaced in the raw text (re-encoded where the raw text was encoded),
-/// so a value survives in neither.
-fn visit_views(s: &mut String, tier: Tier, reading: Reading, f: Visit<'_>) {
-    if s.trim().is_empty() {
-        return;
-    }
-    if !decodes(s, reading) {
-        f.visit(s, tier);
-        return;
-    }
-    let orig = s.clone();
-    // Decoded components first: a value's canonical spelling gets its tag
-    // before the fragments the literal reading may see.
-    let mut hits: Option<Vec<Hit>> = Some(Vec::new());
-    let mut decoded_changed = Vec::new();
-    for (n, (a, b)) in components(&orig).into_iter().enumerate() {
-        let (d, map) = decode_mapped(&orig[a..b]);
-        if d == orig[a..b] || d.trim().is_empty() {
-            continue;
-        }
-        let mut dd = d.clone();
-        f.visit(&mut dd, tier);
-        match (f.found(), hits.as_mut()) {
-            (Some(found), Some(hits)) => {
-                for x in found {
-                    let (start, end) = (a + map[x.start].0, a + map[x.end - 1].1);
-                    hits.push(Hit {
-                        start,
-                        end,
-                        surrogate: x.surrogate.clone(),
-                        kind: x.kind.clone(),
-                        visit: n + 1,
-                        encoded: orig[start..end] != d[x.start..x.end],
-                    });
-                }
-            }
-            _ => hits = None,
-        }
-        if dd != d {
-            decoded_changed.push((a, b, dd));
-        }
-    }
-    let mut raw = orig.clone();
-    f.visit(&mut raw, tier);
-    match (f.found(), hits.as_mut()) {
-        (Some(found), Some(hits)) => hits.extend(found.iter().map(|x| Hit {
-            start: x.start,
-            end: x.end,
-            surrogate: x.surrogate.clone(),
-            kind: x.kind.clone(),
-            visit: 0,
-            encoded: false,
-        })),
-        _ => hits = None,
-    }
-    *s = match hits {
-        Some(hits) => merge_hits(&orig, hits, f),
-        // A sink that cannot say what it replaced: the decoded reading's
-        // changes, re-encoded, else the literal one's.
-        None if !decoded_changed.is_empty() => {
-            let mut out = String::with_capacity(orig.len());
-            let mut last = 0;
-            for (a, b, dd) in decoded_changed {
-                out.push_str(&orig[last..a]);
-                out.push_str(&encode_all(&dd));
-                last = b;
-            }
-            out.push_str(&orig[last..]);
-            out
-        }
-        None => raw,
-    };
-}
-
-/// A replacement found in one reading of a text, in raw coordinates.
-struct Hit {
-    start: usize,
-    end: usize,
-    surrogate: String,
-    kind: String,
-    /// Which visit found it (0: the literal reading).
-    visit: usize,
-    /// The raw text it covers is encoded (`%XX` or `+`).
-    encoded: bool,
-}
-
-/// Replace every hit in `orig`. Overlapping hits are one replacement: the
-/// surrogates of those not inside another, in order (re-encoded when one
-/// covers encoded text; of two over the same text, the decoded reading's).
-/// A hit inside one found by another reading is the same value found
-/// twice: not counted.
-fn merge_hits(orig: &str, mut hits: Vec<Hit>, f: Visit<'_>) -> String {
-    hits.sort_by_key(|h| (h.start, std::cmp::Reverse(h.end), !h.encoded, h.visit));
-    let mut out = String::with_capacity(orig.len());
-    let mut last = 0;
-    let mut i = 0;
-    while i < hits.len() {
-        // One cluster of overlapping hits.
-        let mut end = hits[i].end;
-        let mut j = i + 1;
-        while j < hits.len() && hits[j].start < end {
-            end = end.max(hits[j].end);
-            j += 1;
-        }
-        let cluster = &hits[i..j];
-        let mut outer: Vec<&Hit> = Vec::new();
-        for h in cluster {
-            match outer.iter().find(|o| o.start <= h.start && h.end <= o.end) {
-                Some(o) if o.visit != h.visit => f.forget(&h.kind),
-                Some(_) => {}
-                None => outer.push(h),
-            }
-        }
-        let mut sur = String::new();
-        let mut prev: Option<&str> = None;
-        for o in &outer {
-            if prev != Some(o.surrogate.as_str()) {
-                sur.push_str(&o.surrogate);
-            }
-            prev = Some(o.surrogate.as_str());
-        }
-        if cluster.iter().any(|h| h.encoded) {
-            sur = encode_all(&sur);
-        }
-        out.push_str(&orig[last..hits[i].start]);
-        out.push_str(&sur);
-        last = end;
-        i = j;
-    }
-    out.push_str(&orig[last..]);
-    out
-}
-
-/// The byte ranges of the components of `s` that are decoded on their own:
-/// split at `&` and `=` (form keys, values and pieces) and at `/`, `?` and
-/// `#` (URL path segments, query, fragment).
-fn components(s: &str) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    for (i, c) in s.bytes().enumerate() {
-        if matches!(c, b'&' | b'=' | b'/' | b'?' | b'#') {
-            if i > start {
-                out.push((start, i));
-            }
-            start = i + 1;
-        }
-    }
-    if s.len() > start {
-        out.push((start, s.len()));
-    }
-    out
 }
 
 /// Decode a form component (`+` a space, `%XX` a byte; anything else as it
@@ -666,6 +532,11 @@ fn decode_mapped(raw: &str) -> (String, Vec<(usize, usize)>) {
     (text, map)
 }
 
+/// One form-encoded component: `+` is a space, `%XX` a byte.
+fn decode_component(s: &str) -> String {
+    decode_mapped(s).0
+}
+
 /// Percent-encode everything but unreserved characters (`%20` for a space:
 /// right in a path, a query and a form alike).
 fn encode_all(s: &str) -> String {
@@ -677,451 +548,798 @@ fn encode_all(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, SET).to_string()
 }
 
-/// If `s` holds a JSON object or array, walk it and re-serialise it when a
-/// text inside changed. Returns false when `s` is not JSON; JSON with a
-/// repeated key is refused.
-fn nested_json(
-    s: &mut String,
-    depth: usize,
-    rules: &Rules<'_>,
-    f: Visit<'_>,
-) -> Result<bool, Malformed> {
-    let t = s.trim();
-    let bracketed =
-        (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']'));
-    if !bracketed {
-        return Ok(false);
-    }
-    let mut inner = match parda_wire::body::parse_json_unique(s.as_bytes()) {
-        Ok(v) => v,
-        Err(JsonError::Invalid) => return Ok(false),
-        Err(JsonError::DuplicateKey) => return Err(Malformed),
+/// `s` as the content of a JSON string.
+fn json_escape(s: &str) -> String {
+    let quoted = Value::String(s.to_string()).to_string();
+    quoted[1..quoted.len() - 1].to_string()
+}
+
+/// The text of the JSON string content `raw[start..end]` (valid JSON),
+/// with, for each byte of it, the raw range it was read from: a whole
+/// escape (a surrogate pair is one), or a whole character. A lone
+/// surrogate reads as U+FFFD.
+fn unescape(raw: &str, start: usize, end: usize) -> (String, Vec<(usize, usize)>) {
+    let b = raw.as_bytes();
+    let hex = |i: usize| {
+        let h = b.get(i..i + 4)?;
+        h.iter()
+            .all(u8::is_ascii_hexdigit)
+            .then(|| u32::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok())
+            .flatten()
     };
-    let mut track = Tracking {
-        inner: f,
-        changed: false,
-    };
-    walk_value(
-        &mut inner,
-        None,
-        false,
-        depth + 1,
-        Reading::Nested,
-        rules,
-        &mut track,
-    )?;
-    if track.changed {
-        let out = parda_wire::walk::preserve_numbers(s.as_bytes(), inner.to_string().into_bytes());
-        *s = String::from_utf8(out)
-            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
-    }
-    Ok(true)
-}
-
-/// The byte ranges of the queries (after `?`, before `#`) of the `http://`
-/// and `https://` URLs in `s`. A URL runs to whitespace, a quote or `<`/`>`.
-fn url_query_spans(s: &str) -> Vec<(usize, usize)> {
-    let b = s.as_bytes();
-    let mut spans = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        let rest = &b[i..];
-        let scheme = if rest.len() >= 8 && rest[..8].eq_ignore_ascii_case(b"https://") {
-            8
-        } else if rest.len() >= 7 && rest[..7].eq_ignore_ascii_case(b"http://") {
-            7
-        } else {
-            0
-        };
-        let starts_word = i == 0 || !b[i - 1].is_ascii_alphanumeric();
-        if scheme == 0 || !starts_word {
-            i += 1;
-            continue;
-        }
-        // The URL's end, by characters (whitespace may be non-ASCII).
-        let end = s[i..]
-            .char_indices()
-            .find(|&(_, c)| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`'))
-            .map_or(s.len(), |(j, _)| i + j);
-        let url = &b[i + scheme..end];
-        if let Some(q) = url.iter().position(|&c| c == b'?') {
-            let start = i + scheme + q + 1;
-            let stop = b[start..end]
-                .iter()
-                .position(|&c| c == b'#')
-                .map_or(end, |h| start + h);
-            if stop > start {
-                spans.push((start, stop));
+    let mut text = String::with_capacity(end - start);
+    let mut map = Vec::with_capacity(end - start);
+    let mut i = start;
+    while i < end {
+        let (c, len) = match (b[i], b.get(i + 1)) {
+            (b'\\', Some(b'u')) => match hex(i + 2) {
+                Some(hi @ 0xD800..=0xDBFF) => match (b.get(i + 6), b.get(i + 7), hex(i + 8)) {
+                    (Some(b'\\'), Some(b'u'), Some(lo @ 0xDC00..=0xDFFF)) => (
+                        char::from_u32(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00))
+                            .unwrap_or('\u{fffd}'),
+                        12,
+                    ),
+                    _ => ('\u{fffd}', 6),
+                },
+                Some(u) => (char::from_u32(u).unwrap_or('\u{fffd}'), 6),
+                None => ('\\', 1),
+            },
+            (b'\\', Some(&e)) if b"\"\\/bfnrt".contains(&e) => (
+                match e {
+                    b'b' => '\u{8}',
+                    b'f' => '\u{c}',
+                    b'n' => '\n',
+                    b'r' => '\r',
+                    b't' => '\t',
+                    other => other as char,
+                },
+                2,
+            ),
+            _ => {
+                let c = raw[i..].chars().next().unwrap_or('\u{fffd}');
+                (c, c.len_utf8())
             }
-        }
-        i = end.max(i + 1);
-    }
-    spans
-}
-
-/// If `s` holds URLs with queries, visit the text around them as usual and
-/// each query as a form (decoded keys and values, re-encoded when changed).
-/// Returns false when there is no such URL.
-fn url_queries(
-    s: &mut String,
-    content: bool,
-    skipped: bool,
-    depth: usize,
-    rules: &Rules<'_>,
-    f: Visit<'_>,
-) -> Result<bool, Malformed> {
-    let spans = url_query_spans(s);
-    if spans.is_empty() {
-        return Ok(false);
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut last = 0;
-    for (start, stop) in spans {
-        // The text before the query, without its `?`.
-        let mut text = s[last..start - 1].to_string();
-        let tier = plain_tier(&text, content, skipped, rules);
-        visit_views(&mut text, tier, Reading::Nested, f);
-        out.push_str(&text);
-        out.push('?');
-        let query = &s[start..stop];
-        match walk_form_at(query, depth + 1, rules, f)? {
-            Some(new) => out.push_str(&new),
-            None => out.push_str(query),
-        }
-        last = stop;
-    }
-    let mut text = s[last..].to_string();
-    let tier = plain_tier(&text, content, skipped, rules);
-    visit_views(&mut text, tier, Reading::Nested, f);
-    out.push_str(&text);
-    *s = out;
-    Ok(true)
-}
-
-/// One form-encoded component: `+` is a space, `%XX` a byte.
-fn decode_component(s: &str) -> String {
-    let spaced = s.replace('+', " ");
-    percent_encoding::percent_decode_str(&spaced)
-        .decode_utf8_lossy()
-        .into_owned()
-}
-
-fn encode_component(s: &str) -> String {
-    form_urlencoded::byte_serialize(s.as_bytes()).collect()
-}
-
-/// Visit the keys and values of a form-encoded string (a body or a query);
-/// a piece without `=` is a text of its own. Returns the rewritten string
-/// when something changed; keys, values and pieces that did not change keep
-/// their exact bytes.
-pub(crate) fn walk_form(
-    raw: &str,
-    rules: &Rules<'_>,
-    f: Visit<'_>,
-) -> Result<Option<String>, Malformed> {
-    walk_form_at(raw, 0, rules, f)
-}
-
-fn walk_form_at(
-    raw: &str,
-    depth: usize,
-    rules: &Rules<'_>,
-    f: Visit<'_>,
-) -> Result<Option<String>, Malformed> {
-    let mut out = String::with_capacity(raw.len());
-    let mut changed = false;
-    for (i, piece) in raw.split('&').enumerate() {
-        if i > 0 {
-            out.push('&');
-        }
-        let Some((k_raw, v_raw)) = piece.split_once('=') else {
-            let mut text = decode_component(piece);
-            let before = text.clone();
-            visit_at(&mut text, false, false, depth, Reading::Nested, rules, f)?;
-            if text == before {
-                out.push_str(piece);
-            } else {
-                changed = true;
-                out.push_str(&encode_component(&text));
-            }
-            continue;
         };
-        let key = decode_component(k_raw);
-        let mut new_key = key.clone();
-        visit_key(&mut new_key, Reading::Nested, rules, f);
-        let mut value = decode_component(v_raw);
-        let before = value.clone();
-        visit_at(
-            &mut value,
-            is_content_key(&key),
-            rules.skip_key(&key),
-            depth,
-            Reading::Nested,
-            rules,
-            f,
-        )?;
-        if new_key == key {
-            out.push_str(k_raw);
-        } else {
-            changed = true;
-            out.push_str(&encode_component(&new_key));
-        }
-        out.push('=');
-        if value == before {
-            out.push_str(v_raw);
-        } else {
-            changed = true;
-            out.push_str(&encode_component(&value));
-        }
+        text.push(c);
+        map.extend(std::iter::repeat_n((i, i + len), c.len_utf8()));
+        i += len;
     }
-    Ok(changed.then_some(out))
+    (text, map)
 }
 
-/// Whitespace between JSON tokens.
-const JSON_WS: [char; 4] = [' ', '\t', '\n', '\r'];
-
-/// One JSON value of a text read as JSON lines: byte ranges into the text
-/// (the whole line with its line break, and the JSON value in it, without
-/// surrounding whitespace). `value` is the parsed value when it holds text
-/// (a string, an object or an array); a number or literal is `None`, read
-/// as text. Blank lines have an empty `json` range and `None`.
-pub(crate) struct JsonLine {
+/// A string or number of a JSON text.
+struct Token {
+    /// The raw range: a string's content (inside its quotes), a number.
     start: usize,
-    json: std::ops::Range<usize>,
     end: usize,
-    value: Option<Value>,
+    num: bool,
+    role: Role,
 }
 
-/// `text` as JSON documents: one object or array (over any number of
-/// lines), else JSON values one per line ([`json_lines`]). A key given
-/// twice is refused.
-pub(crate) fn json_docs(text: &str) -> Result<Option<Vec<JsonLine>>, Malformed> {
-    let rest = text.trim_start_matches('\u{feff}');
-    let body = rest.trim_matches(JSON_WS);
-    if body.starts_with(['{', '[']) {
-        let lead = text.len() - rest.trim_start_matches(JSON_WS).len();
-        match parda_wire::body::parse_json_unique(body.as_bytes()) {
-            Ok(value) => {
-                return Ok(Some(vec![JsonLine {
-                    start: 0,
-                    json: lead..lead + body.len(),
-                    end: text.len(),
-                    value: Some(value),
-                }]));
-            }
-            Err(JsonError::DuplicateKey) => return Err(Malformed),
-            Err(JsonError::Invalid) => {}
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while matches!(b.get(i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        i += 1;
+    }
+    i
+}
+
+/// The index of the quote that ends the JSON string whose opening quote is
+/// at `i`.
+fn string_end(b: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    while j < b.len() {
+        match b[j] {
+            b'\\' => j += 2,
+            b'"' => return j,
+            _ => j += 1,
         }
     }
-    json_lines(text)
+    b.len()
 }
 
-/// The lines of `text` when every one that is not blank is a JSON value
-/// (and at least one is), else `None`. A key given twice is refused.
-pub(crate) fn json_lines(text: &str) -> Result<Option<Vec<JsonLine>>, Malformed> {
-    let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
-    let mut lines = Vec::new();
-    let mut start = 0;
-    let mut any = false;
-    while start < text.len() {
-        let end = text[start..]
-            .find('\n')
-            .map_or(text.len(), |i| start + i + 1);
-        let from = if start == 0 { bom } else { start };
-        let line = &text[from..end];
-        let lead = line.len() - line.trim_start_matches(JSON_WS).len();
-        let body = line.trim_matches(JSON_WS);
-        let json = from + lead..from + lead + body.len();
-        let value = if body.is_empty() {
-            None
-        } else {
-            any = true;
-            match parda_wire::body::parse_json_unique(body.as_bytes()) {
-                Ok(v @ (Value::String(_) | Value::Array(_) | Value::Object(_))) => Some(v),
-                Ok(_) => None,
-                Err(JsonError::Invalid) => return Ok(None),
-                Err(JsonError::DuplicateKey) => return Err(Malformed),
+/// The strings (keys too) and numbers of the valid JSON value at `i` in
+/// `raw`, in order, with their roles; returns where the value ends.
+fn scan_json(raw: &str, i: usize, role: Role, rules: &Rules<'_>, out: &mut Vec<Token>) -> usize {
+    let b = raw.as_bytes();
+    let i = skip_ws(b, i);
+    match b.get(i) {
+        Some(b'{') => {
+            let mut i = skip_ws(b, i + 1);
+            while b.get(i) == Some(&b'"') {
+                let end = string_end(b, i);
+                let key = unescape(raw, i + 1, end).0;
+                out.push(Token {
+                    start: i + 1,
+                    end,
+                    num: false,
+                    role: role.key(),
+                });
+                // Past the `:`.
+                i = skip_ws(b, end + 1) + 1;
+                i = skip_ws(b, scan_json(raw, i, role.member(&key, rules), rules, out));
+                if b.get(i) == Some(&b',') {
+                    i = skip_ws(b, i + 1);
+                }
             }
-        };
-        lines.push(JsonLine {
+            i + 1
+        }
+        Some(b'[') => {
+            let mut i = skip_ws(b, i + 1);
+            while i < b.len() && b[i] != b']' {
+                i = skip_ws(b, scan_json(raw, i, role.item(), rules, out));
+                if b.get(i) == Some(&b',') {
+                    i += 1;
+                }
+            }
+            i + 1
+        }
+        Some(b'"') => {
+            let end = string_end(b, i);
+            out.push(Token {
+                start: i + 1,
+                end,
+                num: false,
+                role,
+            });
+            end + 1
+        }
+        Some(b't' | b'n') => i + 4,
+        Some(b'f') => i + 5,
+        Some(_) => {
+            let start = i;
+            let mut i = i + 1;
+            while matches!(
+                b.get(i),
+                Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+            ) {
+                i += 1;
+            }
+            out.push(Token {
+                start,
+                end: i,
+                num: true,
+                role,
+            });
+            i
+        }
+        None => i,
+    }
+}
+
+/// A text read inside another (a JSON string or number, a form key, value
+/// or piece), to be read again in every way.
+struct Part {
+    /// Its raw range in the outer text.
+    start: usize,
+    end: usize,
+    /// As the outer reading reads it.
+    text: String,
+    /// For each byte of `text`, the raw range it was read from.
+    map: Vec<(usize, usize)>,
+    role: Role,
+    /// An identifier (rules only): hidden from the literal reading.
+    ident: bool,
+    /// A JSON number.
+    num: bool,
+    /// A number under an identifier key (a timestamp, a counter): kept as
+    /// written, never read (a 10-digit timestamp reads like a phone).
+    verbatim: bool,
+    /// Read form-decoded: what replaces encoded text is encoded.
+    percent: bool,
+    /// A key or value of a form with key rules: what replaces any of it
+    /// is encoded.
+    encode: bool,
+}
+
+impl Part {
+    fn json(raw: &str, t: Token, rules: &Rules<'_>) -> Part {
+        if t.num {
+            // Numbers are text (only the rules find values in them), but
+            // under an identifier key they are identifiers.
+            let verbatim = t.role == Role::Value { skipped: true };
+            return Part {
+                start: t.start,
+                end: t.end,
+                text: raw[t.start..t.end].to_string(),
+                map: (t.start..t.end).map(|i| (i, i + 1)).collect(),
+                role: Role::Ident,
+                ident: verbatim,
+                num: true,
+                verbatim,
+                percent: false,
+                encode: false,
+            };
+        }
+        let (text, map) = unescape(raw, t.start, t.end);
+        Part {
+            start: t.start,
+            end: t.end,
+            ident: t.role.tier(&text, rules) == Tier::Identifier,
+            text,
+            map,
+            role: t.role,
+            num: false,
+            verbatim: false,
+            percent: false,
+            encode: false,
+        }
+    }
+
+    fn form(
+        raw: &str,
+        start: usize,
+        end: usize,
+        role: Role,
+        encode: bool,
+        rules: &Rules<'_>,
+    ) -> Part {
+        let (text, map) = decode_mapped(&raw[start..end]);
+        Part {
             start,
-            json,
             end,
-            value,
-        });
-        start = end;
+            ident: role.tier(&text, rules) == Tier::Identifier,
+            text,
+            map: map
+                .into_iter()
+                .map(|(a, b)| (a + start, b + start))
+                .collect(),
+            role,
+            num: false,
+            verbatim: false,
+            percent: true,
+            encode,
+        }
     }
-    Ok(any.then_some(lines))
-}
 
-/// Walk `text` read as JSON lines (from [`json_lines`]), as the text of a
-/// body not declared as JSON: each line as a server that parses it reads
-/// it, and as the whole text reads to a server that takes it literally or
-/// decoded as a form (R8.2: strings and keys get [`Reading::Body`], number
-/// literals are read as text). A lone string is a document of its own (see
-/// [`visit_document_string`]). `content` and `skipped` are the text's own
-/// role, for strings and number lines. Returns the new text when something
-/// changed; lines that did not change keep their bytes.
-pub(crate) fn walk_json_lines(
-    text: &str,
-    lines: &mut [JsonLine],
-    content: bool,
-    skipped: bool,
-    depth: usize,
-    rules: &Rules<'_>,
-    f: Visit<'_>,
-) -> Result<Option<String>, Malformed> {
-    let mut out = String::with_capacity(text.len());
-    let mut changed = false;
-    for line in lines.iter_mut() {
-        out.push_str(&text[line.start..line.json.start]);
-        let raw = &text[line.json.clone()];
-        let new = match &mut line.value {
-            Some(Value::String(t)) => {
-                let before = t.clone();
-                visit_document_string(t, content, skipped, depth, rules, f)?;
-                (*t != before).then(|| Value::String(t.clone()).to_string())
-            }
-            Some(value) => walk_json_line(raw, value, depth, rules, f)?,
-            // A number or literal reads the same as text.
-            None => {
-                let mut t = raw.to_string();
-                visit_at(&mut t, content, skipped, depth, Reading::Body, rules, f)?;
-                (t != raw).then_some(t)
-            }
+    /// An edit of this part's text, in the outer text's coordinates.
+    fn lift(&self, raw: &str, e: Edit, view: usize) -> Edit {
+        let start = self.map.get(e.start).map_or(self.end, |m| m.0);
+        let end = match e.end.checked_sub(1) {
+            Some(last) if e.end > e.start => self.map.get(last).map_or(self.end, |m| m.1),
+            _ => start,
         };
-        match new {
-            Some(new) => {
-                changed = true;
-                out.push_str(&new);
+        let encoded =
+            self.encode || (self.percent && raw.get(start..end) != self.text.get(e.start..e.end));
+        Edit {
+            start,
+            end,
+            text: e.text,
+            kinds: e.kinds,
+            view,
+            encoded,
+        }
+    }
+
+    /// `start..end` (inside this part) widened to whole escapes.
+    fn align(&self, start: usize, end: usize) -> (usize, usize) {
+        let k = self.map.partition_point(|m| m.0 <= start);
+        let start = if k > 0 { self.map[k - 1].0 } else { start };
+        if end <= start {
+            return (start, start);
+        }
+        let k = self.map.partition_point(|m| m.1 < end);
+        (start, self.map.get(k).map_or(end, |m| m.1))
+    }
+
+    fn overlaps(&self, e: &Edit) -> bool {
+        if e.start == e.end {
+            return self.start <= e.start && e.start <= self.end;
+        }
+        self.start < e.end && e.start < self.end
+    }
+}
+
+/// The other readings of a text: its JSON values, and the parts read in
+/// them and in the text between them (form-decoded, when it holds `%XX`,
+/// `+` or `=`).
+struct View {
+    parts: Vec<Part>,
+    /// The byte ranges of the JSON values.
+    docs: Vec<std::ops::Range<usize>>,
+    /// A key given twice in the JSON is refused.
+    strict: bool,
+}
+
+impl View {
+    fn plain() -> View {
+        View {
+            parts: Vec::new(),
+            docs: Vec::new(),
+            strict: true,
+        }
+    }
+
+    /// `top`: a whole body or multipart field.
+    fn of(raw: &str, role: Role, top: bool, rules: &Rules<'_>) -> Result<View, Malformed> {
+        // What the user typed is not parsed by the site: a key given twice
+        // there is no reason to refuse it (every token is read anyway).
+        let strict = !role.typed();
+        let docs = json_docs(raw, strict)?;
+        if strict && looks_like_escaped_json(raw, &docs, top) {
+            return Err(Malformed);
+        }
+        let mut tokens = Vec::new();
+        for d in &docs {
+            scan_json(raw, d.start, role.json_root(), rules, &mut tokens);
+        }
+        let mut parts: Vec<Part> = tokens
+            .into_iter()
+            .map(|t| Part::json(raw, t, rules))
+            .collect();
+        // The text outside the JSON values.
+        let mut at = 0;
+        for (a, b) in docs
+            .iter()
+            .map(|d| (d.start, d.end))
+            .chain([(raw.len(), raw.len())])
+        {
+            let gap = &raw[at..a];
+            if has_escape(gap) || gap.contains(['+', '=']) {
+                parts.extend(form_parts(raw, at, a, role, rules));
             }
-            None => out.push_str(raw),
+            at = b;
         }
-        out.push_str(&text[line.json.end..line.end]);
+        parts.sort_by_key(|p| p.start);
+        Ok(View {
+            parts,
+            docs,
+            strict,
+        })
     }
-    Ok(changed.then_some(out))
+
+    fn in_doc(&self, start: usize, end: usize) -> bool {
+        self.docs.iter().any(|d| d.start <= start && end <= d.end)
+    }
 }
 
-/// A lone JSON string that is a whole document (a line of a body, a
-/// field): a server may parse its text again (`JSON.stringify` twice), so
-/// JSON in it is read as JSON documents of their own, and escaped JSON-looking
-/// text in it that is not JSON is refused, never read with its escapes
-/// taken literally. Anything else is text.
-fn visit_document_string(
-    t: &mut String,
-    content: bool,
-    skipped: bool,
-    depth: usize,
-    rules: &Rules<'_>,
-    f: Visit<'_>,
-) -> Result<(), Malformed> {
-    if depth < MAX_NESTED_JSON
-        && let Some(mut lines) = json_docs(t)?
-        && lines.iter().any(|l| l.value.is_some())
-    {
-        if let Some(new) = walk_json_lines(t, &mut lines, content, skipped, depth + 1, rules, f)? {
-            *t = new;
+/// The keys, values and pieces of `raw[from..to]` read as a form: split at
+/// `&`, then at the first `=`. In a form with key rules, a URL before a
+/// query key (`https://x/p?key=…`) is a part of its own. A part that is
+/// neither an identifier nor JSON-looking is split again at `/`, `?` and
+/// `#` (URL path segments, queries and fragments are decoded on their own).
+fn form_parts(raw: &str, from: usize, to: usize, role: Role, rules: &Rules<'_>) -> Vec<Part> {
+    let encode = role.form_keys();
+    let mut parts = Vec::new();
+    let mut add = |a: usize, b: usize, role: Role| {
+        if a >= b {
+            return;
         }
-        return Ok(());
-    }
-    if escaped_like_json(t) {
-        return Err(Malformed);
-    }
-    visit_at(t, content, skipped, depth, Reading::Body, rules, f)
-}
-
-/// One JSON object or array of a text read as JSON lines (`raw`, parsed as
-/// `value`): its strings and keys with [`Reading::Body`], then its number
-/// literals as text. Returns the new JSON text when something changed.
-fn walk_json_line(
-    raw: &str,
-    value: &mut Value,
-    depth: usize,
-    rules: &Rules<'_>,
-    f: Visit<'_>,
-) -> Result<Option<String>, Malformed> {
-    let mut track = Tracking {
-        inner: f,
-        changed: false,
+        let whole = Part::form(raw, a, b, role, encode, rules);
+        let t = raw[a..b].trim_matches(skippable);
+        if whole.ident || opens_json(t) || !t.contains(['/', '?', '#']) {
+            parts.push(whole);
+            return;
+        }
+        let mut s = a;
+        for (i, c) in raw[a..b].char_indices() {
+            if matches!(c, '/' | '?' | '#') {
+                if a + i > s {
+                    parts.push(Part::form(raw, s, a + i, role, encode, rules));
+                }
+                s = a + i + 1;
+            }
+        }
+        if b > s {
+            parts.push(Part::form(raw, s, b, role, encode, rules));
+        }
     };
-    walk_value(value, None, false, depth, Reading::Body, rules, &mut track)?;
-    // Read literally, the body's numbers are text.
-    let numbers = visit_numbers(raw, depth, rules, &mut *track.inner)?;
-    if !track.changed && numbers.is_empty() {
-        return Ok(None);
-    }
-    let json = if track.changed {
-        let json = serde_json::to_vec(value).map_err(|_| Malformed)?;
-        parda_wire::walk::preserve_numbers(raw.as_bytes(), json)
-    } else {
-        raw.as_bytes().to_vec()
-    };
-    let json = replace_numbers(json, &numbers)?;
-    String::from_utf8(json).map(Some).map_err(|_| Malformed)
-}
-
-/// Visit the number literals of the JSON text `raw` as text (as a server
-/// that reads the body literally sees them); returns the changed ones: the
-/// index among the literals and the new text.
-fn visit_numbers(
-    raw: &str,
-    depth: usize,
-    rules: &Rules<'_>,
-    f: Visit<'_>,
-) -> Result<Vec<(usize, String)>, Malformed> {
-    let mut changed = Vec::new();
-    for (i, (a, b)) in parda_wire::walk::number_tokens(raw.as_bytes())
-        .into_iter()
-        .enumerate()
-    {
-        let mut t = raw[a..b].to_string();
-        visit_at(&mut t, true, false, depth, Reading::Body, rules, f)?;
-        if t != raw[a..b] {
-            changed.push((i, t));
+    let mut pos = from;
+    for piece in raw[from..to].split('&') {
+        let (ps, pe) = (pos, pos + piece.len());
+        pos = pe + 1;
+        match piece.find('=') {
+            Some(k) if role.form_keys() => {
+                let ke = ps + k;
+                let ks = raw[ps..ke].rfind(['?', '#']).map_or(ps, |q| ps + q + 1);
+                if ks > ps {
+                    add(ps, ks - 1, role);
+                }
+                let key = decode_component(&raw[ks..ke]);
+                add(ks, ke, role.key());
+                add(ke + 1, pe, role.member(&key, rules));
+            }
+            Some(k) => {
+                add(ps, ps + k, role);
+                add(ps + k + 1, pe, role);
+            }
+            None if role == Role::Form => add(ps, pe, Role::Value { skipped: false }),
+            None => add(ps, pe, role),
         }
     }
-    Ok(changed)
+    parts
 }
 
-/// Put the changed number literals of [`visit_numbers`] into `json` (the
-/// same document, its numbers in the same order): bare when the new text is
-/// a JSON number, else as a JSON string (a tag), so the line still parses.
-fn replace_numbers(json: Vec<u8>, changed: &[(usize, String)]) -> Result<Vec<u8>, Malformed> {
-    if changed.is_empty() {
-        return Ok(json);
-    }
-    let tokens = parda_wire::walk::number_tokens(&json);
-    let mut out = Vec::with_capacity(json.len());
+/// A replacement in a text, in that text's raw coordinates.
+#[derive(Debug, Clone)]
+struct Edit {
+    start: usize,
+    end: usize,
+    /// The new text: as the reading that found it reads it, then (once
+    /// merged) as the raw text holds it.
+    text: String,
+    /// The kinds of the engine findings it stands for (each counted once).
+    kinds: Vec<String>,
+    /// Which reading found it: 0 the literal one, `n` part `n - 1` of the
+    /// other one.
+    view: usize,
+    /// The raw text it covers is form-encoded (`%XX`, `+`).
+    encoded: bool,
+}
+
+/// Apply sorted, disjoint edits to `raw`.
+fn apply(raw: &str, edits: &[Edit]) -> Result<String, Malformed> {
+    let mut out = String::with_capacity(raw.len());
     let mut last = 0;
-    for (i, text) in changed {
-        // Never: redaction rewrites only strings, and numbers keep their order.
-        let &(a, b) = tokens.get(*i).ok_or(Malformed)?;
-        out.extend_from_slice(&json[last..a]);
-        match serde_json::from_str::<Value>(text) {
-            Ok(Value::Number(_)) => out.extend_from_slice(text.as_bytes()),
-            _ => out.extend_from_slice(Value::String(text.clone()).to_string().as_bytes()),
-        }
-        last = b;
+    for e in edits {
+        out.push_str(raw.get(last..e.start).ok_or(Malformed)?);
+        out.push_str(&e.text);
+        last = e.end;
     }
-    out.extend_from_slice(&json[last..]);
+    out.push_str(raw.get(last..).ok_or(Malformed)?);
     Ok(out)
 }
 
-/// Text (not JSON, not JSON lines) that starts like JSON (`{`, `[` or
-/// `"`, after a BOM and whitespace) and holds a backslash, or that has a
-/// line like that (R8.1): a lenient reader would decode escapes that glue
-/// a letter to the value (`\n9876543210`) when read literally, so it
-/// cannot be filtered safely. A line that parses on its own counts too: the
-/// text is read literally, never with that line's escapes decoded.
-pub(crate) fn escaped_like_json(text: &str) -> bool {
-    let looks = |t: &str| {
-        t.trim_start_matches(|c: char| c == '\u{feff}' || JSON_WS.contains(&c))
-            .starts_with(['{', '[', '"'])
+/// Visit `text` as one string; what the sink replaced, as edits.
+fn visit(text: &str, tier: Tier, f: Visit<'_>) -> Vec<Edit> {
+    let mut s = text.to_string();
+    f.visit(&mut s, tier);
+    let edit = |start, end, text, kinds| Edit {
+        start,
+        end,
+        text,
+        kinds,
+        view: 0,
+        encoded: false,
     };
-    (looks(text) && text.contains('\\'))
-        || text
-            .split(['\n', '\r'])
-            .any(|line| line.contains('\\') && looks(line))
+    match f.found() {
+        Some(found) => found
+            .iter()
+            .map(|x| edit(x.start, x.end, x.surrogate.clone(), vec![x.kind.clone()]))
+            .collect(),
+        None if s == text => Vec::new(),
+        // A sink that cannot say what it replaced: the changed middle.
+        None => {
+            let (a, b) = (text.as_bytes(), s.as_bytes());
+            let mut p = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+            while !text.is_char_boundary(p) || !s.is_char_boundary(p) {
+                p -= 1;
+            }
+            let room = a.len().min(b.len()) - p;
+            let mut q = a
+                .iter()
+                .rev()
+                .zip(b.iter().rev())
+                .take_while(|(x, y)| x == y)
+                .count()
+                .min(room);
+            while !text.is_char_boundary(a.len() - q) || !s.is_char_boundary(b.len() - q) {
+                q -= 1;
+            }
+            vec![edit(
+                p,
+                a.len() - q,
+                s[p..b.len() - q].to_string(),
+                Vec::new(),
+            )]
+        }
+    }
+}
+
+/// Read `raw` in every way a server may read it, and redact each reading
+/// with `f`; returns the edits that leave a finding in none of them.
+///
+/// The readings: the literal text (identifiers inside it hidden, as they
+/// skip the model); and either JSON (one value, or one per line, after
+/// whitespace, BOMs and RS), its strings, keys and numbers each read again
+/// the same ways, or, when it holds `%XX`, `+` or `=`, form-decoded, its
+/// keys, values and pieces each read again the same ways. JSON in a string
+/// is thus opened, and so is JSON in a form value, `MAX_DEPTH` levels deep.
+/// What any reading finds is replaced in the raw text, encoded as each
+/// layer needs; a value the literal reading finds across JSON tokens is
+/// replaced in each token it covers (never in an identifier).
+///
+/// Also returns whether JSON was read in `raw` (at any depth).
+fn read(
+    raw: &str,
+    role: Role,
+    depth: usize,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<(Vec<Edit>, bool), Malformed> {
+    if raw.trim_matches(skippable).is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    let tier = role.tier(raw, rules);
+    let role = if tier == Tier::Identifier {
+        Role::Ident
+    } else {
+        role
+    };
+    let view = if depth < MAX_DEPTH {
+        View::of(raw, role, depth == 0, rules)?
+    } else {
+        View::plain()
+    };
+    // The literal reading, identifiers hidden: they skip the model.
+    let mut literal = raw.as_bytes().to_vec();
+    if tier == Tier::Text {
+        for p in view.parts.iter().filter(|p| p.ident) {
+            literal[p.start..p.end].fill(b'_');
+        }
+    }
+    // Whole characters became `_`: still UTF-8.
+    let literal = String::from_utf8(literal).map_err(|_| Malformed)?;
+    // The parts first: a value's canonical spelling (decoded) gets its tag
+    // before the fragments the literal reading may see.
+    let mut edits = Vec::new();
+    let mut json = vec![false; view.parts.len()];
+    for (n, part) in view.parts.iter().enumerate().filter(|(_, p)| !p.verbatim) {
+        let (found, is_json) = read(&part.text, part.role, depth + 1, rules, f)?;
+        json[n] = is_json;
+        edits.extend(found.into_iter().map(|e| part.lift(raw, e, n + 1)));
+    }
+    edits.extend(visit(&literal, tier, f));
+    let has_json = !view.docs.is_empty() || json.contains(&true);
+    Ok((merge(raw, edits, &view, &json, f)?, has_json))
+}
+
+/// Merge what the readings of `raw` found into disjoint edits, as `raw`
+/// holds them. Edits that overlap are one: the new texts of those not
+/// inside another, in order (of two over the same text, the decoded
+/// reading's); one inside another found by another reading is the same
+/// value found twice, not counted again.
+///
+/// `json[n]`: JSON was read in part `n`.
+fn merge(
+    raw: &str,
+    edits: Vec<Edit>,
+    view: &View,
+    json: &[bool],
+    f: Visit<'_>,
+) -> Result<Vec<Edit>, Malformed> {
+    let mut forget = |kinds: &[String]| kinds.iter().for_each(|k| f.forget(k));
+    let found_in_parts: Vec<(usize, usize, usize)> = edits
+        .iter()
+        .filter(|e| e.view != 0)
+        .map(|e| (e.start, e.end, e.view))
+        .collect();
+    let mut hits = Vec::with_capacity(edits.len());
+    for e in edits {
+        if e.view != 0 {
+            hits.push(e);
+            continue;
+        }
+        // What the literal reading found, cut where it enters or leaves a
+        // JSON value.
+        let mut cuts = Vec::new();
+        let mut at = e.start;
+        for d in view
+            .docs
+            .iter()
+            .filter(|d| d.start < e.end && e.start < d.end)
+        {
+            if d.start > at {
+                cuts.push((at, d.start));
+            }
+            cuts.push((at.max(d.start), e.end.min(d.end)));
+            at = e.end.min(d.end);
+        }
+        if at < e.end || cuts.is_empty() {
+            cuts.push((at, e.end));
+        }
+        let mut kinds = Some(e.kinds);
+        for (start, end) in cuts {
+            let cut = Edit {
+                start,
+                end,
+                text: e.text.clone(),
+                kinds: Vec::new(),
+                view: 0,
+                encoded: false,
+            };
+            // Across form syntax (`data=x+ravi@…` reads as one e-mail
+            // literally, also encoded), the value a finer reading found
+            // decides: the key stays.
+            let mut decoded = raw[start..end].to_string();
+            for _ in 0..MAX_DEPTH {
+                decoded = decode_component(&decoded);
+            }
+            if decoded.contains(['=', '&'])
+                && found_in_parts
+                    .iter()
+                    .any(|&(s, t, _)| start <= s && t <= end)
+            {
+                continue;
+            }
+            // Inside a part with JSON in it, what its readings found decides:
+            // cut here, the literal finding could split one of its escapes.
+            let within_json = view
+                .parts
+                .iter()
+                .enumerate()
+                .find(|(n, p)| json[*n] && p.start <= start && end <= p.end);
+            if let Some((n, _)) = within_json
+                && found_in_parts
+                    .iter()
+                    .any(|&(s, t, v)| v == n + 1 && s < end && start < t)
+            {
+                continue;
+            }
+            let over: Vec<&Part> = view.parts.iter().filter(|p| p.overlaps(&cut)).collect();
+            if view.in_doc(start, end) {
+                // In JSON only strings and numbers change: a value found
+                // across them is replaced in each (identifiers keep theirs).
+                // Where a string's own (unescaped) reading found something,
+                // it decides: read raw, escapes glue letters to a value.
+                for (n, p) in view.parts.iter().enumerate() {
+                    if p.ident || !p.overlaps(&cut) {
+                        continue;
+                    }
+                    let (start, end) = p.align(start.max(p.start), end.min(p.end));
+                    if found_in_parts
+                        .iter()
+                        .any(|&(s, t, v)| v == n + 1 && s < end && start < t)
+                    {
+                        continue;
+                    }
+                    hits.push(Edit {
+                        start,
+                        end,
+                        kinds: kinds.take().unwrap_or_default(),
+                        ..cut.clone()
+                    });
+                }
+                continue;
+            }
+            // Inside an identifier, its own reading decides.
+            match over[..] {
+                [p] if p.ident && p.start <= start && end <= p.end => {}
+                _ => hits.push(Edit {
+                    kinds: kinds.take().unwrap_or_default(),
+                    encoded: over.iter().any(|p| p.encode),
+                    ..cut
+                }),
+            }
+        }
+        if let Some(kinds) = kinds {
+            forget(&kinds);
+        }
+    }
+    hits.sort_by_key(|h| (h.start, std::cmp::Reverse(h.end), !h.encoded, h.view));
+    let mut merged: Vec<Edit> = Vec::new();
+    let mut i = 0;
+    while i < hits.len() {
+        let mut end = hits[i].end;
+        let mut j = i + 1;
+        while j < hits.len() && hits[j].start < end {
+            end = end.max(hits[j].end);
+            j += 1;
+        }
+        let mut outer: Vec<&Edit> = Vec::new();
+        for h in &hits[i..j] {
+            if outer.iter().any(|o| o.start <= h.start && h.end <= o.end) {
+                forget(&h.kinds);
+            } else {
+                outer.push(h);
+            }
+        }
+        let mut text = String::new();
+        let mut prev: Option<&str> = None;
+        for o in &outer {
+            if prev != Some(o.text.as_str()) {
+                text.push_str(&o.text);
+            }
+            prev = Some(o.text.as_str());
+        }
+        merged.push(Edit {
+            start: hits[i].start,
+            end,
+            text,
+            kinds: outer.iter().flat_map(|o| o.kinds.iter().cloned()).collect(),
+            view: 0,
+            encoded: hits[i..j].iter().any(|h| h.encoded),
+        });
+        i = j;
+    }
+    // As each reading holds them: escaped in JSON strings; a JSON number
+    // with edits becomes a string unless what replaces it is a number;
+    // encoded where the text was form-encoded.
+    let mut out: Vec<Edit> = Vec::new();
+    let mut k = 0;
+    while k < merged.len() {
+        let e = &merged[k];
+        let json = view
+            .parts
+            .iter()
+            .find(|p| !p.percent && p.start <= e.start && e.end <= p.end);
+        let Some(p) = json.filter(|p| p.num) else {
+            let text = match json {
+                Some(_) => json_escape(&e.text),
+                None if view.in_doc(e.start, e.end) => return Err(Malformed),
+                None if e.encoded => encode_all(&e.text),
+                None => e.text.clone(),
+            };
+            out.push(Edit { text, ..e.clone() });
+            k += 1;
+            continue;
+        };
+        let mut inner = Vec::new();
+        while let Some(e) = merged
+            .get(k)
+            .filter(|e| p.start <= e.start && e.end <= p.end)
+        {
+            inner.push(Edit {
+                start: e.start - p.start,
+                end: e.end - p.start,
+                ..e.clone()
+            });
+            k += 1;
+        }
+        let text = apply(&raw[p.start..p.end], &inner)?;
+        let text = match serde_json::from_str::<Value>(&text) {
+            Ok(Value::Number(_)) => text,
+            _ => Value::String(text).to_string(),
+        };
+        out.push(Edit {
+            start: p.start,
+            end: p.end,
+            text,
+            kinds: inner.into_iter().flat_map(|e| e.kinds).collect(),
+            view: 0,
+            encoded: false,
+        });
+    }
+    // Every JSON value must still be JSON, and name no key twice (two keys
+    // that became the same tag).
+    if !out.is_empty() && !view.docs.is_empty() {
+        let new = apply(raw, &out)?;
+        let moved = |at: usize| {
+            out.iter()
+                .filter(|e| e.end <= at)
+                .map(|e| e.text.len() as isize - (e.end - e.start) as isize)
+                .sum::<isize>()
+                .saturating_add(at as isize) as usize
+        };
+        for d in &view.docs {
+            let json = new.get(moved(d.start)..moved(d.end)).ok_or(Malformed)?;
+            if !parses(json, view.strict)? {
+                return Err(Malformed);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Redact `raw` (a body, a field, a query string) in every reading (see
+/// [`read`]); returns the new text when something changed.
+pub(crate) fn read_text(
+    raw: &str,
+    role: Role,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<Option<String>, Malformed> {
+    let (edits, _) = read(raw, role, 0, rules, f)?;
+    if edits.is_empty() {
+        return Ok(None);
+    }
+    let out = apply(raw, &edits)?;
+    Ok((out != raw).then_some(out))
+}
+
+/// Redact a multipart field named `name` (see [`read_text`]); one declared
+/// as JSON must be JSON.
+fn read_field(
+    text: &str,
+    name: Option<&str>,
+    json: bool,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<Option<String>, Malformed> {
+    if json && !is_json_document(text)? {
+        return Err(Malformed);
+    }
+    let role = name.map_or(Role::Body, |n| Role::Body.member(n, rules));
+    read_text(text, role, rules, f)
 }
 
 /// What a multipart walk did.
@@ -1357,9 +1575,11 @@ pub(crate) fn walk_multipart(
         .filter(|t| !t.contains('\0'));
         match text {
             Some(text) => {
-                let mut value = text.clone();
-                visit_field(&mut value, part.name.as_deref(), rules, f)?;
-                if value != text {
+                let json = part
+                    .content_type
+                    .as_deref()
+                    .is_some_and(|t| t.starts_with("application/json") || t.contains("+json"));
+                if let Some(value) = read_field(&text, part.name.as_deref(), json, rules, f)? {
                     new = Some(if base64 {
                         base64_encode(value.as_bytes())
                     } else {
@@ -1409,13 +1629,6 @@ mod tests {
             extra,
             site: crate::sites::for_host(site),
         }
-    }
-
-    /// The texts visited, identifiers marked with a leading `#`.
-    fn collect_json(v: &mut Value, r: &Rules<'_>) -> Vec<String> {
-        let mut out = Vec::new();
-        walk_json(v, r, &mut |s: &mut String, tier| out.push(mark(s, tier))).unwrap();
-        out
     }
 
     fn mark(s: &str, tier: Tier) -> String {
@@ -1558,12 +1771,89 @@ mod tests {
         }
     }
 
+    /// The texts `raw` is read as (identifiers marked `#`), and the result.
+    fn visits(raw: &str, role: Role, r: &Rules<'_>) -> Vec<String> {
+        let mut out = Vec::new();
+        read_text(raw, role, r, &mut |s: &mut String, tier| {
+            out.push(mark(s, tier))
+        })
+        .unwrap();
+        out
+    }
+
+    /// Replaces each needle with its tag and says where (like the engine).
+    struct Finder {
+        needles: Vec<(&'static str, &'static str)>,
+        found: Vec<Found>,
+        seen: Vec<String>,
+    }
+
+    impl Finder {
+        fn new(needles: &[(&'static str, &'static str)]) -> Self {
+            Finder {
+                needles: needles.to_vec(),
+                found: Vec::new(),
+                seen: Vec::new(),
+            }
+        }
+    }
+
+    impl Sink for Finder {
+        fn visit(&mut self, s: &mut String, tier: Tier) {
+            self.seen.push(mark(s, tier));
+            self.found.clear();
+            for (needle, tag) in &self.needles {
+                for (i, _) in s.match_indices(needle) {
+                    self.found.push(Found {
+                        start: i,
+                        end: i + needle.len(),
+                        surrogate: tag.to_string(),
+                        kind: "K".into(),
+                    });
+                }
+            }
+            // Longest first where two start together; overlaps dropped.
+            self.found
+                .sort_by_key(|x| (x.start, std::cmp::Reverse(x.end)));
+            let mut end = 0;
+            self.found.retain(|x| {
+                let keep = x.start >= end;
+                end = end.max(x.end);
+                keep
+            });
+            let mut out = String::new();
+            let mut last = 0;
+            for x in &self.found {
+                out.push_str(&s[last..x.start]);
+                out.push_str(&x.surrogate);
+                last = x.end;
+            }
+            out.push_str(&s[last..]);
+            *s = out;
+        }
+
+        fn found(&self) -> Option<&[Found]> {
+            Some(&self.found)
+        }
+    }
+
+    fn find(
+        raw: &str,
+        role: Role,
+        needles: &[(&'static str, &'static str)],
+    ) -> Result<String, Malformed> {
+        let h = hosts();
+        let r = rules(&h, &[], "chatgpt.com");
+        let mut f = Finder::new(needles);
+        Ok(read_text(raw, role, &r, &mut f)?.unwrap_or_else(|| raw.to_string()))
+    }
+
     #[test]
-    fn json_walk_visits_text_only() {
+    fn json_tokens_get_their_tiers_and_the_literal_hides_identifiers() {
         let h = hosts();
         let r = rules(&h, &[], "chatgpt.com");
         let key = "sk-proj-0123456789abcdefghijABCDEFGHIJ0123456789";
-        let mut v = json!({
+        let body = json!({
             "action": "next",
             "messages": [{
                 "id": "aaa2b8c1-55f4-4bd2-9a1c-0123456789ab",
@@ -1575,18 +1865,22 @@ mod tests {
             "model": "ravi.k@gmail.com",
             "type": "Ravi Kumar",
             "timezone_offset_min": -330,
+            "create_time": 1760000000.123,
             "client_contextual_info": {"page_title": "x"},
             "tags": ["a", "  "],
             "ids": ["aaa2b8c1-55f4-4bd2-9a1c-0123456789ab"],
-        });
+        })
+        .to_string();
+        let mut seen = visits(&body, Role::Body, &r);
+        let literal = seen.pop().unwrap();
+        // Every string, key and number is read on its own. Identifier-shaped
+        // values under identifier keys (or looking like ids) skip only the
+        // model; a value with a space or an `@` is text under any key;
+        // content keys (`parts`) are always text; numbers meet the rules
+        // only, and under identifier keys (`create_time`) are kept as
+        // written. Keys follow the value rule.
         assert_eq!(
-            collect_json(&mut v, &r),
-            // Every string and every key is visited. Identifier-shaped
-            // values under identifier keys (or looking like ids) skip only
-            // the model; a value with a space or an `@` is text under any
-            // key; content keys (`parts`) are always text. Keys follow the
-            // same rule: only known protocol keys (or id-looking ones) skip
-            // the model.
+            seen,
             [
                 "#action",
                 "#next",
@@ -1614,6 +1908,8 @@ mod tests {
                 "#type",
                 "Ravi Kumar",
                 "timezone_offset_min",
+                "#-330",
+                "#create_time",
                 "#client_contextual_info",
                 "page_title",
                 "x",
@@ -1623,48 +1919,77 @@ mod tests {
                 "#aaa2b8c1-55f4-4bd2-9a1c-0123456789ab",
             ]
         );
+        // And the whole text literally (a value split across tokens), its
+        // identifiers hidden from the model.
+        assert_eq!(literal.len(), body.len());
+        for hidden in [
+            "aaa2b8c1",
+            "client-created-root",
+            "deadbeef",
+            "1760000000",
+            "parent_message_id",
+        ] {
+            assert!(!literal.contains(hidden), "{literal}");
+        }
+        for shown in [
+            "Email Ravi Kumar",
+            key,
+            "ravi.k@gmail.com",
+            "-330",
+            "\"name\"",
+        ] {
+            assert!(literal.contains(shown), "{literal}");
+        }
     }
 
     #[test]
-    fn json_in_strings_is_walked_and_reserialised() {
+    fn json_in_strings_is_opened_and_rewritten_exactly() {
         let h = hosts();
         let r = rules(&h, &[], "gemini.google.com");
         let inner = r#"[["Ravi Kumar here",0,null,1e2],["en"],["c_1a2b3c","r_9f8e7d"]]"#;
-        let mut v = json!([null, inner]);
-        assert_eq!(
-            collect_json(&mut v, &r),
-            ["Ravi Kumar here", "en", "c_1a2b3c", "r_9f8e7d"]
-        );
-        walk_json(&mut v, &r, &mut |s: &mut String, t| {
+        let body = json!([null, inner]).to_string();
+        let ravi = |s: &mut String, t: Tier| {
             if s.starts_with("Ravi") {
                 upper(s, t)
             }
-        })
-        .unwrap();
+        };
+        let out = read_text(&body, Role::Body, &r, &mut { ravi })
+            .unwrap()
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             v[1],
             r#"[["RAVI KUMAR HERE",0,null,1e2],["en"],["c_1a2b3c","r_9f8e7d"]]"#
         );
         // Unchanged JSON-in-string keeps its exact text.
-        let spaced = r#"{ "a" : "x" }"#;
-        let mut v = json!({"blob": spaced});
-        walk_json(&mut v, &r, &mut |_: &mut String, _: Tier| {}).unwrap();
-        assert_eq!(v["blob"], spaced);
-        // JSON typed into a content field is text: its keys get no say.
-        let mut v = json!({"prompt": r#"{"id": "Ravi Kumar"}"#});
+        let spaced = json!({"blob": r#"{ "a" : "x" }"#}).to_string();
         assert_eq!(
-            collect_json(&mut v, &r),
-            ["#prompt", r#"{"id": "Ravi Kumar"}"#]
+            read_text(&spaced, Role::Body, &r, &mut |_: &mut String, _: Tier| {}),
+            Ok(None)
         );
-        // Nesting beyond the limit is visited as text, never skipped.
+        // JSON typed into a content field is read too, but all of it is
+        // text: its keys get no say.
+        let typed = json!({"prompt": r#"{"id": "Ravi Kumar", "n": "ab12"}"#}).to_string();
+        let seen = visits(&typed, Role::Body, &r);
+        for v in ["id", "Ravi Kumar", "ab12"] {
+            assert!(seen.iter().any(|s| s == v), "{seen:?}");
+        }
+        // Nesting beyond the limit is read literally, never skipped.
         let mut s = String::from("\"deep Ravi\"");
         for _ in 0..6 {
             s = serde_json::to_string(&json!([s])).unwrap();
         }
-        let mut v: Value = serde_json::from_str(&s).unwrap();
-        let got = collect_json(&mut v, &r);
-        assert_eq!(got.len(), 1);
-        assert!(got[0].contains("deep Ravi") && got[0].starts_with('['));
+        let out = read_text(&s, Role::Body, &r, &mut { ravi_anywhere })
+            .unwrap()
+            .unwrap();
+        assert!(
+            !out.contains("deep Ravi") && out.contains("deep RAVI"),
+            "{out}"
+        );
+    }
+
+    fn ravi_anywhere(s: &mut String, _: Tier) {
+        *s = s.replace("Ravi", "RAVI");
     }
 
     #[test]
@@ -1676,98 +2001,92 @@ mod tests {
                 *s = "[NAME_1]".into();
             }
         };
-        let mut v = json!({"a": 1, "Ravi Kumar": {"ravi k": 2}, "z": 3});
-        walk_json(&mut v, &r, &mut { tag }).unwrap();
-        assert_eq!(v.to_string(), r#"{"a":1,"[NAME_1]":{"[NAME_1]":2},"z":3}"#);
+        let read = |v: Value| read_text(&v.to_string(), Role::Body, &r, &mut { tag });
+        assert_eq!(
+            read(json!({"a": 1, "Ravi Kumar": {"ravi k": 2}, "z": 3})),
+            Ok(Some(r#"{"a":1,"[NAME_1]":{"[NAME_1]":2},"z":3}"#.into()))
+        );
         // Two keys that would become the same text: one value would be
         // lost, so the body is refused.
-        for mut v in [
+        for v in [
             json!({"Ravi Kumar": 1, "ravi kumar": 2}),
             json!({"Ravi Kumar": 1, "[NAME_1]": 2}),
             json!([{"x": {"[NAME_1]": 1, "Ravi": 2}}]),
         ] {
-            assert_eq!(walk_json(&mut v, &r, &mut { tag }), Err(Malformed));
+            assert_eq!(read(v), Err(Malformed));
         }
-        // JSON repeating a key inside a string is refused too.
-        let mut v = json!({"blob": r#"{"a":"x","a":"Ravi"}"#});
-        assert_eq!(walk_json(&mut v, &r, &mut { tag }), Err(Malformed));
+        // JSON repeating a key, here or inside a string, is refused.
+        assert_eq!(
+            read_text(r#"{"a":"x","a":"y"}"#, Role::Body, &r, &mut { tag }),
+            Err(Malformed)
+        );
+        assert_eq!(
+            read(json!({"blob": r#"{"a":"x","a":"Ravi"}"#})),
+            Err(Malformed)
+        );
+        // Typed into a message it is text the site never parses: read, not
+        // refused.
+        let typed = json!({"prompt": r#"{"a":"x","a":"Ravi"}"#});
+        assert_eq!(
+            read(typed),
+            Ok(Some(
+                json!({"prompt": r#"{"a":"x","a":"[NAME_1]"}"#}).to_string()
+            ))
+        );
     }
 
+    /// Open item: a value split across JSON tokens is found by the literal
+    /// reading of the whole text and replaced in each token; escapes are
+    /// never split; identifiers keep their value.
     #[test]
-    fn url_queries_in_strings_are_found() {
-        fn spans(s: &str) -> Vec<&str> {
-            url_query_spans(s)
-                .into_iter()
-                .map(|(a, b)| &s[a..b])
-                .collect()
-        }
-        assert_eq!(spans("https://a.example/p?q=1#f"), ["q=1"]);
+    fn literal_findings_are_written_back_into_tokens() {
         assert_eq!(
-            spans("x HTTP://a/?b=c d \"https://e/?f\" https://g/h #?i"),
-            ["b=c", "f"]
+            find(
+                r#"["Ravi","Kumar"]"#,
+                Role::Body,
+                &[(r#"Ravi","Kumar"#, "[X]")]
+            ),
+            Ok(r#"["[X]","[X]"]"#.into())
         );
-        assert_eq!(spans("https://a/b\u{a0}?c https://a/?"), Vec::<&str>::new());
-        assert_eq!(spans("xhttps://a/?b ftp://a/?b https://é/?ü=1"), ["ü=1"]);
-        assert!(spans("no url ?q=1").is_empty());
-    }
-
-    /// Scan R5.2/R5.3: the decoded reading maps every byte back to the raw
-    /// text it came from, so a value found decoded is replaced in the raw
-    /// text exactly.
-    #[test]
-    fn decoded_readings_map_back_to_raw_bytes() {
-        let (d, map) = decode_mapped("a+%C3%A9%zz%FF%40b");
-        assert_eq!(d, "a é%zz\u{fffd}@b");
-        assert_eq!(map.len(), d.len());
-        assert_eq!(map[1], (1, 2)); // `+`
-        assert_eq!((map[2], map[3]), ((2, 5), (5, 8))); // `é` from two escapes
-        assert_eq!(&map[7..10], &[(11, 14); 3]); // U+FFFD for `%FF`
-        assert_eq!(map[10], (14, 17)); // `@`
         assert_eq!(
-            components("https://x.example/u/a%40b/?q=1&r#f=g"),
-            [
-                (0, 6),
-                (8, 17),
-                (18, 19),
-                (20, 25),
-                (27, 28),
-                (29, 30),
-                (31, 32),
-                (33, 34),
-                (35, 36)
-            ]
+            find(
+                r#"{"Ravi":"Kumar","n":1}"#,
+                Role::Body,
+                &[(r#"Ravi":"Kumar"#, "[X]")]
+            ),
+            Ok(r#"{"[X]":"[X]","n":1}"#.into())
         );
-        // Two readings of one text: one replacement where they overlap,
-        // re-encoded where the raw text was encoded, counted once.
-        struct Forget(Vec<String>);
-        impl Sink for Forget {
-            fn visit(&mut self, _: &mut String, _: Tier) {}
-            fn forget(&mut self, kind: &str) {
-                self.0.push(kind.to_string());
-            }
-        }
-        let hit = |start, end, s: &str, visit, encoded| Hit {
-            start,
-            end,
-            surrogate: s.into(),
-            kind: "Person".into(),
-            visit,
-            encoded,
-        };
-        let orig = "n=Ravi%20Kumar&m=x.y+z@e.example";
-        let mut sink = Forget(Vec::new());
-        let out = merge_hits(
-            orig,
-            vec![
-                hit(2, 6, "[NAME_2]", 0, false),
-                hit(2, 14, "[NAME_1]", 1, true),
-                hit(17, 32, "[EMAIL_1]", 0, false),
-                hit(21, 32, "[EMAIL_2]", 2, false),
-            ],
-            &mut sink,
+        // A finding glued to an escape takes the whole escape.
+        assert_eq!(
+            find(r#"{"m":"Hi\nRavi"}"#, Role::Body, &[("nRavi", "[X]")]),
+            Ok(r#"{"m":"Hi[X]"}"#.into())
         );
-        assert_eq!(out, "n=%5BNAME_1%5D&m=[EMAIL_1]");
-        assert_eq!(sink.0.len(), 2);
+        // A number becomes a string with the tag.
+        assert_eq!(
+            find(
+                r#"{"p":9876543210,"n":2}"#,
+                Role::Body,
+                &[("9876543210", "[X]")]
+            ),
+            Ok(r#"{"p":"[X]","n":2}"#.into())
+        );
+        // Under an identifier key a number is kept as written (timestamps
+        // read like phones), and so is an identifier.
+        let ids = r#"{"create_time":1760000000.123,"n":1}"#;
+        assert_eq!(
+            find(ids, Role::Body, &[("1760000000", "[X]")]),
+            Ok(ids.into())
+        );
+        // The strings and numbers of a JSON line among text change; the text
+        // around is read literally.
+        assert_eq!(
+            find(
+                "note Ravi\n{\"m\":\"Ravi\"}\n",
+                Role::Body,
+                &[("Ravi", "[X]")]
+            ),
+            Ok("note [X]\n{\"m\":\"[X]\"}\n".into())
+        );
     }
 
     #[test]
@@ -1777,41 +2096,96 @@ mod tests {
         let freq = serde_json::to_string(&json!([null, r#"[["Ravi Kumar",0]]"#])).unwrap();
         let enc: String = form_urlencoded::byte_serialize(freq.as_bytes()).collect();
         let raw = format!("f.req={enc}&at=AJvLN6M%3A1697000000000&q=Ravi+Kumar&flag&e=%E2%9C%93");
-        let mut seen = Vec::new();
-        assert_eq!(
-            walk_form(&raw, &r, &mut |s: &mut String, t| seen.push(mark(s, t))),
-            Ok(None)
-        );
-        // Keys too; a piece without `=` is a text of its own.
-        assert_eq!(
-            seen,
-            [
-                "f.req",
-                "Ravi Kumar",
-                "#at",
-                "#AJvLN6M:1697000000000",
-                "#q",
-                "Ravi Kumar",
-                "flag",
-                "e",
-                "✓"
-            ]
-        );
-        let out = walk_form(&raw, &r, &mut |s: &mut String, t| {
+        let seen = visits(&raw, Role::Form, &r);
+        // Keys and values by the key rules; a piece without `=` is a text
+        // of its own; the whole text literally last, identifiers hidden.
+        for v in [
+            "f.req",
+            "Ravi Kumar",
+            "#at",
+            "#AJvLN6M:1697000000000",
+            "#q",
+            "flag",
+            "e",
+            "✓",
+        ] {
+            assert!(seen.iter().any(|s| s == v), "{v}: {seen:?}");
+        }
+        assert!(!seen.last().unwrap().contains("AJvLN6M"));
+        let ravi = |s: &mut String, t: Tier| {
             if s.starts_with("Ravi") {
                 upper(s, t)
             }
-        })
-        .unwrap()
-        .unwrap();
+        };
+        let out = read_text(&raw, Role::Form, &r, &mut { ravi })
+            .unwrap()
+            .unwrap();
         let pairs: Vec<(String, String)> = form_urlencoded::parse(out.as_bytes())
             .into_owned()
             .collect();
         assert_eq!(pairs[0].0, "f.req");
         let outer: Value = serde_json::from_str(&pairs[0].1).unwrap();
         assert_eq!(outer[1], r#"[["RAVI KUMAR",0]]"#);
-        // Untouched pairs keep their bytes; changed ones are re-encoded.
-        assert!(out.contains("&at=AJvLN6M%3A1697000000000&q=RAVI+KUMAR&flag&e=%E2%9C%93"));
+        // Untouched pairs keep their bytes; changed text is encoded.
+        assert!(
+            out.ends_with("&at=AJvLN6M%3A1697000000000&q=RAVI%20KUMAR&flag&e=%E2%9C%93"),
+            "{out}"
+        );
+    }
+
+    /// The decoded reading maps every byte back to the raw text it came
+    /// from, so a value found decoded is replaced in the raw text exactly.
+    #[test]
+    fn decoded_readings_map_back_to_raw_bytes() {
+        let (d, map) = decode_mapped("a+%C3%A9%zz%FF%40b");
+        assert_eq!(d, "a é%zz\u{fffd}@b");
+        assert_eq!(map.len(), d.len());
+        assert_eq!(map[1], (1, 2)); // `+`
+        assert_eq!((map[2], map[3]), ((2, 5), (5, 8))); // `é` from two escapes
+        assert_eq!(&map[7..10], &[(11, 14); 3]); // U+FFFD for `%FF`
+        assert_eq!(map[10], (14, 17)); // `@`
+        let raw = r#""a\u00e9\ud83d\ude00\ud83d\n""#;
+        let (t, map) = unescape(raw, 1, raw.len() - 1);
+        assert_eq!(t, "aé😀\u{fffd}\n");
+        assert_eq!((map[1], map[3]), ((2, 8), (8, 20)));
+        assert_eq!(map[t.len() - 1], (26, 28));
+        // Two readings of one text: one replacement where they overlap,
+        // encoded where the raw text was encoded.
+        assert_eq!(
+            find(
+                "n=Ravi%20Kumar&m=x",
+                Role::Form,
+                &[("Ravi Kumar", "[N]"), ("Ravi", "[R]")]
+            ),
+            Ok("n=%5BN%5D&m=x".into())
+        );
+    }
+
+    /// Text that looks like escaped JSON but is not JSON is refused, except
+    /// what the user typed (a question about broken JSON).
+    #[test]
+    fn escaped_json_looking_text_is_refused() {
+        let refused = |raw: &str, role| find(raw, role, &[]) == Err(Malformed);
+        for raw in [
+            "{\"m\":\"x\\n\", bad}",
+            "note\n[\"x\\n\"",
+            "\u{a0}\"x\\n",
+            "{\"t\":1}\n{\"m\":\"x\\n\", bad}",
+        ] {
+            assert!(refused(raw, Role::Body), "{raw:?}");
+            assert!(!refused(raw, Role::Typed), "{raw:?}");
+        }
+        // Inside a body: only text bracketed like JSON.
+        let inner = |s: &str| json!({ "blob": s }).to_string();
+        assert!(refused(&inner("{\"m\":\"x\\n\", bad}"), Role::Body));
+        assert!(!refused(&inner("{\"m\":\"x\\n\", bad"), Role::Body));
+        assert!(!refused(&inner("\"Hi\" C:\\new"), Role::Body));
+        assert!(!refused(
+            &json!({ "prompt": "{\"m\":\"x\\n\", bad}" }).to_string(),
+            Role::Body
+        ));
+        // Backslashes elsewhere are text.
+        assert!(!refused("C:\\new Ravi", Role::Body));
     }
 
     fn multipart(boundary: &str) -> Vec<u8> {
@@ -1899,7 +2273,9 @@ mod tests {
             seen.push(mark(s, t))
         })
         .unwrap();
-        assert_eq!(seen, [field]);
+        // One field, read literally last (its form-decoded parts first).
+        assert_eq!(seen.last().map(String::as_str), Some(field));
+        assert!(seen.iter().all(|s| field.contains(s.as_str())), "{seen:?}");
         assert_eq!(w.unscanned, 0);
         let w = walk_multipart(body.as_bytes(), "XyZ", &r, &mut tag_name).unwrap();
         assert_eq!(

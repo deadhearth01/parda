@@ -100,20 +100,24 @@ Tags follow `replace.style` (there is no separate style for intercept).
     a name is renamed where it stands). Form and query-string values, keys and value-less pieces
     (`?Ravi%20Kumar`). Text bodies. Multipart text fields, including base64-encoded ones. Compressed
     bodies are decoded first.
-  - *Whatever the content type says.* A body that is a JSON object or array is read as JSON (sites
-    post JSON as `text/plain`, as a form, or as `application/octet-stream`). So is a body (not
-    declared as a form) of JSON values one per line (NDJSON: batched telemetry, a Sentry envelope),
-    and one that is a lone JSON string: each line is read as JSON, so an escape such as
-    `\n9876543210` cannot hide a number. Such a body also keeps the readings a text body gets: its
-    strings and keys are read decoded as a form too (`+` is a space), and its numbers as text (a
-    number found this way becomes a JSON string holding its tag). A text or untyped body that
-    starts like JSON (`{`, `[`, `"`) and holds a backslash, or that has a line like that, but is
-    not JSON (or JSON lines) is refused. A text or untyped body
-    written in form encoding (`prompt=Ravi+Kumar&mail=ravi%40example.com`) is read as a form, so `+`
-    and `%40` cannot hide a name or an e-mail.
-  - *URLs inside strings.* The query of every `http(s)://` link in any of these strings is decoded,
-    filtered with the same rules and encoded again (telemetry often carries the page URL, prompt
-    included).
+  - *Every way the site may read it, whatever the content type says.* One reader serves every body,
+    multipart text field, form value and JSON string: UTF-8 text is read literally; as JSON of any
+    kind (one value, or one value per line: NDJSON, RFC 7464 records with their RS, a JSON line
+    among other text; leading and trailing Unicode whitespace such as `\f`, `\v` or NBSP and a
+    byte-order mark skipped); and, when it holds `%XX`, `+` or `=`, decoded as a form (`+` a space).
+    Each string, key and number found that way is read the same ways again (JSON inside a string,
+    such as Gemini's `f.req`, or inside a form value), four levels deep; deeper, it is read literally.
+    What any reading finds is replaced in the bytes that go out, encoded as each layer needs (JSON
+    escaped, percent-encoded), so no reading of the forwarded body holds it: an escape such as
+    `\n9876543210` cannot hide a number, nor `+` or `%40` a name or an e-mail. Numbers are text:
+    one that holds a value becomes a JSON string holding its tag, except under identifier keys
+    (`create_time`, `*_id`), where numbers are kept as written. A value the whole text shows but
+    single tokens do not (`{"Ravi":"Kumar"}`) is replaced in each token it covers. Text that looks
+    like escaped JSON (starting with `{`, `[` or `"`, or a line that does, holding a backslash;
+    inside a body, text bracketed like JSON) but is not JSON is refused; what the user typed under
+    a content key (`prompt`, `parts`, …) never is.
+  - *URLs inside strings.* A link's path segments, query and fragment are read decoded too, its
+    query keys with the key rules (telemetry often carries the page URL, prompt included).
   - *Identifiers.* Keys such as `id`, `*_id`, `*Id`, `uuid`, `model`, `token`, `nonce`,
     `timestamp`, `parent*`, `client_*`, `type`, `role`, `status` (plus `skip_keys` and a built-in
     list per site), and values that look like identifiers (UUIDs, long hex or base64 strings, links
@@ -121,16 +125,14 @@ Tags follow `replace.style` (there is no separate style for intercept).
     to 64 characters of `A-Z a-z 0-9 _ . : / + = -`). The dictionary and rule tiers still see them,
     so an e-mail, phone number, Aadhaar or key is redacted wherever it sits; a value with a space or
     an `@` is redacted under any key.
-  - *JSON inside a string* (Gemini's `f.req`) is opened and filtered, four levels deep; deeper, it
-    is filtered as plain text.
   - *`Referer`.* Its query and fragment are removed. A page opened with the prompt in its address
     (`chatgpt.com/?q=…`, `perplexity.ai/search?q=…`) would otherwise send the prompt again with
     every request it makes.
   - *Not read, counted as unscanned* (with `unscanned = "block"` the request is refused,
     `415 parda_unscanned_blocked`): file parts; multipart fields that are not text or JSON, are not
     UTF-8 (a declared charset other than UTF-8, or NUL bytes, as UTF-16 has), or use another
-    transfer encoding (quoted-printable); bodies of other types that are not JSON (images, binary
-    data); untyped bodies that are not UTF-8 or hold NUL bytes; WebSocket (and other protocol
+    transfer encoding (quoted-printable); bodies of any type other than form, `text/*` or JSON
+    that are not UTF-8 or hold NUL bytes (images, binary data); WebSocket (and other protocol
     upgrade) connections, whose frames are tunnelled without inspection, so with `"block"` the
     upgrade request is refused before it reaches the site. Headers other than `Referer` are
     forwarded as they are.
@@ -138,7 +140,7 @@ Tags follow `replace.style` (there is no separate style for intercept).
 
     | Status and code | When |
     |---|---|
-    | `400 parda_unparseable_body` | a body typed as JSON that is not JSON; a text or untyped body that starts like JSON and holds a backslash, or has a line like that, but is not JSON (or JSON lines); a JSON key given twice (anywhere, JSON inside strings, forms and queries included); two keys that redaction would make the same; a multipart body without a boundary, that does not split as RFC 2046 says, or whose preamble or epilogue holds the boundary |
+    | `400 parda_unparseable_body` | a body or multipart field typed as JSON that is not JSON; text that looks like escaped JSON but is not JSON (see above); a JSON key given twice (anywhere, JSON inside strings, forms and queries included); two keys that redaction would make the same; a multipart body without a boundary, that does not split as RFC 2046 says, or whose preamble or epilogue holds the boundary |
     | `400 parda_not_utf8` | a form, `text/*` or JSON body declaring a charset other than UTF-8 or US-ASCII; a form or `text/*` body that is not UTF-8 or holds NUL bytes (UTF-16) |
     | `413 parda_body_too_large` | a body too large to filter |
     | `415 parda_unsupported_encoding` | a `content-encoding` parda cannot decode |

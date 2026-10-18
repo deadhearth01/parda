@@ -11,16 +11,14 @@ use http::header::CONTENT_TYPE;
 use parda_core::{INTERCEPT_SCOPE_PER_HOST, InterceptConfig, UnscannedMedia};
 use parda_engine::{Engine, EngineError};
 use parda_wire::body::{self, BodyError};
-use parda_wire::walk::preserve_numbers;
-use serde_json::Value;
 
 use crate::hosts::HostList;
 use crate::server::MAX_REQUEST_BODY;
 use crate::sites;
 use crate::transform::RequestOutcome;
 use crate::walk::{
-    Found, JsonLine, Rules, Sink, Tier, Tracking, Visit, escaped_like_json, json_lines,
-    utf8_charset, visit_body_text, walk_form, walk_json, walk_json_lines, walk_multipart,
+    Found, Role, Rules, Sink, Tier, Visit, is_json_document, read_text, utf8_charset,
+    walk_multipart,
 };
 use crate::{BodyTransform, Refusal, StreamTransform};
 
@@ -112,7 +110,7 @@ impl EngineTransform {
         // Pass 1: collect the texts (identifiers skip only the ML model).
         let mut collect = Collect::default();
         if let Some(q) = query {
-            walk_form(q, &rules, &mut collect).map_err(|_| unparseable())?;
+            read_text(q, Role::Form, &rules, &mut collect).map_err(|_| unparseable())?;
         }
         let (_, mut unscanned) = body.walk(&rules, &mut collect)?;
         // An upgrade (WebSocket) tunnels its frames unread: one unscanned
@@ -152,7 +150,7 @@ impl EngineTransform {
             counts: BTreeMap::new(),
         };
         let target = match query {
-            Some(q) => walk_form(q, &rules, &mut assign)
+            Some(q) => read_text(q, Role::Form, &rules, &mut assign)
                 .map_err(|_| unparseable())?
                 .map(|q| format!("{path}?{q}")),
             None => None,
@@ -228,30 +226,26 @@ impl Sink for Assign {
 /// A request body, decoded and classified by its content type.
 enum ReqBody {
     Empty,
-    Json {
-        raw: Bytes,
-        value: Value,
-    },
-    /// JSON values one per line (NDJSON), or one JSON value that is not an
-    /// object or array, in a body not declared as JSON. Besides each line
-    /// read as JSON, the readings a text body gets are kept (R8.2): strings
-    /// and keys are also read decoded as a form, and numbers as the text
-    /// they are, so a value survives no reading.
-    JsonLines {
+    /// Text, whatever its declared type: read in every way a server may
+    /// read it (see [`read_text`]). `Role::Form` when declared a form.
+    Text {
         text: String,
-        lines: Vec<JsonLine>,
+        role: Role,
     },
-    /// Declared `application/x-www-form-urlencoded`.
-    Form(String),
-    /// Any other text: redacted as it reads literally and as it reads
-    /// decoded as a form.
-    Text(String),
     Multipart {
         raw: Bytes,
         boundary: String,
     },
-    /// Forwarded unchanged, counted as unscanned.
+    /// Not UTF-8 text: forwarded unchanged, counted as unscanned.
     Opaque(Bytes),
+}
+
+fn not_utf8() -> Refusal {
+    refusal(
+        400,
+        "parda_not_utf8",
+        "the request body is not UTF-8 text, so parda could not filter it; it was not sent",
+    )
 }
 
 impl ReqBody {
@@ -275,28 +269,16 @@ impl ReqBody {
         if raw.is_empty() {
             return Ok(ReqBody::Empty);
         }
-        let (media, boundary) = media_type(headers);
-        let form = media == "application/x-www-form-urlencoded";
-        let typed_text = media.starts_with("text/");
-        let not_utf8 = || {
-            refusal(
-                400,
-                "parda_not_utf8",
-                "the request body is not UTF-8 text, so parda could not filter it; it was not sent",
-            )
-        };
+        let ct = content_type(headers)?;
+        let (media, boundary) = media_type(&ct);
         // A body declared in another charset (UTF-16 of ASCII text is valid
         // UTF-8, NULs interleaved) cannot be read as text here.
-        let declared = headers
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if (is_json(&media) || form || typed_text) && !utf8_charset(declared) {
+        if (is_json(&media)
+            || media == "application/x-www-form-urlencoded"
+            || media.starts_with("text/"))
+            && !utf8_charset(&ct)
+        {
             return Err(not_utf8());
-        }
-        if is_json(&media) {
-            let value = body::parse_json_unique(&raw).map_err(|_| unparseable())?;
-            return Ok(ReqBody::Json { raw, value });
         }
         if media == "multipart/form-data" {
             return match boundary {
@@ -304,40 +286,24 @@ impl ReqBody {
                 None => Err(unparseable()),
             };
         }
-        // Whatever the type says, a JSON object or array is walked as JSON:
-        // sites post JSON as text/plain to skip CORS preflights, jQuery
-        // labels it as a form, others as octet-stream.
-        if let Some(value) = json_container(&raw)? {
-            return Ok(ReqBody::Json { raw, value });
-        }
-        // So are JSON values one per line (batched telemetry, a Sentry
-        // envelope), and a lone JSON string: a server parses each line, so
-        // reading `\n9876543210` literally would miss the number.
-        if !form
-            && let Ok(text) = std::str::from_utf8(&raw)
-            && let Some(lines) = json_lines(text).map_err(|_| unparseable())?
-        {
-            let text = text.to_string();
-            return Ok(ReqBody::JsonLines { text, lines });
-        }
-        if !(form || typed_text || media.is_empty()) {
-            return Ok(ReqBody::Opaque(raw));
-        }
-        // A form or text in another charset (or holding NULs, as UTF-16
-        // does) cannot be filtered; an untyped body like that is binary data.
-        let text = match String::from_utf8(raw.to_vec()) {
-            Ok(text) if !text.contains('\0') => text,
-            _ if form || typed_text => return Err(not_utf8()),
+        let form = media == "application/x-www-form-urlencoded";
+        let json = is_json(&media);
+        // Whatever the type says, UTF-8 text is read as text: sites post
+        // JSON as text/plain to skip CORS preflights, jQuery labels it as a
+        // form, others as octet-stream. Text in another charset (or holding
+        // NULs, as UTF-16 does) cannot be filtered; an untyped or binary
+        // body like that is binary data.
+        let text = match std::str::from_utf8(&raw) {
+            Ok(text) if !text.contains('\0') => text.to_string(),
+            _ if json => return Err(unparseable()),
+            _ if form || media.starts_with("text/") => return Err(not_utf8()),
             _ => return Ok(ReqBody::Opaque(raw)),
         };
-        if !form && escaped_like_json(&text) {
+        if json && !is_json_document(&text).map_err(|_| unparseable())? {
             return Err(unparseable());
         }
-        Ok(if form {
-            ReqBody::Form(text)
-        } else {
-            ReqBody::Text(text)
-        })
+        let role = if form { Role::Form } else { Role::Body };
+        Ok(ReqBody::Text { text, role })
     }
 
     /// Visit the texts; returns the rewritten body (when a text changed) and
@@ -345,35 +311,12 @@ impl ReqBody {
     fn walk(&mut self, rules: &Rules<'_>, f: Visit<'_>) -> Result<(Option<Bytes>, u32), Refusal> {
         Ok(match self {
             ReqBody::Empty => (None, 0),
-            ReqBody::Json { raw, value } => {
-                let mut track = Tracking {
-                    inner: f,
-                    changed: false,
-                };
-                walk_json(value, rules, &mut track).map_err(|_| unparseable())?;
-                let out = track.changed.then(|| {
-                    let json = serde_json::to_vec(value).unwrap_or_default();
-                    Bytes::from(preserve_numbers(raw, json))
-                });
-                (out, 0)
-            }
-            ReqBody::JsonLines { text, lines } => (
-                walk_json_lines(text, lines, true, false, 0, rules, f)
+            ReqBody::Text { text, role } => (
+                read_text(text, *role, rules, f)
                     .map_err(|_| unparseable())?
                     .map(Bytes::from),
                 0,
             ),
-            ReqBody::Form(text) => (
-                walk_form(text, rules, f)
-                    .map_err(|_| unparseable())?
-                    .map(Bytes::from),
-                0,
-            ),
-            ReqBody::Text(text) => {
-                let mut t = text.clone();
-                visit_body_text(&mut t, rules, f).map_err(|_| unparseable())?;
-                ((t != *text).then(|| Bytes::from(t)), 0)
-            }
             ReqBody::Multipart { raw, boundary } => {
                 let w = walk_multipart(raw, boundary, rules, f).map_err(|_| unparseable())?;
                 (w.body.map(Bytes::from), w.unscanned)
@@ -386,12 +329,8 @@ impl ReqBody {
     fn into_bytes(self) -> Bytes {
         match self {
             ReqBody::Empty => Bytes::new(),
-            ReqBody::Json { raw, .. } | ReqBody::Multipart { raw, .. } | ReqBody::Opaque(raw) => {
-                raw
-            }
-            ReqBody::Form(t) | ReqBody::Text(t) | ReqBody::JsonLines { text: t, .. } => {
-                Bytes::from(t)
-            }
+            ReqBody::Multipart { raw, .. } | ReqBody::Opaque(raw) => raw,
+            ReqBody::Text { text, .. } => Bytes::from(text),
         }
     }
 }
@@ -400,30 +339,18 @@ fn is_json(media: &str) -> bool {
     media == "application/json" || media == "text/json" || media.ends_with("+json")
 }
 
-/// A JSON object or array, if `raw` is one (after a BOM and whitespace).
-/// JSON that names a key twice is refused.
-fn json_container(raw: &[u8]) -> Result<Option<Value>, Refusal> {
-    let start = raw
-        .strip_prefix(b"\xEF\xBB\xBF")
-        .unwrap_or(raw)
-        .iter()
-        .find(|b| !b.is_ascii_whitespace());
-    if !matches!(start, Some(b'{' | b'[')) {
-        return Ok(None);
-    }
-    match body::parse_json_unique(raw) {
-        Ok(v) => Ok(Some(v)),
-        Err(body::JsonError::Invalid) => Ok(None),
-        Err(body::JsonError::DuplicateKey) => Err(unparseable()),
-    }
+/// The request's `Content-Type` (empty when it has none).
+fn content_type(headers: &HeaderMap) -> Result<String, Refusal> {
+    Ok(headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string())
 }
 
 /// The media type (lower-case, without parameters) and the multipart
-/// boundary, from `Content-Type`.
-fn media_type(headers: &HeaderMap) -> (String, Option<String>) {
-    let Some(ct) = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()) else {
-        return (String::new(), None);
-    };
+/// boundary of a `Content-Type`.
+fn media_type(ct: &str) -> (String, Option<String>) {
     let mut parts = ct.split(';');
     let media = parts.next().unwrap_or("").trim().to_ascii_lowercase();
     let boundary = parts
@@ -607,13 +534,16 @@ pub(crate) mod tests {
         engine_with(dir, None, |_| {})
     }
 
-    fn transform(e: &Engine, tweak: impl FnOnce(&mut InterceptConfig)) -> EngineTransform {
+    pub(crate) fn transform(
+        e: &Engine,
+        tweak: impl FnOnce(&mut InterceptConfig),
+    ) -> EngineTransform {
         let mut cfg = InterceptConfig::default();
         tweak(&mut cfg);
         EngineTransform::new(e.clone(), &cfg)
     }
 
-    fn headers(content_type: &str) -> HeaderMap {
+    pub(crate) fn headers(content_type: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         if !content_type.is_empty() {
             h.insert(http::header::CONTENT_TYPE, content_type.parse().unwrap());
@@ -625,11 +555,16 @@ pub(crate) mod tests {
         Bytes::from(serde_json::to_vec(v).unwrap())
     }
 
-    fn rewrite(t: &EngineTransform, host: &str, ct: &str, body: Bytes) -> RequestOutcome {
+    pub(crate) fn rewrite(
+        t: &EngineTransform,
+        host: &str,
+        ct: &str,
+        body: Bytes,
+    ) -> RequestOutcome {
         t.rewrite_request(host, "/x", &headers(ct), body).unwrap()
     }
 
-    fn refusal(t: &EngineTransform, ct: &str, body: impl Into<Bytes>) -> Refusal {
+    pub(crate) fn refusal(t: &EngineTransform, ct: &str, body: impl Into<Bytes>) -> Refusal {
         t.rewrite_request("chatgpt.com", "/x", &headers(ct), body.into())
             .unwrap_err()
     }
@@ -747,8 +682,6 @@ pub(crate) mod tests {
             "hello there\n{\"m\":\"Phone:\\n9876543210\", bad}\n",
             "note\n  [\"Phone:\\n9876543210\"\n",
             "note\r\n\"Phone:\\n9876543210\r\n",
-            "note\n{\"m\":\"Phone:\\n9876543210\"}\n",
-            "a=1\n\t\"Phone:\\t9876543210\"",
         ] {
             for ct in ["text/plain", "text/plain;charset=utf-8", ""] {
                 let r = refusal(&t, ct, body.to_string());
@@ -758,6 +691,15 @@ pub(crate) mod tests {
                     "{ct} {body:?}"
                 );
             }
+        }
+        // A line that is JSON is read as JSON (round 2: JSON among text,
+        // as in a multipart body read as text), its value redacted.
+        for (body, secret) in [
+            ("note\n{\"m\":\"Phone:\\n9876543210\"}\n", "9876543210"),
+            ("a=1\n\t\"Phone:\\t9876543210\"", "9876543210"),
+        ] {
+            let out = rewrite(&t, "chatgpt.com", "text/plain", Bytes::from(body));
+            crate::request_readings_tests::assert_gone(body, &out.body, secret);
         }
         // Lines that start like JSON without a backslash, or hold one but
         // do not start like JSON, are text as before.
@@ -1308,15 +1250,27 @@ pub(crate) mod tests {
             "application/octet-stream",
             Bytes::from(arr),
         );
-        assert_eq!(body_text(&out), "[\"[NAME_1]\"]");
-        // Anything else of an opaque type is still forwarded unscanned.
+        // Only the string changes: the byte-order mark stays.
+        assert_eq!(body_text(&out), "\u{feff}[\"[NAME_1]\"]");
+        // Any other UTF-8 text of an opaque type is read as text too;
+        // binary data is forwarded unscanned.
         let out = rewrite(
             &t,
             "chatgpt.com",
             "application/octet-stream",
-            Bytes::from("{x"),
+            Bytes::from("{x Ravi Kumar"),
         );
-        assert_eq!((body_text(&out).as_str(), out.unscanned), ("{x", 1));
+        assert_eq!(
+            (body_text(&out).as_str(), out.unscanned),
+            ("{x [NAME_1]", 0)
+        );
+        let out = rewrite(
+            &t,
+            "chatgpt.com",
+            "application/octet-stream",
+            Bytes::from_static(b"\x89PNG\xff Ravi Kumar"),
+        );
+        assert_eq!(out.unscanned, 1);
     }
 
     /// Reviewer probes (I3, M4): a form or text body that is not UTF-8
@@ -1472,7 +1426,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             body_text(&out),
-            r#"{"href":"https://www.perplexity.ai/search?q=mail+%5BEMAIL_1%5D+about+it#x","id":"https://chatgpt.com/c/1?r=2"}"#
+            r#"{"href":"https://www.perplexity.ai/search?q=mail%20%5BEMAIL_1%5D%20about%20it#x","id":"https://chatgpt.com/c/1?r=2"}"#
         );
         // A URL inside prose, in a JSON string or a text body.
         let out = rewrite(
@@ -1935,13 +1889,22 @@ pub(crate) mod tests {
                 .replace("I am Ravi Kumar", "I am [NAME_1]")
         );
         assert_eq!(out.unscanned, 1);
+        // Binary data is unscanned; UTF-8 text is read whatever its type.
+        let binary = Bytes::from_static(b"\x89PNG\r\n\x1a\n\xff Ravi Kumar");
+        let out = rewrite(
+            &t,
+            "example.com",
+            "application/octet-stream",
+            binary.clone(),
+        );
+        assert_eq!((&out.body, out.unscanned), (&binary, 1));
         let out = rewrite(
             &t,
             "example.com",
             "application/octet-stream",
             Bytes::from("Ravi Kumar"),
         );
-        assert_eq!((out.body.as_ref(), out.unscanned), (&b"Ravi Kumar"[..], 1));
+        assert_eq!((out.body.as_ref(), out.unscanned), (&b"[NAME_1]"[..], 0));
         // A multipart body without a usable boundary is refused.
         let r = refusal(&t, "multipart/form-data", multipart_body());
         assert_eq!(r.status, 400);
@@ -1954,7 +1917,7 @@ pub(crate) mod tests {
             "{}",
             r.message
         );
-        assert_eq!(refusal(&t, "image/png", "x").status, 415);
+        assert_eq!(refusal(&t, "image/png", binary).status, 415);
         // Text-only multipart is fine in block mode.
         let text_only =
             "--b0\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\nhi\r\n--b0--\r\n";
@@ -2042,7 +2005,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn with_names(dir: &std::path::Path) -> (Arc<NameMl>, EngineTransform) {
+    pub(crate) fn with_names(dir: &std::path::Path) -> (Arc<NameMl>, EngineTransform) {
         let ml = Arc::new(NameMl(Mutex::new(Vec::new())));
         let e = engine_with(dir, Some(ml.clone()), |c| c.detect.model = "names".into());
         (ml, transform(&e, |_| {}))
