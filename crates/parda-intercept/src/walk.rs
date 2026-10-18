@@ -614,6 +614,8 @@ struct Token {
     end: usize,
     num: bool,
     role: Role,
+    /// A value under a timestamp-like key ([`timestamp_key`]).
+    time: bool,
 }
 
 fn skip_ws(b: &[u8], mut i: usize) -> usize {
@@ -638,8 +640,16 @@ fn string_end(b: &[u8], i: usize) -> usize {
 }
 
 /// The strings (keys too) and numbers of the valid JSON value at `i` in
-/// `raw`, in order, with their roles; returns where the value ends.
-fn scan_json(raw: &str, i: usize, role: Role, rules: &Rules<'_>, out: &mut Vec<Token>) -> usize {
+/// `raw`, in order, with their roles; returns where the value ends. `time`:
+/// the value sits under a timestamp-like key.
+fn scan_json(
+    raw: &str,
+    i: usize,
+    role: Role,
+    time: bool,
+    rules: &Rules<'_>,
+    out: &mut Vec<Token>,
+) -> usize {
     let b = raw.as_bytes();
     let i = skip_ws(b, i);
     match b.get(i) {
@@ -653,10 +663,15 @@ fn scan_json(raw: &str, i: usize, role: Role, rules: &Rules<'_>, out: &mut Vec<T
                     end,
                     num: false,
                     role: role.key(),
+                    time: false,
                 });
                 // Past the `:`.
                 i = skip_ws(b, end + 1) + 1;
-                i = skip_ws(b, scan_json(raw, i, role.member(&key, rules), rules, out));
+                let member = role.member(&key, rules);
+                i = skip_ws(
+                    b,
+                    scan_json(raw, i, member, timestamp_key(&key), rules, out),
+                );
                 if b.get(i) == Some(&b',') {
                     i = skip_ws(b, i + 1);
                 }
@@ -666,7 +681,7 @@ fn scan_json(raw: &str, i: usize, role: Role, rules: &Rules<'_>, out: &mut Vec<T
         Some(b'[') => {
             let mut i = skip_ws(b, i + 1);
             while i < b.len() && b[i] != b']' {
-                i = skip_ws(b, scan_json(raw, i, role.item(), rules, out));
+                i = skip_ws(b, scan_json(raw, i, role.item(), time, rules, out));
                 if b.get(i) == Some(&b',') {
                     i += 1;
                 }
@@ -680,6 +695,7 @@ fn scan_json(raw: &str, i: usize, role: Role, rules: &Rules<'_>, out: &mut Vec<T
                 end,
                 num: false,
                 role,
+                time,
             });
             end + 1
         }
@@ -699,6 +715,7 @@ fn scan_json(raw: &str, i: usize, role: Role, rules: &Rules<'_>, out: &mut Vec<T
                 end: i,
                 num: true,
                 role,
+                time,
             });
             i
         }
@@ -722,8 +739,11 @@ struct Part {
     /// A JSON number.
     num: bool,
     /// A number under an identifier key (a timestamp, a counter): kept as
-    /// written, never read (a 10-digit timestamp reads like a phone).
+    /// written; it refuses the request only when certainly a value
+    /// ([`refuses_number`]).
     verbatim: bool,
+    /// A plausible epoch time under a timestamp-like key: never refused.
+    epoch: bool,
     /// Read form-decoded: what replaces encoded text is encoded.
     percent: bool,
     /// A key or value of a form with key rules: what replaces any of it
@@ -735,8 +755,10 @@ impl Part {
     fn json(raw: &str, t: Token, rules: &Rules<'_>) -> Part {
         if t.num {
             // Numbers are text (only the rules find values in them), but
-            // under an identifier key they are identifiers.
-            let verbatim = t.role == Role::Value { skipped: true };
+            // under an identifier key they are identifiers, and so is a
+            // plausible epoch time under a timestamp-like key.
+            let epoch = t.time && epoch_like(&raw[t.start..t.end]);
+            let verbatim = epoch || t.role == Role::Value { skipped: true };
             return Part {
                 start: t.start,
                 end: t.end,
@@ -746,6 +768,7 @@ impl Part {
                 ident: verbatim,
                 num: true,
                 verbatim,
+                epoch,
                 percent: false,
                 encode: false,
             };
@@ -760,6 +783,7 @@ impl Part {
             role: t.role,
             num: false,
             verbatim: false,
+            epoch: false,
             percent: false,
             encode: false,
         }
@@ -786,6 +810,7 @@ impl Part {
             role,
             num: false,
             verbatim: false,
+            epoch: false,
             percent: true,
             encode,
         }
@@ -860,7 +885,7 @@ impl View {
         }
         let mut tokens = Vec::new();
         for d in &docs {
-            scan_json(raw, d.start, role.json_root(), rules, &mut tokens);
+            scan_json(raw, d.start, role.json_root(), false, rules, &mut tokens);
         }
         let mut parts: Vec<Part> = tokens
             .into_iter()
@@ -1111,6 +1136,101 @@ fn read(
     Ok((merge(raw, edits, &view, &json, f)?, has_json))
 }
 
+/// Keys whose numbers may be timestamps: `timestamp`, `ts`, `*_time`,
+/// `*Time`, `*_at`, `*At`, `created*`, `updated*`, `expires*`, `date*`.
+fn timestamp_key(key: &str) -> bool {
+    [
+        "timestamp",
+        "ts",
+        "*_time",
+        "*_at",
+        "created*",
+        "updated*",
+        "expires*",
+        "date*",
+    ]
+    .iter()
+    .any(|p| glob(p, key))
+        || ["Time", "At"]
+            .iter()
+            .any(|s| key.len() > s.len() && key.ends_with(s))
+}
+
+/// A plausible epoch time: seconds, milliseconds or microseconds since
+/// 1970 (2001 to 2286).
+fn epoch_like(number: &str) -> bool {
+    number.parse::<f64>().is_ok_and(|n| {
+        let n = n.abs();
+        (1e9..1e10).contains(&n) || (1e12..1e13).contains(&n) || (1e15..1e16).contains(&n)
+    })
+}
+
+/// A number under an identifier key keeps its value unless what the rules
+/// found in all of it is certainly that kind: an Aadhaar number
+/// (Verhoeff), a card number (Luhn), or an Indian mobile number (`[6-9]`
+/// and nine digits, `91` allowed before). A bare 10-digit run is not
+/// enough, and an epoch time under a timestamp-like key never is.
+fn refuses_number(p: &Part, kinds: &[String]) -> bool {
+    let d = p.text.as_str();
+    if p.epoch || d.is_empty() || !d.bytes().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let mobile = |d: &str| d.len() == 10 && matches!(d.as_bytes()[0], b'6'..=b'9');
+    kinds.iter().any(|k| match k.as_str() {
+        "Aadhaar" => d.len() == 12 && d.as_bytes()[0] >= b'2' && verhoeff(d),
+        "CreditCard" => (13..=19).contains(&d.len()) && luhn(d),
+        "Phone" => mobile(d) || d.strip_prefix("91").is_some_and(mobile),
+        _ => false,
+    })
+}
+
+fn luhn(digits: &str) -> bool {
+    let sum: u32 = digits
+        .bytes()
+        .rev()
+        .enumerate()
+        .map(|(i, c)| {
+            let d = u32::from(c - b'0');
+            match (i % 2, d * 2) {
+                (1, x) if x > 9 => x - 9,
+                (1, x) => x,
+                _ => d,
+            }
+        })
+        .sum();
+    sum.is_multiple_of(10)
+}
+
+fn verhoeff(digits: &str) -> bool {
+    const D: [[u8; 10]; 10] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        [1, 2, 3, 4, 0, 6, 7, 8, 9, 5],
+        [2, 3, 4, 0, 1, 7, 8, 9, 5, 6],
+        [3, 4, 0, 1, 2, 8, 9, 5, 6, 7],
+        [4, 0, 1, 2, 3, 9, 5, 6, 7, 8],
+        [5, 9, 8, 7, 6, 0, 4, 3, 2, 1],
+        [6, 5, 9, 8, 7, 1, 0, 4, 3, 2],
+        [7, 6, 5, 9, 8, 2, 1, 0, 4, 3],
+        [8, 7, 6, 5, 9, 3, 2, 1, 0, 4],
+        [9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+    ];
+    const P: [[u8; 10]; 8] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        [1, 5, 7, 6, 2, 8, 3, 0, 9, 4],
+        [5, 8, 0, 3, 7, 9, 6, 1, 4, 2],
+        [8, 9, 1, 6, 0, 4, 3, 5, 2, 7],
+        [9, 4, 5, 3, 1, 2, 6, 8, 7, 0],
+        [4, 2, 8, 6, 5, 7, 3, 9, 0, 1],
+        [2, 7, 9, 3, 8, 0, 6, 4, 1, 5],
+        [7, 0, 4, 6, 9, 1, 3, 2, 5, 8],
+    ];
+    let mut c = 0u8;
+    for (i, ch) in digits.bytes().rev().enumerate() {
+        c = D[c as usize][P[i % 8][(ch - b'0') as usize] as usize];
+    }
+    c == 0
+}
+
 /// The view of the literal reading that the rules make of the unmasked text
 /// (identifiers included).
 const UNMASKED: usize = usize::MAX;
@@ -1157,7 +1277,7 @@ fn merge(
             // request is refused.
             let p = &view.parts[e.view - 1];
             if p.verbatim {
-                if e.start <= p.start && p.end <= e.end {
+                if e.start <= p.start && p.end <= e.end && refuses_number(p, &e.kinds) {
                     return Err(Malformed);
                 }
                 forget(&e.kinds);
@@ -1241,7 +1361,9 @@ fn merge(
                         continue;
                     }
                     if p.verbatim {
-                        if unmasked && start <= p.start && p.end <= end {
+                        let found = kinds.as_deref().unwrap_or_default();
+                        if unmasked && start <= p.start && p.end <= end && refuses_number(p, found)
+                        {
                             return Err(Malformed);
                         }
                         continue;
@@ -1935,6 +2057,68 @@ mod tests {
         let r = rules(&h, &[], "chatgpt.com");
         let mut f = Finder::new(needles);
         Ok(read_text(raw, role, &r, &mut f)?.unwrap_or_else(|| raw.to_string()))
+    }
+
+    #[test]
+    fn identifier_numbers_are_checked_before_they_refuse() {
+        assert!(verhoeff("234567890124") && !verhoeff("234567890125"));
+        assert!(luhn("4111111111111111") && !luhn("4111111111111112"));
+        for k in [
+            "timestamp",
+            "ts",
+            "create_time",
+            "created_at",
+            "createdAt",
+            "expires",
+            "updated",
+            "dateSent",
+            "startTime",
+        ] {
+            assert!(timestamp_key(k), "{k}");
+        }
+        for k in ["id", "user_id", "status", "At", "data"] {
+            assert!(!timestamp_key(k), "{k}");
+        }
+        for n in [
+            "1760000000",
+            "1760000000.5",
+            "1760000000123",
+            "1760000000123456",
+        ] {
+            assert!(epoch_like(n), "{n}");
+        }
+        // A 10-digit mobile number is in the seconds range and a 16-digit
+        // card in the microseconds range: under a timestamp-like key they
+        // are kept, as ruled.
+        assert!(epoch_like("9876543210") && epoch_like("4111111111111111"));
+        for n in ["17600000000", "234567890124", "41111111111111", "176000000"] {
+            assert!(!epoch_like(n), "{n}");
+        }
+        let part = |text: &str, epoch| Part {
+            start: 0,
+            end: text.len(),
+            text: text.into(),
+            map: Vec::new(),
+            role: Role::Ident,
+            ident: true,
+            num: true,
+            verbatim: true,
+            epoch,
+            percent: false,
+            encode: false,
+        };
+        let k = |s: &str| vec![s.to_string()];
+        assert!(refuses_number(&part("9876543210", false), &k("Phone")));
+        assert!(refuses_number(&part("919876543210", false), &k("Phone")));
+        assert!(!refuses_number(&part("1760000000", false), &k("Phone")));
+        assert!(!refuses_number(&part("9876543210", true), &k("Phone")));
+        assert!(refuses_number(&part("234567890124", false), &k("Aadhaar")));
+        assert!(!refuses_number(&part("234567890125", false), &k("Aadhaar")));
+        assert!(refuses_number(
+            &part("4111111111111111", false),
+            &k("CreditCard")
+        ));
+        assert!(!refuses_number(&part("9876543210.5", false), &k("Phone")));
     }
 
     #[test]

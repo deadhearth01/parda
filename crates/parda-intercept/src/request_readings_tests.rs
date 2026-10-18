@@ -689,27 +689,45 @@ mod generated {
     }
 }
 
-/// Scan on 31c4d85, ruling 1: numbers under identifier keys still meet the
-/// rules. One that is a phone, card or Aadhaar number refuses the request
-/// (a string would break its type); a timestamp whose digits merely contain
-/// a phone-shaped run is kept. A value the rules see across identifier
-/// parts is not hidden from them.
+/// Scan on 31c4d85, ruling 1, and the follow-up ruling: numbers under
+/// identifier keys still meet the rules. One that is certainly a value (an
+/// Aadhaar number by Verhoeff, a card by Luhn, a valid Indian mobile)
+/// refuses the request, as a string would break its type. A bare 10-digit
+/// run is not enough, and an epoch time under a timestamp-like key is never
+/// refused or rewritten.
 #[test]
 fn identifier_numbers_meet_the_rules() {
     let dir = tempfile::tempdir().unwrap();
     let t = transform(&engine(dir.path()), |_| {});
     for body in [
-        "{\"id\":9876543210}",
+        "{\"id\":234567890124}",
         "{\"order_id\":4111111111111111}",
-        "{\"timestamp\":234567890124}",
+        "{\"user_id\":9876543210}",
     ] {
         for ct in ["application/json", "text/plain"] {
             assert_unparseable(body, &send(&t, ct, body).unwrap_err());
         }
     }
-    let body = "{\"create_time\":1760000000.123,\"parent_message_id\":\"client-created-root\"}";
-    let out = send(&t, "application/json", body).unwrap();
-    assert_eq!(out.body, body);
+    for body in [
+        "{\"timestamp\":1760000000}",
+        "{\"created_at\":1760000000123}",
+        "{\"expires\":1760000000.5}",
+        "{\"ts\":1760000000123456,\"updatedAt\":1760000000}",
+        "{\"create_time\":1760000000.123,\"parent_message_id\":\"client-created-root\"}",
+        // Not certainly a value: a bare 10-digit run (no mobile prefix),
+        // digits that fail the checksum.
+        "{\"id\":1234567890}",
+        "{\"conversation_id\":234567890125}",
+        "{\"order_id\":4111111111111112}",
+    ] {
+        for ct in ["application/json", "text/plain"] {
+            let out = send(&t, ct, body).unwrap_or_else(|r| panic!("{body}: {}", r.message));
+            assert_eq!(out.body, body, "{ct}");
+        }
+    }
+    // Outside identifier keys a number is text: a phone there is redacted.
+    let out = send(&t, "application/json", "{\"phone\":9876543210}").unwrap();
+    assert_gone("phone", &out.body, "9876543210");
 }
 
 /// Scan on 31c4d85, ruling 2: past the reading depth parda fails closed.

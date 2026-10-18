@@ -113,9 +113,12 @@ Tags follow `replace.style` (there is no separate style for intercept).
     escaped, percent-encoded), so no reading of the forwarded body holds it: an escape such as
     `\n9876543210` cannot hide a number, nor `+` or `%40` a name or an e-mail. Numbers are text:
     one that holds a value becomes a JSON string holding its tag. Under identifier keys
-    (`create_time`, `*_id`) numbers meet the rules only and are kept as written, unless a rule finds
-    the whole number (an id that is a phone, card or Aadhaar number): then the request is refused,
-    as a string in its place would break its type. A value the whole text shows but
+    (`create_time`, `*_id`) numbers meet the rules only and are kept as written, unless the whole
+    number is certainly a value (an Aadhaar number passing Verhoeff, a card passing Luhn, a valid
+    Indian mobile): then the request is refused, as a string in its place would break its type. An
+    epoch time (seconds, milliseconds or microseconds) under a timestamp-like key (`timestamp`,
+    `ts`, `*_time`, `*Time`, `*_at`, `*At`, `created*`, `updated*`, `expires*`, `date*`) is never
+    refused or rewritten. A value the whole text shows but
     single tokens do not (`{"Ravi":"Kumar"}`) is replaced in each token it covers. Text that looks
     like escaped JSON (starting with `{`, `[` or `"`, or a line that does, holding a backslash;
     inside a body, text bracketed like JSON) but is not JSON is refused; what the user typed under
@@ -145,7 +148,7 @@ Tags follow `replace.style` (there is no separate style for intercept).
 
     | Status and code | When |
     |---|---|
-    | `400 parda_unparseable_body` | a body or multipart field typed as JSON that is not JSON; text that looks like escaped JSON but is not JSON (see above); a number under an identifier key that is wholly a phone, card or Aadhaar number; text past the reading depth that is still encoded; a JSON key given twice (anywhere, JSON inside strings, forms and queries included); two keys that redaction would make the same; a multipart body without a boundary, that does not split as RFC 2046 says, or whose preamble or epilogue holds the boundary |
+    | `400 parda_unparseable_body` | a body or multipart field typed as JSON that is not JSON; text that looks like escaped JSON but is not JSON (see above); a number under an identifier key that is wholly a checksum-valid Aadhaar or card number or a valid Indian mobile; text past the reading depth that is still encoded; a JSON key given twice (anywhere, JSON inside strings, forms and queries included); two keys that redaction would make the same; a multipart body without a boundary, that does not split as RFC 2046 says, or whose preamble or epilogue holds the boundary |
     | `400 parda_not_utf8` | a body of any type declaring a charset other than UTF-8 or US-ASCII; a `Content-Type` holding bytes outside visible ASCII, or two different ones; a form or `text/*` body that is not UTF-8 or holds NUL bytes (UTF-16) |
     | `413 parda_body_too_large` | a body too large to filter |
     | `415 parda_unsupported_encoding` | a `content-encoding` parda cannot decode |
