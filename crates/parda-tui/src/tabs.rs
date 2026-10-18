@@ -436,18 +436,18 @@ fn activity(app: &App, f: &mut Frame, area: Rect) {
         let h = per.min(inner.bottom() - y);
         f.render_widget(
             Paragraph::new(Span::styled(label, dim())),
-            Rect::new(inner.x, y, label_w, 1),
+            Rect::new(inner.x, y, label_w, 1).intersection(inner),
         );
         f.render_widget(
             Sparkline::default()
                 .data(&data)
                 .bar_set(symbols::bar::NINE_LEVELS)
                 .style(style),
-            Rect::new(inner.x + label_w, y, spark_w, h),
+            Rect::new(inner.x + label_w, y, spark_w, h).intersection(inner),
         );
         f.render_widget(
             Paragraph::new(Span::raw(value)),
-            Rect::new(inner.x + label_w + spark_w + 1, y, value_w, 1),
+            Rect::new(inner.x + label_w + spark_w + 1, y, value_w, 1).intersection(inner),
         );
     }
 }

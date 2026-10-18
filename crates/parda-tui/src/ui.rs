@@ -405,7 +405,7 @@ fn toasts(app: &App, f: &mut Frame, body: Rect) {
         .map(|t| t.text.chars().count() as u16 + 4)
         .max()
         .unwrap_or(20);
-    let w = longest.clamp(24, max_w);
+    let w = longest.min(max_w).max(24.min(max_w));
     let inner = (w - 2) as usize;
     let lines_n: u16 = app
         .toasts
@@ -506,6 +506,9 @@ fn confirm(app: &App, c: &Confirm, f: &mut Frame, area: Rect) {
 
 fn palette_overlay(app: &App, f: &mut Frame, area: Rect) {
     let Some(p) = &app.palette else { return };
+    if area.height < 3 {
+        return;
+    }
     let entries = app.palette_entries();
     let matches = palette::filter(&entries, &p.query);
     let w = area.width.saturating_sub(4).min(68);
@@ -513,7 +516,8 @@ fn palette_overlay(app: &App, f: &mut Frame, area: Rect) {
         .height
         .saturating_sub(2)
         .min(matches.len() as u16 + 4)
-        .max(5);
+        .max(5)
+        .min(area.height.saturating_sub(1));
     let r = Rect::new(area.x + (area.width - w) / 2, area.y + 1, w, h);
     f.render_widget(Clear, r);
     let b = Block::default()

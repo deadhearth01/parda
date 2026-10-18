@@ -1461,7 +1461,11 @@ fn i4_a_failed_rules_save_leaves_no_phantom_rule() {
     assert!(!render_text(&app, 80, 24).contains("Phantom"));
     // A delete that fails comes back too.
     press(&mut app, &mut b, KeyCode::Char('d'));
-    assert!(app.rule_rows().iter().any(|(_, t)| t.contains("Ravi Kumar")));
+    assert!(
+        app.rule_rows()
+            .iter()
+            .any(|(_, t)| t.contains("Ravi Kumar"))
+    );
     // And a later successful save applies normally.
     b.fail_rules_set = false;
     press(&mut app, &mut b, KeyCode::Char('w'));
@@ -1469,4 +1473,109 @@ fn i4_a_failed_rules_save_leaves_no_phantom_rule() {
     press(&mut app, &mut b, KeyCode::Enter);
     assert!(b.rules.contains("Acme"));
     assert!(app.rule_rows().iter().any(|(_, t)| t == "Acme"));
+}
+
+/// Every screen the app can show, set up on a fresh app.
+fn all_screens() -> Vec<(&'static str, App)> {
+    type Setup = fn(&mut App, &mut Fake);
+    let setups: Vec<(&'static str, Setup)> = vec![
+        ("dashboard", |app, _| {
+            let mut st = app.status.clone().unwrap();
+            st["intercept"] = json!({"enabled": true, "listening": null, "ca": false,
+                                     "error": null, "pac": "http://127.0.0.1:8788/parda.pac"});
+            st["model"] = Value::Null;
+            st["model_error"] = json!("model file missing");
+            app.status = Some(st);
+        }),
+        ("live", |app, b| {
+            press(app, b, KeyCode::Char('2'));
+            press(app, b, KeyCode::Char('/'));
+            typ(app, b, "a");
+            press(app, b, KeyCode::Enter);
+            press(app, b, KeyCode::Enter);
+        }),
+        ("inspector", |app, b| {
+            press(app, b, KeyCode::Char('3'));
+            press(app, b, KeyCode::Char('i'));
+            typ(app, b, "hi Ravi Kumar");
+            press(app, b, KeyCode::Enter);
+            app.inspector.busy = true;
+        }),
+        ("rules", |app, b| {
+            press(app, b, KeyCode::Char('4'));
+            press(app, b, KeyCode::Enter);
+            press(app, b, KeyCode::Char('/'));
+        }),
+        ("vault", |app, b| {
+            press(app, b, KeyCode::Char('5'));
+            press(app, b, KeyCode::Enter);
+        }),
+        ("settings editor", |app, b| {
+            select_setting(app, b, crate::settings::Setting::Threshold);
+            press(app, b, KeyCode::Enter);
+            typ(app, b, "x");
+            press(app, b, KeyCode::Enter);
+        }),
+        ("palette", |app, b| press(app, b, KeyCode::Char(':'))),
+        ("help", |app, b| press(app, b, KeyCode::Char('?'))),
+        ("toasts", |app, _| {
+            for i in 0..3 {
+                app.toast(
+                    format!("{i} a rather long message that has to wrap over several lines here"),
+                    crate::Level::Warn,
+                );
+            }
+        }),
+        ("confirm", |app, b| {
+            press(app, b, KeyCode::Char('5'));
+            press(app, b, KeyCode::Char('w'));
+        }),
+        ("prompt", |app, b| {
+            press(app, b, KeyCode::Char('4'));
+            press(app, b, KeyCode::Char('a'));
+            typ(app, b, "Zubin");
+        }),
+        ("offline", |app, b| {
+            b.online = false;
+            app.request_refresh();
+            app.sync(b);
+        }),
+        ("starting", |app, b| {
+            b.online = false;
+            app.request_refresh();
+            app.sync(b);
+            app.starting = Some(Instant::now());
+        }),
+    ];
+    setups
+        .into_iter()
+        .map(|(name, f)| {
+            let mut b = fake();
+            let mut app = live_app(&mut b);
+            press(&mut app, &mut b, KeyCode::Char('1'));
+            f(&mut app, &mut b);
+            (name, app)
+        })
+        .collect()
+}
+
+#[test]
+fn i5_every_screen_renders_at_every_size_without_panicking() {
+    let widths: Vec<u16> = (1..=40).chain((41..=100).step_by(3)).chain([100]).collect();
+    let mut failures = Vec::new();
+    for (name, app) in all_screens() {
+        'screen: for &w in &widths {
+            for h in 1..=40u16 {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    render_text(&app, w, h);
+                }));
+                if r.is_err() {
+                    // The first size per screen is enough to go on.
+                    failures.push(format!("{name} at {w}×{h}"));
+                    break 'screen;
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "panics: {failures:?}");
 }
