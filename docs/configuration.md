@@ -233,11 +233,18 @@ settings.
 
 ## Changing settings
 
-- **TUI** (`parda tui`, tab 6 *Settings*): every option above as a list. ↑↓ or the mouse wheel selects,
-  Enter / Space / click changes the value, ← or right-click goes back. Options marked ↻ take effect
-  after the daemon restarts (the AI-sites rows apply at once). Turning on `privacy.log_values` asks
-  for confirmation.
-- **Protection switch**: `p` anywhere in the TUI, a click on the header switch, or `parda off` /
+- **TUI** (`parda` or `parda tui`, tab 6 *Settings*): every option above as a list. ↑↓ / `jk` or the
+  mouse wheel selects. Switches toggle with Enter / Space / click; choices cycle with Enter / → / click
+  and go back with ← or right-click; numbers (model threshold 0.30–0.95, model time budget 10–60000
+  ms, vault TTL 1–3650 days) and text (model id, agent proxy and intercept listener addresses —
+  `IP:PORT` or `localhost:PORT`, loopback only, except that the agent proxy takes any address
+  when `proxy.allow_non_loopback = true` — and the paste-safe hotkey) open an inline editor on
+  Enter: the value is checked before it is sent, Esc cancels, and the daemon's answer appears as a
+  message (pasting works too; a newline in a paste never submits). ←/→ step numbers to the next
+  larger / smaller preset. Options marked ↻ take effect after the daemon restarts (the AI-sites
+  rows apply at once). Turning on `privacy.log_values` asks for confirmation. The command palette
+  (`:` or Ctrl-K) also switches intercept, the agent proxy, the clipboard, mode and style by name.
+- **Protection switch**: `p` anywhere in the TUI, a click on the status-bar badge, or `parda off` /
   `parda on`. While off, every surface (proxy, paste-safe, `parda redact`) passes text through
   unchanged and records a warning event; stand-ins sent earlier are still restored in answers.
 - **By hand**: edit `config.toml`, then `parda` picks it up on the next daemon start (or send a reload

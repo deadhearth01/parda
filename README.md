@@ -120,8 +120,20 @@ export OPENAI_BASE_URL=http://127.0.0.1:8787/v1     # Codex CLI, OpenAI SDKs
 #    (parda env claude | parda env codex prints the exact lines and the config-file equivalents)
 
 # 4. watch it work — dashboard with live feed and every setting (keyboard or mouse)
-parda tui
+parda            # alone in a terminal opens the dashboard (same as `parda tui`)
 ```
+
+**The dashboard.** `parda` opens it; if the daemon is not running it says so and `s` (only `s`) starts
+it in the background — the login service if `parda service install` set one up *for the same
+PARDA_HOME*, else a detached `parda daemon` for this home. A daemon that runs but does not answer, or
+speaks another protocol version, is shown as such (no start key).
+`:` or Ctrl-K opens a command palette with every action; `1`–`6` / Tab switch tabs; arrows or `hjkl`,
+`g`/`G`, PgUp/PgDn move; `/` filters Live, Rules and Vault; Enter opens details; Esc backs out; `?`
+lists every key; the bottom line always shows the keys that work right now. Live pauses with Space and
+filters by surface (`f`) and kind (`t`) — kinds and counts only, never values. Settings are edited in
+place: switches toggle, choices cycle, numbers and addresses open a validated inline editor. Mouse
+works throughout. `NO_COLOR=1` gives a monochrome screen, `PARDA_ASCII=1` plain ASCII borders, and
+`parda tui --dump` prints every tab as text.
 
 Try it without any AI:
 
@@ -245,7 +257,7 @@ Stale requests (older than 2 s) are dropped, so a slow scan can never paste into
 ### 8. Daemon, dashboard and CLI
 
 - **One daemon process** hosts the proxy, interception, clipboard and engine.
-- **CLI and dashboard:** the `parda` CLI and the ratatui dashboard (`parda tui`: mouse, live feed, every setting) talk to it over a local socket — a `0700` Unix socket, or a per-user named pipe with an owner-only ACL on Windows.
+- **CLI and dashboard:** the `parda` CLI and the ratatui dashboard (`parda` alone, or `parda tui`: command palette, filterable live feed, every setting editable in place, mouse) talk to it over a local socket; the dashboard does its socket work on a background thread and redraws only when something changed — a `0700` Unix socket, or a per-user named pipe with an owner-only ACL on Windows.
 - **Logging:** events carry kinds, counts and timings, never values.
 - **Start at login:** `parda service install` sets this up with launchd (macOS), a systemd user unit (Linux) or Task Scheduler (Windows).
 
@@ -336,7 +348,8 @@ Full reference: [docs/configuration.md](docs/configuration.md). Every option is 
 ## Commands
 
 ```text
-parda setup | doctor | status | tui | on | off | stop
+parda                      # in a terminal: the dashboard (else this help)
+parda setup | doctor | status | tui [--dump] | on | off | stop
 parda redact | restore | scan [TEXT|-] [--scope S] [--json]
 parda paste-safe
 parda rules show | edit | add-person NAME | allow TERM

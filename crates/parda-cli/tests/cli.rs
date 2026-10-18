@@ -316,3 +316,32 @@ fn intercept_help_lists_on_off_and_status() {
         .stdout(predicate::str::contains("on").and(predicate::str::contains("off")))
         .stdout(predicate::str::contains("changes nothing"));
 }
+
+#[test]
+fn parda_alone_without_a_terminal_prints_help_and_starts_nothing() {
+    // Under the test harness stdin/stdout are pipes: scripts get the short
+    // help, not a dashboard, and no daemon is started.
+    let h = home();
+    parda(&h)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: parda"))
+        .stdout(predicate::str::contains("tui"))
+        .stdout(
+            predicate::str::contains("Run `parda` alone in a terminal for the dashboard").not(),
+        );
+    assert!(
+        !h.path().join("logs").join("daemon.out.log").exists(),
+        "nothing was started"
+    );
+}
+
+#[test]
+fn tui_dump_without_a_daemon_still_fails_cleanly() {
+    let h = home();
+    parda(&h)
+        .args(["tui", "--dump"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot reach the daemon"));
+}
