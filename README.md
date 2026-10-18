@@ -94,7 +94,7 @@ WITH parda      Claude Code ──► parda (127.0.0.1:8787, on your Mac) ──
 | Where you talk to AI | How parda gets in the way | Status |
 |---|---|---|
 | **Claude Code, Codex CLI, Anthropic / OpenAI SDKs, OpenAI-compatible tools** | Set the tool's base URL to parda (one environment variable). Every request, streamed answer and tool call is filtered. | ✅ ready |
-| **Any chat website or desktop app** (ChatGPT, Claude, Gemini, Copilot, Perplexity, DeepSeek …) | **System-wide interception:** an auto-proxy rule sends *only AI sites* through parda, which filters what you type in real time. Needs a one-time certificate approval. Banking, mail and every other site are never touched. | 🚧 in development |
+| **Any chat website or desktop app** (ChatGPT, Claude, Gemini, Copilot, Perplexity, DeepSeek …) | **System-wide interception:** an auto-proxy rule sends *only AI sites* through parda, which filters what you type in real time. Needs a one-time certificate approval. Banking, mail and every other site are never touched. | 🧪 beta (macOS) |
 | **Any app, today** | **Paste-safe hotkey:** copy your text, press ⌘⌥V (macOS) / Ctrl+Alt+V instead of ⌘V; parda pastes the tagged version. Copying the AI's answer puts the real values back on your clipboard. | ✅ ready |
 | **Scripts and pipes** | `parda redact` / `parda restore` on the command line. | ✅ ready |
 | Images, PDFs, Office files inside requests | Forwarded **unscanned** with a warning (or refused with `unscanned_media = "block"`). | ⏳ planned |
@@ -119,9 +119,19 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8787     # Claude Code, Anthropic SDK
 export OPENAI_BASE_URL=http://127.0.0.1:8787/v1     # Codex CLI, OpenAI SDKs
 #    (parda env claude | parda env codex prints the exact lines and the config-file equivalents)
 
-# 4. watch it work — dashboard with live feed and every setting (keyboard or mouse)
+# 4. protect AI websites and desktop apps (ChatGPT, Claude, Gemini …) — beta, macOS tested
+parda ca install     # creates parda's local certificate; your OS asks you to trust it (once)
+parda intercept on   # routes only AI sites through parda; `parda intercept off` undoes it
+#    then fully quit and reopen your browser
+
+# 5. watch it work — dashboard with live feed and every setting (keyboard or mouse)
 parda            # alone in a terminal opens the dashboard (same as `parda tui`)
 ```
+
+**Check that a website is protected.** With interception on, the chat looks the same — you see your
+own text, the site only ever receives tags, and parda puts the real values back into the answer. To see
+it, keep the dashboard on the Live tab (`2`) while you chat, or ask the AI to spell your name letter by
+letter with spaces: it can only spell the tag (`[ N A M E _ 1 ]`).
 
 **The dashboard.** `parda` opens it; if the daemon is not running it says so and `s` (only `s`) starts
 it in the background — the login service if `parda service install` set one up *for the same
@@ -178,7 +188,7 @@ A value introduced by its own name is masked even when it is not a valid ID: `my
  Codex, SDKs     │  Anthropic / OpenAI Chat /   │                                                               │    api.openai.com
                  │  OpenAI Responses, SSE        │      ┌─────────────── engine ───────────────┐                 │    (or any compatible
  browsers, apps ►│ interception 127.0.0.1:8788 ─┼─────►│ 1 detect  dictionary · rules · model │                 │     upstream)
- (AI hosts only) │  (in development)            │      │ 2 policy  redact / block / warn / ignore               │
+ (AI hosts only) │  (beta)                      │      │ 2 policy  redact / block / warn / ignore               │
  clipboard ─────►│ paste-safe + restore-on-copy ┘      │ 3 tag     [NAME_1] … via encrypted vault│                │
                  │                                     │ 4 restore answers, streams, tool calls │                │
  parda CLI/TUI ─►│ local socket (IPC)  ◄── events: kinds, counts, latency — never values        │                │
@@ -231,7 +241,7 @@ Every finding has a kind and a tier. Per-kind actions (`redact`, `block`, `warn`
   - rejects non-loopback peers, browser `Origin` headers and DNS-rebinding `Host` values.
 - **Auth:** API keys pass through untouched and are never logged.
 
-### 6. System-wide interception (in development)
+### 6. System-wide interception (beta)
 
 - **Routing:** a PAC (proxy auto-config) rule sends **only listed AI hosts** to parda; everything else goes direct and is never decrypted.
 - **Decryption:** for AI hosts, parda terminates TLS with a local root certificate that you approve once in your OS. It is generated on your machine and its private key never leaves it.
@@ -240,7 +250,9 @@ Every finding has a kind and a tier. Per-kind actions (`redact`, `block`, `warn`
 - **Turning it on:** `parda ca create`, then `parda ca install` (your OS asks you to approve the certificate), then `parda intercept on` — it checks the certificate is trusted, starts the listener in the daemon and points every enabled network service's automatic proxy setting at parda, printing what it changed. Firefox uses its own settings; `on` prints the two to set.
 - **Checking it:** `parda intercept status` shows the certificate, the listener, each network service's current setting and the site list, and changes nothing. `parda doctor` warns when the system still sends AI sites to parda while nothing listens.
 - **Turning it off:** `parda intercept off` restores your previous network settings exactly (it also works with the daemon stopped or after a crash). A setting you changed yourself meanwhile is left as it is; one that cannot be put back keeps parda filtering and makes the command fail, so you can run it again. Without saved settings (data folder cleaned, another `PARDA_HOME`) it switches off any parda automatic proxy setting it finds; if the saved file is damaged, `parda intercept off --forget` does that and moves the file aside.
-- **When parda isn't running:** the PAC file is unreachable and the system goes direct, so a stopped parda never breaks your internet. The dashboard shows whether protection is active.
+- **When parda isn't running:** listed AI sites do not load (they are never sent unfiltered); every other site is unaffected. Start parda again, or run `parda intercept off`. `parda doctor` and the dashboard warn about this state.
+- **What gets values back:** answers to your own messages and your own chat history on chatgpt.com, claude.ai and gemini.google.com; streamed answers on the other listed sites. Real values are never put back inside links, images, HTML or styles, and each site only gets back values that were sent to that same site.
+- **Known beta limits:** Gemini history shows tags; sites change their internal formats without notice (a site that breaks can be left out with `intercept.hosts`); file uploads are forwarded unscanned (or refused with `intercept.unscanned = "block"`); WebSocket chats are not filtered.
 
 ### 7. Clipboard paste-safe
 
@@ -311,7 +323,7 @@ parda's model is **`parda-pii-edge`**, an India-first fine-tune of [knowledgator
 
 - **No detector is perfect.** Unusual names in long, dense messages can be missed: about 1 in 100 hand-written test cases still leaks one value. Add the people who matter most with `parda rules add-person "Full Name"`; dictionary entries are always masked.
 - **Pictures and files** inside requests are not scanned yet.
-- **Typing directly into chat websites and apps** is protected only once system-wide interception ships; until then, use paste-safe.
+- **Typing directly into chat websites and apps** is protected with system-wide interception (beta). The site's own page scripts still see what you type before parda filters network traffic, and only listed AI hosts are covered — not third-party analytics on those pages.
 - **The AI can still infer public facts.** parda hides *your* data, not public knowledge.
 
 ---
@@ -383,7 +395,8 @@ Rust 1.89+ (edition 2024). See [CONTRIBUTING.md](CONTRIBUTING.md).
 | `parda-vault` | encrypted mapping store, key storage, tag and stand-in generators |
 | `parda-engine` | detect → policy → tag → self-check → restore, caches, streaming restorer |
 | `parda-proxy` | agent API proxy (Anthropic, OpenAI Chat, OpenAI Responses) |
-| `parda-intercept` | system-wide HTTPS interception for AI hosts (in development) |
+| `parda-intercept` | system-wide HTTPS interception for AI hosts (beta) |
+| `parda-wire` | shared body decoding, SSE parsing, JSON-fragment restore and the URL guard |
 | `parda-clip` | clipboard watcher, paste-safe, hotkey |
 | `parda-ipc`, `parda-daemon` | local socket protocol, the background daemon, login service |
 | `parda-tui`, `parda-cli` | dashboard and the `parda` command |
@@ -392,7 +405,7 @@ Rust 1.89+ (edition 2024). See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Roadmap
 
-System-wide interception for every chat website and desktop app (in progress) · INT8 model (3× smaller and faster, needs an ONNX Runtime upgrade) · images and PDFs · more providers (Gemini, Bedrock) · native-script names (Devanagari, Tamil, Bengali …).
+One-step setup (`parda` sets up the certificate and interception itself) · interception hardening for more sites · INT8 model (3× smaller and faster, needs an ONNX Runtime upgrade) · images and PDFs · more providers (Gemini, Bedrock) · native-script names (Devanagari, Tamil, Bengali …).
 
 ## License
 

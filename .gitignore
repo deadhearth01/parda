@@ -13,5 +13,5 @@
 /training/out/
 __pycache__/
 *.pyc
-/.parda-home/
+/.parda-home*/
 /.worktrees/
