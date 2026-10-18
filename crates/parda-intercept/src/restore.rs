@@ -152,30 +152,50 @@ fn build(
     }
 }
 
-/// The `Content-Type` a response is restored by: `""` when there is none
-/// (or it is not visible ASCII, which restores nothing), the first one
-/// when every one has the same media type (ASCII case and parameters
-/// aside), and `None` when several disagree: a client may read such a
-/// body by another type than parda did, so it passes through unrestored.
+/// The `Content-Type` a response is restored by: `""` when there is none,
+/// the first one when every one has the same media type (ASCII case and
+/// parameters aside), and `None` (the body passes through unrestored, as a
+/// client may read it by another type than parda did) when several
+/// disagree, or when one is empty, does not parse, or lists several types
+/// (a comma outside a quoted string).
 pub(crate) fn response_content_type(headers: &http::HeaderMap) -> Option<String> {
     let mut values = headers.get_all(http::header::CONTENT_TYPE).iter();
     let Some(first) = values.next() else {
         return Some(String::new());
     };
-    let media = |v: &http::HeaderValue| {
-        v.to_str().ok().map(|s| {
-            s.split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase()
-        })
-    };
-    let want = media(first);
-    if values.any(|v| want.is_none() || media(v) != want) {
+    let want = media_type(first)?;
+    if values.any(|v| media_type(v).as_ref() != Some(&want)) {
         return None;
     }
-    Some(first.to_str().unwrap_or("").to_string())
+    first.to_str().ok().map(str::to_string)
+}
+
+/// The lowercased `type/subtype` of one `Content-Type` value; `None` when
+/// it is not visible ASCII, has a comma outside a quoted string or an
+/// unterminated quote, or does not start with `type/subtype` (tokens).
+fn media_type(v: &http::HeaderValue) -> Option<String> {
+    let s = v.to_str().ok()?;
+    let (mut quoted, mut escaped) = (false, false);
+    for c in s.chars() {
+        match (quoted, escaped, c) {
+            (true, true, _) => escaped = false,
+            (true, false, '\\') => escaped = true,
+            (_, false, '"') => quoted = !quoted,
+            (false, _, ',') => return None,
+            _ => {}
+        }
+    }
+    if quoted {
+        return None;
+    }
+    let media = s.split(';').next().unwrap_or("").trim();
+    let token = |t: &str| {
+        !t.is_empty()
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
+    };
+    let (ty, sub) = media.split_once('/')?;
+    (token(ty) && token(sub)).then(|| media.to_ascii_lowercase())
 }
 
 /// A rewriter that changes nothing.
@@ -4254,6 +4274,34 @@ mod tests {
             &[b"application/json\xff", b"application/json\xff"],
         ] {
             assert_eq!(ct(vals), None, "{vals:?}");
+        }
+        // One header holding several types (a comma outside a quoted
+        // string), or one that is empty or does not parse, restores nothing.
+        for v in [
+            &b"text/event-stream, text/html"[..],
+            b"application/json,text/html",
+            b"application/json,",
+            b",application/json",
+            b"text/plain; x=\"a,b\", text/html",
+            b"text/plain; x=\"a,b",
+            b"",
+            b"   ",
+            b"application/json\xff",
+            b"json",
+            b"/json",
+            b"application/",
+            b"application/json/x",
+            b"application json",
+        ] {
+            assert_eq!(ct(&[v]), None, "{:?}", String::from_utf8_lossy(v));
+        }
+        // A comma inside a quoted parameter value is not a list.
+        for v in [
+            "text/plain; x=\"a,b\"",
+            "text/plain; x=\"a\\\",b\"; charset=utf-8",
+            "application/json;charset=utf-8",
+        ] {
+            assert_eq!(ct(&[v.as_bytes()]).as_deref(), Some(v), "{v}");
         }
     }
 

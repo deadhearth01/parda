@@ -812,6 +812,14 @@ async fn conflicting_content_types_pass_through_unrestored() {
             vec!["application/json"],
             true,
         ),
+        // One header listing several types (a comma outside quotes), or an
+        // empty one: unrestored too.
+        ("text/event-stream, text/html", vec![], false),
+        ("application/json,text/html", vec![], false),
+        ("application/json; charset=utf-8, text/html", vec![], false),
+        ("application/json; x=\"a,b\", text/html", vec![], false),
+        ("", vec![], false),
+        ("application/json; x=\"a,b\"", vec![], true),
     ];
     for (first, more, want) in cases {
         let (first2, more2, doc2) = (first, more.clone(), doc.clone());
