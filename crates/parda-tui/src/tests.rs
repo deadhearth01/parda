@@ -1314,3 +1314,125 @@ fn c1_start_hint_comes_from_the_worker_once_offline() {
     let screen = render_text(&app, 80, 24);
     assert!(screen.contains("PARDA_HOME /x/home"), "{screen}");
 }
+
+fn paste(app: &mut App, b: &mut Fake, s: &str) {
+    app.on_term(ratatui::crossterm::event::Event::Paste(s.into()));
+    app.sync(b);
+}
+
+#[test]
+fn i1_paste_goes_into_the_active_input_and_newlines_never_submit() {
+    let mut b = fake();
+    let mut app = online(&mut b);
+    // Nothing active: pasted text is not keys.
+    paste(&mut app, &mut b, "q3p\n");
+    assert!(!app.should_quit());
+    assert_eq!(app.tab, Tab::Dashboard);
+    assert!(cfg(&b).protection.enabled);
+    // Inspector: multi-line text is kept, nothing runs.
+    press(&mut app, &mut b, KeyCode::Char('3'));
+    paste(&mut app, &mut b, "line one\r\nline two\nq");
+    assert!(
+        app.inspector.editing,
+        "pasting on the Inspector starts typing"
+    );
+    assert_eq!(app.inspector.input, "line one\nline two\nq");
+    assert!(!b.calls.iter().any(|c| c == "Redact"));
+    press(&mut app, &mut b, KeyCode::Esc);
+    // Prompt: one line, the newline does not add the rule.
+    press(&mut app, &mut b, KeyCode::Char('4'));
+    press(&mut app, &mut b, KeyCode::Char('a'));
+    paste(&mut app, &mut b, "Zubin\nWadia\n");
+    assert_eq!(
+        app.prompt.as_ref().map(|p| p.1.as_str()),
+        Some("Zubin Wadia")
+    );
+    assert!(!b.calls.iter().any(|c| c == "RulesSet"));
+    press(&mut app, &mut b, KeyCode::Esc);
+    // Filter.
+    press(&mut app, &mut b, KeyCode::Char('/'));
+    paste(&mut app, &mut b, "ravi\n");
+    assert_eq!(app.rules_filter.text, "ravi");
+    assert!(app.rules_filter.editing);
+    press(&mut app, &mut b, KeyCode::Esc);
+    // Palette.
+    press(&mut app, &mut b, KeyCode::Char(':'));
+    paste(&mut app, &mut b, "vault\n");
+    assert_eq!(
+        app.palette.as_ref().map(|p| p.query.as_str()),
+        Some("vault")
+    );
+    press(&mut app, &mut b, KeyCode::Esc);
+    // Settings editor.
+    select_setting(&mut app, &mut b, crate::settings::Setting::ProxyListen);
+    press(&mut app, &mut b, KeyCode::Enter);
+    ctrl(&mut app, &mut b, 'u');
+    paste(&mut app, &mut b, "127.0.0.1:9100\n");
+    assert_eq!(
+        app.editor.as_ref().map(|e| e.buf.as_str()),
+        Some("127.0.0.1:9100")
+    );
+    assert!(!b.calls.iter().any(|c| c == "ConfigSet"));
+}
+
+#[test]
+fn i2_going_offline_closes_inputs_and_typing_never_starts_the_daemon() {
+    let mut b = fake();
+    let mut app = online(&mut b);
+    press(&mut app, &mut b, KeyCode::Char('3'));
+    press(&mut app, &mut b, KeyCode::Char('i'));
+    typ(&mut app, &mut b, "hello");
+    b.online = false;
+    app.request_refresh();
+    app.sync(&mut b);
+    assert!(app.offline());
+    assert!(
+        !app.inspector.editing,
+        "typing stops when the daemon goes away"
+    );
+    // The next keys of the sentence the user was typing do nothing.
+    typ(&mut app, &mut b, " is this safe");
+    assert_eq!(b.started, 0);
+
+    let mut b = fake();
+    let mut app = online(&mut b);
+    select_setting(&mut app, &mut b, crate::settings::Setting::Threshold);
+    press(&mut app, &mut b, KeyCode::Enter);
+    assert!(app.editor.is_some());
+    press(&mut app, &mut b, KeyCode::Char('2'));
+    press(&mut app, &mut b, KeyCode::Char('/'));
+    b.online = false;
+    app.request_refresh();
+    app.sync(&mut b);
+    assert!(app.editor.is_none());
+    typ(&mut app, &mut b, "s");
+    assert_eq!(b.started, 0);
+
+    let mut b = fake();
+    let mut app = online(&mut b);
+    press(&mut app, &mut b, KeyCode::Char('2'));
+    press(&mut app, &mut b, KeyCode::Char('/'));
+    b.online = false;
+    app.request_refresh();
+    app.sync(&mut b);
+    assert!(!app.live.filter.editing);
+    // An open palette still takes the keys: `s` is text there.
+    press(&mut app, &mut b, KeyCode::Char(':'));
+    typ(&mut app, &mut b, "s");
+    assert_eq!(b.started, 0);
+}
+
+#[test]
+fn i3_only_s_starts_the_daemon_not_enter() {
+    let mut b = fake();
+    b.online = false;
+    let mut app = online(&mut b);
+    press(&mut app, &mut b, KeyCode::Enter);
+    assert_eq!(b.started, 0);
+    press(&mut app, &mut b, KeyCode::Char('?'));
+    let help = render_text(&app, 80, 24);
+    assert!(help.contains("only s"), "{help}");
+    press(&mut app, &mut b, KeyCode::Esc);
+    press(&mut app, &mut b, KeyCode::Char('s'));
+    assert_eq!(b.started, 1);
+}

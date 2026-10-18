@@ -610,6 +610,10 @@ fn help(_app: &App, f: &mut Frame, area: Rect) {
             "Settings",
             "Enter/Space toggle · ←→ cycle · Enter edits numbers/text",
         ),
+        key(
+            "offline",
+            "only s (or the button / palette) starts the daemon",
+        ),
         key("q  Ctrl-C", "quit (Ctrl-C works everywhere)"),
         Line::from(""),
         Line::from(Span::styled(

@@ -28,7 +28,9 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Instant;
 
 use parda_ipc::{Client, Request};
-use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use ratatui::crossterm::execute;
 use serde_json::Value;
 
@@ -99,6 +101,40 @@ pub fn dump(runtime_dir: &Path, width: u16, height: u16) -> anyhow::Result<Strin
 /// is not running it shows the offline screen and keeps retrying; `starter`
 /// (if any) is what its start key runs.
 pub fn run(runtime_dir: &Path, starter: Option<Starter>) -> anyhow::Result<()> {
+    // No terminal: an error, not a panic.
+    let mut terminal =
+        ratatui::try_init().map_err(|e| anyhow::anyhow!("the dashboard needs a terminal: {e}"))?;
+    // ratatui's hook restores the screen; ours first switches off what we
+    // switched on, so a panic never leaves mouse reporting or paste
+    // brackets in the user's shell.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        release_terminal();
+        previous(info);
+    }));
+    // Mouse: click tabs/rows/badge, wheel scrolls (text selection needs
+    // Shift / Option while capture is on). Bracketed paste: pasted text
+    // arrives as one event, so its newlines are never Enter.
+    let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
+    let result = run_loop(&mut terminal, runtime_dir, starter);
+    release_terminal();
+    ratatui::restore();
+    result
+}
+
+fn release_terminal() {
+    let _ = execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
+}
+
+fn run_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    runtime_dir: &Path,
+    starter: Option<Starter>,
+) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel::<UiEvent>();
     let mut app = App::new();
     app.theme = Theme::from_env();
@@ -114,49 +150,39 @@ pub fn run(runtime_dir: &Path, starter: Option<Starter>) -> anyhow::Result<()> {
             }
         }
     });
-
-    let mut terminal = ratatui::init();
-    // Mouse: click tabs/rows/badge, wheel scrolls. Text selection needs
-    // Shift (Option on macOS) while capture is on.
-    let _ = execute!(std::io::stdout(), EnableMouseCapture);
-    let result = (|| -> anyhow::Result<()> {
-        loop {
-            for c in app.take_cmds() {
-                let _ = cmds.send(c);
-            }
-            if app.should_quit() {
-                return Ok(());
-            }
-            if app.take_dirty() {
-                terminal.draw(|f| app.draw(f))?;
-            }
-            let now = Instant::now();
-            let first = match app.next_wakeup(now) {
-                Some(at) => match rx.recv_timeout(at.saturating_duration_since(now)) {
-                    Ok(ev) => Some(ev),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
-                },
-                None => match rx.recv() {
-                    Ok(ev) => Some(ev),
-                    Err(_) => return Ok(()),
-                },
-            };
-            // Apply everything that is waiting before drawing once.
-            for ev in first
-                .into_iter()
-                .chain(std::iter::from_fn(|| rx.try_recv().ok()))
-                .take(1024)
-            {
-                match ev {
-                    UiEvent::Term(e) => app.on_term(e),
-                    UiEvent::Msg(m) => app.on_msg(m),
-                }
-            }
-            app.tick(Instant::now());
+    loop {
+        for c in app.take_cmds() {
+            let _ = cmds.send(c);
         }
-    })();
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
-    ratatui::restore();
-    result
+        if app.should_quit() {
+            return Ok(());
+        }
+        if app.take_dirty() {
+            terminal.draw(|f| app.draw(f))?;
+        }
+        let now = Instant::now();
+        let first = match app.next_wakeup(now) {
+            Some(at) => match rx.recv_timeout(at.saturating_duration_since(now)) {
+                Ok(ev) => Some(ev),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            },
+            None => match rx.recv() {
+                Ok(ev) => Some(ev),
+                Err(_) => return Ok(()),
+            },
+        };
+        // Apply everything that is waiting before drawing once.
+        for ev in first
+            .into_iter()
+            .chain(std::iter::from_fn(|| rx.try_recv().ok()))
+            .take(1024)
+        {
+            match ev {
+                UiEvent::Term(e) => app.on_term(e),
+                UiEvent::Msg(m) => app.on_msg(m),
+            }
+        }
+        app.tick(Instant::now());
+    }
 }

@@ -33,6 +33,10 @@ const MINUTES: u64 = 240;
 const TOAST_INFO: Duration = Duration::from_secs(4);
 const TOAST_WARN: Duration = Duration::from_secs(8);
 const SPIN: Duration = Duration::from_millis(120);
+/// Offline keys are ignored this long after going offline closed an input.
+const INERT: Duration = Duration::from_millis(1500);
+/// Longest paste taken (characters).
+const MAX_PASTE: usize = 256 * 1024;
 /// Give up waiting for a started daemon after this long.
 const START_WAIT: Duration = Duration::from_secs(15);
 /// Surfaces the Live filter cycles through (None = all).
@@ -250,6 +254,9 @@ pub struct App {
     pub now_ms: u64,
     pub spin: usize,
     next_spin: Option<Instant>,
+    /// Going offline closed an input: offline keys do nothing until then,
+    /// so the rest of a sentence being typed cannot start the daemon.
+    inert_until: Option<Instant>,
     outbox: Vec<Cmd>,
     dirty: bool,
     /// Clickable regions of the last frame (topmost last).
@@ -317,6 +324,7 @@ impl App {
             now_ms: wall_ms(),
             spin: 0,
             next_spin: None,
+            inert_until: None,
             outbox: Vec::new(),
             dirty: true,
             hits: RefCell::new(Vec::new()),
@@ -494,6 +502,9 @@ impl App {
             Msg::Status(Err(e)) => {
                 let next = Conn::Offline(e);
                 if self.conn != next {
+                    if !self.offline() && self.close_inputs() {
+                        self.inert_until = Some(Instant::now() + INERT);
+                    }
                     self.conn = next;
                     self.dirty = true;
                 }
@@ -907,9 +918,70 @@ impl App {
         match ev {
             TermEvent::Key(k) if k.kind == KeyEventKind::Press => self.on_key(k),
             TermEvent::Mouse(m) => self.on_mouse(m),
+            TermEvent::Paste(text) => self.on_paste(&text),
             TermEvent::Resize(..) => self.dirty = true,
             _ => {}
         }
+    }
+
+    /// Close every text input (editor, filters, Inspector typing). Returns
+    /// whether one was open.
+    fn close_inputs(&mut self) -> bool {
+        let mut was = self.editor.take().is_some();
+        for f in [
+            &mut self.live.filter,
+            &mut self.rules_filter,
+            &mut self.vault_filter,
+        ] {
+            was |= std::mem::take(&mut f.editing);
+        }
+        was |= std::mem::take(&mut self.inspector.editing);
+        was
+    }
+
+    /// Bracketed paste: the text goes into the active input as text; a
+    /// newline in it is never Enter. Only the Inspector keeps newlines.
+    pub fn on_paste(&mut self, text: &str) {
+        self.dirty = true;
+        let text: String = text.chars().take(MAX_PASTE).collect();
+        let one_line = || -> String {
+            text.split(['\n', '\r'])
+                .map(|l| {
+                    l.chars()
+                        .map(|c| if c.is_control() { ' ' } else { c })
+                        .collect::<String>()
+                })
+                .filter(|l| !l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        if let Some(ed) = &mut self.editor {
+            ed.buf.push_str(one_line().trim());
+            ed.error = None;
+        } else if let Some((_, buf)) = &mut self.prompt {
+            buf.push_str(&one_line());
+        } else if let Some(p) = &mut self.palette {
+            p.query.push_str(&one_line());
+            p.sel = 0;
+        } else if self.confirm.is_some() || self.help {
+            // Not an input: ignore.
+        } else if self.filter_mut().is_some_and(|f| f.editing) {
+            let add = one_line();
+            if let Some(f) = self.filter_mut() {
+                f.text.push_str(add.trim());
+            }
+            self.filter_changed(true);
+        } else if self.tab == Tab::Inspector && !self.offline() {
+            let ins = &mut self.inspector;
+            ins.editing = true;
+            let clean = text.replace("\r\n", "\n").replace('\r', "\n");
+            ins.input.extend(
+                clean
+                    .chars()
+                    .filter(|c| !c.is_control() || *c == '\n' || *c == '\t'),
+            );
+        }
+        // Anywhere else pasted text is dropped: it is never read as keys.
     }
 
     fn switch(&mut self, tab: Tab) {
@@ -1001,7 +1073,7 @@ impl App {
             self.filter_key(key);
             return;
         }
-        if self.tab == Tab::Inspector && self.inspector.editing && !self.offline() {
+        if self.tab == Tab::Inspector && self.inspector.editing {
             self.inspector_edit(key);
             return;
         }
@@ -1010,8 +1082,12 @@ impl App {
             return;
         }
         if self.offline() {
+            if self.inert_until.is_some_and(|t| Instant::now() < t) {
+                return;
+            }
             match key.code {
-                KeyCode::Char('s') | KeyCode::Enter => self.start_daemon(),
+                // Only `s` (or the button, or the palette): never Enter.
+                KeyCode::Char('s') => self.start_daemon(),
                 KeyCode::Char('q') => self.quit = true,
                 KeyCode::Char('?') => self.help = true,
                 _ => {}
