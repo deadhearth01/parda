@@ -1137,22 +1137,26 @@ fn read(
     Ok((merge(raw, edits, &view, &json, f)?, has_json))
 }
 
-/// Keys whose numbers may be timestamps: `timestamp`, `ts`, `*_time`,
-/// `*Time`, `*_at`, `*At`, `created*`, `updated*`, `expires*`, `date*`.
+/// Keys whose numbers may be timestamps: exactly `timestamp`, `ts`,
+/// `time`, `date`, `created`, `updated`, `expires`; or ending in `_time`,
+/// `_at`, `_ts`, `_date` (any case) or `Time`, `At`, `Date` (camelCase).
+/// No open prefixes: `dateOfBirth` is not one.
 fn timestamp_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
     [
         "timestamp",
         "ts",
-        "*_time",
-        "*_at",
-        "created*",
-        "updated*",
-        "expires*",
-        "date*",
+        "time",
+        "date",
+        "created",
+        "updated",
+        "expires",
     ]
-    .iter()
-    .any(|p| glob(p, key))
-        || ["Time", "At"]
+    .contains(&lower.as_str())
+        || ["_time", "_at", "_ts", "_date"]
+            .iter()
+            .any(|s| lower.len() > s.len() && lower.ends_with(s))
+        || ["Time", "At", "Date"]
             .iter()
             .any(|s| key.len() > s.len() && key.ends_with(s))
 }
@@ -1169,23 +1173,43 @@ fn epoch_like(number: &str) -> bool {
     })
 }
 
-/// A number under an identifier key keeps its value unless what the rules
-/// found in all of it is certainly that kind: an Aadhaar number
-/// (Verhoeff), a card number (Luhn), or an Indian mobile number (`[6-9]`
-/// and nine digits, `91` allowed before). A bare 10-digit run is not
-/// enough, and an epoch time under a timestamp-like key never is.
+/// Does a finding of `kinds` that covers all of the number `p` (under an
+/// identifier or timestamp-like key, kept as written otherwise) refuse the
+/// request? A string in its place would break its type, so yes, unless
+/// there is positive evidence it is no value:
+/// - an epoch time (2001-2100) under a timestamp-like key, that no
+///   checksum-valid card ([`card`]) or Aadhaar number (Verhoeff) covers;
+/// - only a phone was found, and the digits are no Indian mobile number
+///   (`[6-9]` and nine digits, `91` allowed before): a bare 10-digit run.
+///
+/// Unknown kinds (a sink that cannot say) refuse.
 fn refuses_number(p: &Part, kinds: &[String]) -> bool {
+    if kinds.is_empty() {
+        return true;
+    }
     let d = p.text.as_str();
-    if p.epoch || d.is_empty() || !d.bytes().all(|c| c.is_ascii_digit()) {
+    let digits = !d.is_empty() && d.bytes().all(|c| c.is_ascii_digit());
+    let checksum = digits
+        && kinds.iter().any(|k| match k.as_str() {
+            "Aadhaar" => d.len() == 12 && verhoeff(d),
+            "CreditCard" => card(d),
+            _ => false,
+        });
+    if p.epoch && !checksum {
         return false;
     }
     let mobile = |d: &str| d.len() == 10 && matches!(d.as_bytes()[0], b'6'..=b'9');
-    kinds.iter().any(|k| match k.as_str() {
-        "Aadhaar" => d.len() == 12 && d.as_bytes()[0] >= b'2' && verhoeff(d),
-        "CreditCard" => (13..=19).contains(&d.len()) && luhn(d),
-        "Phone" => mobile(d) || d.strip_prefix("91").is_some_and(mobile),
-        _ => false,
-    })
+    let valid_phone = digits && (mobile(d) || d.strip_prefix("91").is_some_and(mobile));
+    !(kinds.iter().all(|k| k == "Phone") && !valid_phone)
+}
+
+/// A card number: 13-19 digits, an issuer's first digit (2-6: Mastercard,
+/// Amex, JCB, Diners, Visa, Discover, Maestro, RuPay; or RuPay's 81, 82),
+/// and the Luhn check. (A millisecond timestamp starts with 1.)
+fn card(d: &str) -> bool {
+    (13..=19).contains(&d.len())
+        && (matches!(d.as_bytes()[0], b'2'..=b'6') || d.starts_with("81") || d.starts_with("82"))
+        && luhn(d)
 }
 
 fn luhn(digits: &str) -> bool {
@@ -1309,6 +1333,9 @@ fn merge(
         if at < e.end || cuts.is_empty() {
             cuts.push((at, e.end));
         }
+        // What this finding stands for, for numbers it covers (`kinds` is
+        // taken by the first piece written).
+        let found = e.kinds.clone();
         let mut kinds = Some(e.kinds);
         for (start, end) in cuts {
             let cut = Edit {
@@ -1365,8 +1392,7 @@ fn merge(
                         continue;
                     }
                     if p.verbatim {
-                        let found = kinds.as_deref().unwrap_or_default();
-                        if unmasked && start <= p.start && p.end <= end && refuses_number(p, found)
+                        if unmasked && start <= p.start && p.end <= end && refuses_number(p, &found)
                         {
                             return Err(Malformed);
                         }
@@ -2023,7 +2049,12 @@ mod tests {
                         start: i,
                         end: i + needle.len(),
                         surrogate: tag.to_string(),
-                        kind: "K".into(),
+                        kind: if tag.starts_with("[PHONE") {
+                            "Phone"
+                        } else {
+                            "K"
+                        }
+                        .into(),
                     });
                 }
             }
@@ -2070,17 +2101,31 @@ mod tests {
         for k in [
             "timestamp",
             "ts",
+            "time",
+            "date",
+            "created",
+            "updated",
+            "expires",
             "create_time",
             "created_at",
+            "event_ts",
+            "start_date",
             "createdAt",
-            "expires",
-            "updated",
-            "dateSent",
             "startTime",
+            "endDate",
         ] {
             assert!(timestamp_key(k), "{k}");
         }
-        for k in ["id", "user_id", "status", "At", "data"] {
+        for k in [
+            "id",
+            "user_id",
+            "status",
+            "At",
+            "data",
+            "dateOfBirth",
+            "created_by",
+            "updates",
+        ] {
             assert!(!timestamp_key(k), "{k}");
         }
         for n in [
@@ -2092,10 +2137,14 @@ mod tests {
         ] {
             assert!(epoch_like(n), "{n}");
         }
-        // Mobile numbers and most cards fall outside the ranges.
-        assert!(!epoch_like("6000000000") && !epoch_like("4111111111111111"));
-        assert!(epoch_like("4102444800") && !epoch_like("4103000000"));
-        for n in ["17600000000", "234567890124", "41111111111111", "176000000"] {
+        // Mobile numbers (6e9 and up) and most cards are past 2100.
+        for n in [
+            "6000000000",
+            "9876543210",
+            "4111111111111111",
+            "4103000000",
+            "176000000",
+        ] {
             assert!(!epoch_like(n), "{n}");
         }
         let part = |text: &str, epoch| Part {
@@ -2111,18 +2160,45 @@ mod tests {
             percent: false,
             encode: false,
         };
-        let k = |s: &str| vec![s.to_string()];
-        assert!(refuses_number(&part("9876543210", false), &k("Phone")));
-        assert!(refuses_number(&part("919876543210", false), &k("Phone")));
-        assert!(!refuses_number(&part("1760000000", false), &k("Phone")));
-        assert!(!refuses_number(&part("9876543210", true), &k("Phone")));
-        assert!(refuses_number(&part("234567890124", false), &k("Aadhaar")));
-        assert!(!refuses_number(&part("234567890125", false), &k("Aadhaar")));
+        let k = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Any finding refuses by default; unknown kinds too.
+        assert!(refuses_number(&part("12345", false), &k(&["Person"])));
+        assert!(refuses_number(&part("12345", false), &[]));
+        assert!(refuses_number(&part("9876543210", false), &k(&["Phone"])));
+        assert!(refuses_number(&part("919876543210", false), &k(&["Phone"])));
+        assert!(refuses_number(
+            &part("234567890124", false),
+            &k(&["Aadhaar"])
+        ));
         assert!(refuses_number(
             &part("4111111111111111", false),
-            &k("CreditCard")
+            &k(&["CreditCard"])
         ));
-        assert!(!refuses_number(&part("9876543210.5", false), &k("Phone")));
+        // A phone that is no Indian mobile number is kept, unless something
+        // else covers it too.
+        assert!(!refuses_number(&part("1234567890", false), &k(&["Phone"])));
+        assert!(refuses_number(
+            &part("1234567890", false),
+            &k(&["Phone", "Person"])
+        ));
+        // An epoch time is kept, unless a checksum-valid card or Aadhaar
+        // covers it.
+        assert!(!refuses_number(&part("1760000000", true), &k(&["Phone"])));
+        assert!(refuses_number(
+            &part("4000000000000002", true),
+            &k(&["CreditCard"])
+        ));
+        assert!(!refuses_number(
+            &part("4000000000000003", true),
+            &k(&["CreditCard"])
+        ));
+        // A Luhn-valid millisecond timestamp is no card: no issuer starts
+        // with 1.
+        assert!(luhn("1760000000123") && !card("1760000000123"));
+        assert!(!refuses_number(
+            &part("1760000000123", true),
+            &k(&["CreditCard"])
+        ));
     }
 
     #[test]
@@ -2366,6 +2442,32 @@ mod tests {
                 &[(r#"98765","n":"43210"#, "[X]")]
             ),
             Ok(r#"{"id":"[X]","[X]":"[X]"}"#.into())
+        );
+        // A finding across text and a whole identifier number keeps its kind
+        // for the number after the text piece took it: a mobile refuses.
+        assert_eq!(
+            find(
+                r#"{"n":"x","id":9876543210}"#,
+                Role::Body,
+                &[(r#"x","id":9876543210"#, "[PHONE_1]")]
+            ),
+            Err(Malformed)
+        );
+        assert!(
+            find(
+                r#"{"n":"x","id":1234567890}"#,
+                Role::Body,
+                &[(r#"x","id":1234567890"#, "[PHONE_1]")]
+            )
+            .is_ok()
+        );
+        // A sink that cannot say what it found refuses an identifier number.
+        let h = hosts();
+        let r = rules(&h, &[], "chatgpt.com");
+        let mut blank = |s: &mut String, _: Tier| *s = s.replace("1234567890", "X");
+        assert_eq!(
+            read_text(r#"{"id":1234567890}"#, Role::Body, &r, &mut blank),
+            Err(Malformed)
         );
         // The strings and numbers of a JSON line among text change; the text
         // around is read literally.

@@ -707,6 +707,9 @@ fn identifier_numbers_meet_the_rules() {
         // the same rule.
         "{\"timestamp\":9876543210}",
         "{\"ts\":4111111111111111}",
+        // Epoch-like (about 4.0e15 µs) but a Luhn-valid card.
+        "{\"ts\":4000000000000002}",
+        "{\"id\":9876543210}",
     ] {
         for ct in ["application/json", "text/plain"] {
             assert_unparseable(body, &send(&t, ct, body).unwrap_err());
@@ -721,6 +724,7 @@ fn identifier_numbers_meet_the_rules() {
         // Not certainly a value: a bare 10-digit run (no mobile prefix),
         // digits that fail the checksum.
         "{\"id\":1234567890}",
+        "{\"user_id\":1234567890}",
         "{\"conversation_id\":234567890125}",
         "{\"order_id\":4111111111111112}",
     ] {
@@ -729,9 +733,21 @@ fn identifier_numbers_meet_the_rules() {
             assert_eq!(out.body, body, "{ct}");
         }
     }
-    // Outside identifier keys a number is text: a phone there is redacted.
-    let out = send(&t, "application/json", "{\"phone\":9876543210}").unwrap();
-    assert_gone("phone", &out.body, "9876543210");
+    // Outside identifier keys a number is text: a phone or card there is
+    // redacted, and a `date*` key is no timestamp key.
+    for (body, secret) in [
+        ("{\"phone\":9876543210}", "9876543210"),
+        ("{\"note\":4111111111111111}", "4111111111111111"),
+    ] {
+        let out = send(&t, "application/json", body).unwrap();
+        assert_gone(body, &out.body, secret);
+    }
+    let dob = send(&t, "application/json", "{\"dateOfBirth\":19900101}").unwrap();
+    let plain = send(&t, "application/json", "{\"note\":19900101}").unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&dob.body).replace("dateOfBirth", "note"),
+        String::from_utf8_lossy(&plain.body)
+    );
 }
 
 /// Scan on 31c4d85, ruling 2: past the reading depth parda fails closed.
