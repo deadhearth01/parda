@@ -1612,7 +1612,7 @@ mod tests {
     ];
 
     /// For every input of every table: where the old guard said URL, so
-    /// does the guard (whole and char by char).
+    /// does the guard (whole, split in two anywhere, and char by char).
     #[test]
     fn never_narrower_than_the_previous_guard() {
         let mut inputs: Vec<String> = [
@@ -1632,25 +1632,38 @@ mod tests {
             inputs.extend(t.iter().map(|(input, _)| input.to_string()));
         }
         inputs.push(ANY_SPLIT_TEXT.to_string());
+        let old_mask = |pieces: &[&str]| -> Vec<bool> {
+            let mut old = reference::UrlGuard::default();
+            let mut mask = Vec::new();
+            for piece in pieces {
+                for part in old.split(piece) {
+                    mask.extend(part.text.chars().map(|_| part.url));
+                }
+            }
+            mask
+        };
         let mut failures = Vec::new();
         for text in &inputs {
-            let mut old = reference::UrlGuard::default();
-            let old_mask: Vec<bool> = old
-                .split(text)
-                .iter()
-                .flat_map(|p| p.text.chars().map(|_| p.url))
-                .collect();
+            // Whole, split in two at every char boundary, char by char.
+            let mut splits: Vec<Vec<&str>> = vec![vec![text]];
+            splits.extend(
+                text.char_indices()
+                    .skip(1)
+                    .map(|(i, _)| vec![&text[..i], &text[i..]]),
+            );
             let chars: Vec<String> = text.chars().map(String::from).collect();
-            let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
-            for new_mask in [url_mask(&[text]), url_mask(&refs)] {
+            splits.push(chars.iter().map(String::as_str).collect());
+            for pieces in &splits {
                 let lost: String = text
                     .chars()
-                    .zip(old_mask.iter().zip(&new_mask))
+                    .zip(old_mask(pieces).iter().zip(&url_mask(pieces)))
                     .filter(|(_, (o, n))| **o && !**n)
                     .map(|(c, _)| c)
                     .collect();
                 if !lost.is_empty() {
-                    failures.push(format!("{text:?}: no longer guarded {lost:?}"));
+                    failures.push(format!(
+                        "{text:?} as {pieces:?}: no longer guarded {lost:?}"
+                    ));
                 }
             }
         }
