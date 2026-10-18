@@ -20,9 +20,13 @@
 //!   TAB, LF, FF, CR and SPACE end an unquoted one, as for browsers. A tag
 //!   is read from every `<` + letter, even inside what another reading
 //!   takes for a value: that may be a comment, CDATA or code to a renderer.
-//! - CSS `url(…)` and `image-set(…)` (quotes honoured, to an unquoted `)`),
-//!   and what follows `@import` (to an unquoted `;`, across line breaks);
-//!   escapes are honoured, in names (`u\72l(`) and in strings.
+//! - A `<style>` element, whole (to `</style` and a delimiter; its tag's
+//!   attributes, and nested SVG ones, too).
+//! - Elsewhere CSS `url(…)` and `image-set(…)` (quotes and escapes
+//!   honoured, to an unquoted `)`), what follows `@import` (to an unquoted
+//!   `;`, across line breaks), and, since CSS compares names after their
+//!   escapes (`u\72l(` is `url(`), the argument of any `(` that has a
+//!   backslash in the 16 characters before it.
 //!
 //! Other URL-like plain text (`key=value`, a value right after a URL) is
 //! left to the engine's url-safe restore, which never restores a value
@@ -106,6 +110,9 @@ enum Css {
     },
     /// After `@import`: to an unquoted `;`.
     Import { quote: Option<char>, escaped: bool },
+    /// A style element (all of it, its attributes too): to `</style`;
+    /// `depth` counts nested ones (SVG style elements are not raw text).
+    Style { depth: u32 },
 }
 
 impl Css {
@@ -113,94 +120,6 @@ impl Css {
         Css::Import {
             quote,
             escaped: false,
-        }
-    }
-}
-
-/// The CSS identifier being read, decoded: CSS compares a function or
-/// at-rule name after its escapes are consumed (`u\\72l(` is `url(`).
-#[derive(Debug, Clone, Default)]
-struct CssName {
-    /// It follows an `@`.
-    at: bool,
-    /// It holds an escape (names without one are matched in `recent`).
-    escaped: bool,
-    /// The last character was a `\\`.
-    backslash: bool,
-    /// Hex digits of the escape being read (up to 6), and their value.
-    hex: u8,
-    hex_value: u32,
-    /// The last characters of the name, decoded and lower-cased.
-    decoded: String,
-}
-
-impl CssName {
-    /// Moves on over `c`; says whether a CSS URL starts after it.
-    fn step(&mut self, c: char) -> Css {
-        if self.backslash {
-            self.backslash = false;
-            self.escaped = true;
-            match c.to_digit(16) {
-                Some(d) => (self.hex, self.hex_value) = (1, d),
-                None => self.push(c),
-            }
-            return Css::Free;
-        }
-        if self.hex > 0 {
-            if self.hex < 6
-                && let Some(d) = c.to_digit(16)
-            {
-                self.hex += 1;
-                self.hex_value = self.hex_value * 16 + d;
-                return Css::Free;
-            }
-            self.push(char::from_u32(self.hex_value).unwrap_or('\u{fffd}'));
-            self.hex = 0;
-            // One whitespace character ends a hex escape.
-            if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c') {
-                return Css::Free;
-            }
-        }
-        if c == '\\' {
-            self.backslash = true;
-            // The escape may complete `@import`: start before it, so
-            // nothing after it is missed.
-            return if self.at && "import".starts_with(self.decoded.as_str()) {
-                Css::import(None)
-            } else {
-                Css::Free
-            };
-        }
-        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii() {
-            self.push(c);
-            return Css::Free;
-        }
-        let d = &self.decoded;
-        let start = if c == '(' && self.escaped && (d.ends_with("url") || d.ends_with("image-set"))
-        {
-            Css::Fn {
-                depth: 0,
-                quote: None,
-                escaped: false,
-            }
-        } else {
-            Css::Free
-        };
-        *self = CssName {
-            at: c == '@',
-            ..CssName::default()
-        };
-        start
-    }
-
-    fn push(&mut self, c: char) {
-        self.decoded.extend(c.to_lowercase());
-        if self.decoded.len() > 4 * RECENT_CHARS {
-            let cut = self.decoded.len() - 2 * RECENT_CHARS;
-            let cut = (cut..)
-                .find(|&i| self.decoded.is_char_boundary(i))
-                .unwrap_or(0);
-            self.decoded.drain(..cut);
         }
     }
 }
@@ -219,8 +138,8 @@ pub struct UrlGuard {
     /// CSS readings in progress (never `Free`; at most one per quote and
     /// escape state).
     css: Vec<Css>,
-    /// The CSS identifier being read, for names spelt with escapes.
-    name: CssName,
+    /// Characters since the last backslash, while fewer than 16.
+    backslash_gap: Option<u8>,
     /// The last characters seen, lower-cased.
     recent: String,
     prev: Option<char>,
@@ -281,9 +200,26 @@ impl UrlGuard {
                 }
             }
         }
+        // `<style` / `</style` + a delimiter (an end tag must be the
+        // appropriate one to close the raw text).
+        let delimiter = html_space(c) || c == '/' || c == '>';
+        let style_end = delimiter && self.recent.ends_with("</style");
+        let style_start = delimiter && self.recent.ends_with("<style");
+        // CSS compares names after escapes (`u\72l(` is `url(`): rather
+        // than decode them, any `(` shortly after a backslash is a URL.
+        let escaped_fn = c == '(' && self.backslash_gap.is_some();
+        self.backslash_gap = match self.backslash_gap {
+            _ if c == '\\' => Some(0),
+            Some(gap) if gap < 15 => Some(gap + 1),
+            _ => None,
+        };
         let mut css: Vec<Css> = Vec::with_capacity(self.css.len() + 1);
         for state in std::mem::take(&mut self.css) {
-            let (u, next) = css_step(state, c);
+            let (u, next) = match state {
+                Css::Style { depth: 0 } if style_end => (false, Css::Free),
+                Css::Style { depth } if style_end => (true, Css::Style { depth: depth - 1 }),
+                _ => css_step(state, c),
+            };
             url |= u;
             add_css(&mut css, next);
         }
@@ -291,7 +227,19 @@ impl UrlGuard {
         // A CSS URL may start at any trigger, whatever else is going on: a
         // quote in text that is not CSS must not hide it.
         add_css(&mut css, self.css_trigger());
-        add_css(&mut css, self.name.step(c));
+        if escaped_fn {
+            add_css(
+                &mut css,
+                Css::Fn {
+                    depth: 0,
+                    quote: None,
+                    escaped: false,
+                },
+            );
+        }
+        if style_start {
+            add_css(&mut css, Css::Style { depth: 0 });
+        }
         self.css = css;
         // A tag may start at any `<` + letter, whatever else is going on:
         // what another reading takes for a quoted value may be a comment,
@@ -524,7 +472,16 @@ fn tag_step(state: Tag, c: char) -> (bool, Option<Tag>) {
 /// escape state read every character alike but for their depth, so the
 /// deeper one, which ends later, stands for both.
 fn add_css(css: &mut Vec<Css>, new: Css) {
-    if new == Css::Free || css.contains(&new) {
+    if new == Css::Free {
+        return;
+    }
+    if new == (Css::Style { depth: 0 })
+        && let Some(Css::Style { depth }) = css.iter_mut().find(|s| matches!(s, Css::Style { .. }))
+    {
+        *depth = depth.saturating_add(1);
+        return;
+    }
+    if css.contains(&new) {
         return;
     }
     if let Css::Fn {
@@ -605,6 +562,7 @@ fn css_step(state: Css, c: char) -> (bool, Css) {
                 escaped: false,
             },
         ),
+        Css::Style { .. } => (true, state),
         // CSS allows any whitespace (line breaks too) after `@import`.
         Css::Import { quote: None, .. } => match c {
             ';' => (false, Css::Free),
@@ -1043,8 +1001,26 @@ mod tests {
         "<style>@\\69mport '⟨//e/[NAME_1]⟩';</style>",
         "<style>@\\69 mport\"⟨//e/;[NAME_1]⟩\";</style>",
         "<style>@impor\\74\"⟨//e/;[NAME_1]⟩\";</style>",
-        // Other escaped names are not URLs (TeX in prose stays plain).
-        "\\(x\\) and \\sin(«[NAME_1]») and \\left(«[NAME_1]»\\right)",
+        // §4.3.7 after a hex escape one whitespace is consumed, and CRLF is
+        // one whitespace (§3.3 preprocessing). Outside a style element the
+        // guard does not decode names: any `(` with a backslash in the 16
+        // characters before it guards its argument (fail-closed).
+        "p{background:u\\72\r\nl(⟨//e/[NAME_1]⟩)}",
+        "p{background:u\\72\nl(⟨//e/[NAME_1]⟩)}",
+        "p{background:\\75rl(⟨//e/[NAME_1]⟩)}",
+        "p{background:URL(⟨//e/[NAME_1]⟩)}",
+        "\\(x\\) and \\sin(⟨[NAME_1]⟩)",
+        // HTML §13.2.5.3 RAWTEXT: a style element is CSS up to `</style`
+        // and a delimiter; all of it is guarded, with any attributes, in
+        // SVG too, whatever it holds.
+        "<style>⟨p{background:u\\72\r\nl(//e/[NAME_1])}⟩</style> «[NAME_1]»",
+        "<style>⟨p{}<img src=x>[NAME_1]<a title=\"[EMAIL_1]\">⟩</style>«[NAME_1]»",
+        "<style media=\"⟨x⟩\" nonce=⟨y⟩>⟨@\\69mport 'x';[NAME_1]⟩</style>",
+        "<STYLE/>⟨[NAME_1]⟩</STYLE >«[NAME_1]»",
+        "<style>⟨\n[NAME_1]\r\n⟩</style>",
+        "<style>⟨</stylex>[NAME_1]⟩</style>",
+        "<svg><style>⟨<![CDATA[ [NAME_1] ]]>⟩</style></svg>",
+        "<svg><style>⟨<style></style>[NAME_1]⟩</style></svg>",
         "<style>@font-face{src:url(⟨//e/[NAME_1].woff⟩)}</style>",
         // A url reading started in other text does not hide the next
         // one.
@@ -1107,7 +1083,8 @@ mod tests {
             format!("{many}⟨ ![x](//e/[NAME_1])⟩\n![y](⟨//e/[NAME_1]⟩) «[NAME_1]»"),
             // CommonMark §4.7: a label with escaped brackets saturates at
             // its `]:`; its destination on the next line is still guarded.
-            format!("[{label}]:\n⟨//e/[NAME_1]⟩\n\n«[NAME_1]»"),
+            // (The `\\](` also guards to a `)`, fail-closed.)
+            format!("[{label}]:\n⟨//e/[NAME_1]⟩\n\n[NAME_1]"),
             format!("[{label}]: \r\n  ⟨//e/[NAME_1]⟩"),
             format!("> [{label}]:\n> ⟨//e/[NAME_1]⟩"),
         ]
@@ -1233,11 +1210,11 @@ mod tests {
         ),
         (
             "<style>@import\n\"//e/?[NAME_1]\";</style>",
-            "<style>@import⟨\n\"//e/?[NAME_1]\"⟩;</style>",
+            "<style>⟨@import\n\"//e/?[NAME_1]\";</style⟩>",
         ),
         (
             "<style>@import \"//e/[NAME_1]\"; p{}</style>",
-            "<style>@import⟨ \"//e/[NAME_1]\"⟩; p{}</style>",
+            "<style>⟨@import \"//e/[NAME_1]\"; p{}</style⟩>",
         ),
         (
             "x{background:url('//e/?x=)[NAME_1]')} [NAME_1]",
