@@ -258,20 +258,16 @@ fn action_label(a: Action) -> &'static str {
     }
 }
 
-/// The next (or previous) value of `list` after `current`, cycling. A value
-/// that is not in the list (typed in) moves to the nearest preset in that
-/// direction, never to the far end of the list.
+/// The next larger (or smaller) preset after `current`, for numbers. It
+/// saturates: at or past either end it keeps `current`, never wrapping to
+/// the other end (TTL 9999 days must not become 1 day and delete mappings).
 fn cycle<T: PartialOrd + Copy>(list: &[T], current: T, forward: bool) -> T {
-    let n = list.len();
-    let next = match (list.iter().position(|x| *x == current), forward) {
-        (Some(i), true) => (i + 1) % n,
-        (Some(i), false) => (i + n - 1) % n,
-        // Off the list: first preset above (below); past the end the
-        // cycle wraps as it does from the last (first) preset.
-        (None, true) => list.iter().position(|x| *x > current).unwrap_or(0),
-        (None, false) => list.iter().rposition(|x| *x < current).unwrap_or(n - 1),
+    let next = if forward {
+        list.iter().find(|x| **x > current)
+    } else {
+        list.iter().rev().find(|x| **x < current)
     };
-    list[next]
+    next.copied().unwrap_or(current)
 }
 
 /// Cycle through choices that have no order.
@@ -288,7 +284,10 @@ fn cycle_eq<T: PartialEq + Copy>(list: &[T], current: T, forward: bool) -> T {
 fn cycle_f32(list: &[f32], current: f32, forward: bool) -> f32 {
     // Within rounding of a preset counts as that preset.
     match list.iter().find(|x| (**x - current).abs() < 1e-4) {
-        Some(on) => cycle(list, *on, forward),
+        Some(on) => {
+            let next = cycle(list, *on, forward);
+            if next == *on { current } else { next }
+        }
         None => cycle(list, current, forward),
     }
 }
@@ -708,10 +707,57 @@ mod tests {
             "{}",
             c.detect.ml_threshold
         );
-        // Beyond the last preset the cycle goes on as it does from the last one.
         c.vault.ttl_days = 400;
         step(&Setting::Ttl, &mut c, false);
         assert_eq!(c.vault.ttl_days, 365);
+    }
+
+    #[test]
+    fn numbers_saturate_and_never_wrap() {
+        let mut c = Config::default();
+        // A shorter TTL deletes mappings: never wrap 9999 days to 1.
+        for start in [9999, 365] {
+            c.vault.ttl_days = start;
+            step(&Setting::Ttl, &mut c, true);
+            assert_eq!(c.vault.ttl_days, start, "TTL {start} → stays");
+        }
+        for start in [1, 0] {
+            c.vault.ttl_days = start;
+            step(&Setting::Ttl, &mut c, false);
+            assert_eq!(c.vault.ttl_days, start, "TTL {start} ← stays");
+        }
+        for start in [60_000, 2000] {
+            c.detect.ml_timeout_ms = start;
+            step(&Setting::Timeout, &mut c, true);
+            assert_eq!(c.detect.ml_timeout_ms, start, "timeout {start} → stays");
+        }
+        for start in [10, 100] {
+            c.detect.ml_timeout_ms = start;
+            step(&Setting::Timeout, &mut c, false);
+            assert_eq!(c.detect.ml_timeout_ms, start, "timeout {start} ← stays");
+        }
+        for start in [0.95f32, 0.7] {
+            c.detect.ml_threshold = start;
+            step(&Setting::Threshold, &mut c, true);
+            assert!(
+                (c.detect.ml_threshold - start).abs() < 1e-6,
+                "threshold {start} → stays"
+            );
+        }
+        for start in [0.3f32, 0.2] {
+            c.detect.ml_threshold = start;
+            step(&Setting::Threshold, &mut c, false);
+            assert!(
+                (c.detect.ml_threshold - start).abs() < 1e-6,
+                "threshold {start} ← stays"
+            );
+        }
+        // Choices still cycle.
+        let s = Setting::Action(EntityKind::Secret);
+        for _ in 0..4 {
+            step(&s, &mut c, true);
+        }
+        assert_eq!(c.action_for(&EntityKind::Secret), Action::Redact);
     }
 
     #[test]
