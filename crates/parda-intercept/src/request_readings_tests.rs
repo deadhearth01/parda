@@ -706,10 +706,10 @@ fn identifier_numbers_meet_the_rules() {
         // Past plausible dates (2001-2100), a timestamp-like key follows
         // the same rule.
         "{\"timestamp\":9876543210}",
-        "{\"ts\":4111111111111111}",
-        // Epoch-like (about 4.0e15 µs) but a Luhn-valid card.
-        "{\"ts\":4000000000000002}",
         "{\"id\":9876543210}",
+        // A timestamp-like key: a phone that is all of a number other than
+        // an epoch time refuses, whatever its digits.
+        "{\"deadline_ts\":9123456789}",
     ] {
         for ct in ["application/json", "text/plain"] {
             assert_unparseable(body, &send(&t, ct, body).unwrap_err());
@@ -734,20 +734,33 @@ fn identifier_numbers_meet_the_rules() {
         }
     }
     // Outside identifier keys a number is text: a phone or card there is
-    // redacted, and a `date*` key is no timestamp key.
+    // redacted; under a timestamp-like key too, unless it is an epoch time
+    // no card covers (4.0e15 µs, but a valid card).
     for (body, secret) in [
         ("{\"phone\":9876543210}", "9876543210"),
         ("{\"note\":4111111111111111}", "4111111111111111"),
+        ("{\"ts\":4111111111111111}", "4111111111111111"),
+        ("{\"ts\":4000000000000002}", "4000000000000002"),
     ] {
         let out = send(&t, "application/json", body).unwrap();
         assert_gone(body, &out.body, secret);
     }
-    let dob = send(&t, "application/json", "{\"dateOfBirth\":19900101}").unwrap();
-    let plain = send(&t, "application/json", "{\"note\":19900101}").unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&dob.body).replace("dateOfBirth", "note"),
-        String::from_utf8_lossy(&plain.body)
-    );
+    // Numbers that are no epoch time under timestamp-like keys (and
+    // `date*` keys, which are none) are handled like any number.
+    for (key, n) in [
+        ("dateOfBirth", "19900101"),
+        ("birth_date", "19900101"),
+        ("updated_at", "98765432"),
+    ] {
+        let body = format!("{{\"{key}\":{n}}}");
+        let out = send(&t, "application/json", &body).unwrap();
+        let plain = send(&t, "application/json", &format!("{{\"note\":{n}}}")).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.body).replace(key, "note"),
+            String::from_utf8_lossy(&plain.body),
+            "{body}"
+        );
+    }
 }
 
 /// Scan on 31c4d85, ruling 2: past the reading depth parda fails closed.

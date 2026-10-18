@@ -742,8 +742,12 @@ struct Part {
     /// written; it refuses the request only when certainly a value
     /// ([`refuses_number`]).
     verbatim: bool,
-    /// A plausible epoch time under a timestamp-like key: never refused.
+    /// A plausible epoch time under a timestamp-like key.
     epoch: bool,
+    /// A number under an identifier key.
+    id_key: bool,
+    /// A number under a timestamp-like key.
+    time: bool,
     /// Read form-decoded: what replaces encoded text is encoded.
     percent: bool,
     /// A key or value of a form with key rules: what replaces any of it
@@ -758,8 +762,9 @@ impl Part {
             // under an identifier or timestamp-like key they are kept as
             // written unless certainly a value; a plausible epoch time under
             // a timestamp-like key always is.
+            let id_key = t.role == Role::Value { skipped: true };
             let epoch = t.time && epoch_like(&raw[t.start..t.end]);
-            let verbatim = t.time || t.role == Role::Value { skipped: true };
+            let verbatim = id_key || epoch;
             return Part {
                 start: t.start,
                 end: t.end,
@@ -770,6 +775,8 @@ impl Part {
                 num: true,
                 verbatim,
                 epoch,
+                id_key,
+                time: t.time,
                 percent: false,
                 encode: false,
             };
@@ -785,6 +792,8 @@ impl Part {
             num: false,
             verbatim: false,
             epoch: false,
+            id_key: false,
+            time: false,
             percent: false,
             encode: false,
         }
@@ -812,6 +821,8 @@ impl Part {
             num: false,
             verbatim: false,
             epoch: false,
+            id_key: false,
+            time: false,
             percent: true,
             encode,
         }
@@ -1189,18 +1200,25 @@ fn refuses_number(p: &Part, kinds: &[String]) -> bool {
     }
     let d = p.text.as_str();
     let digits = !d.is_empty() && d.bytes().all(|c| c.is_ascii_digit());
-    let checksum = digits
-        && kinds.iter().any(|k| match k.as_str() {
-            "Aadhaar" => d.len() == 12 && verhoeff(d),
-            "CreditCard" => card(d),
-            _ => false,
-        });
-    if p.epoch && !checksum {
+    if p.epoch && !checksum_value(p, kinds) {
         return false;
     }
     let mobile = |d: &str| d.len() == 10 && matches!(d.as_bytes()[0], b'6'..=b'9');
     let valid_phone = digits && (mobile(d) || d.strip_prefix("91").is_some_and(mobile));
     !(kinds.iter().all(|k| k == "Phone") && !valid_phone)
+}
+
+/// A finding of `kinds` over all of `p` is a checksum-valid card ([`card`])
+/// or Aadhaar number (Verhoeff).
+fn checksum_value(p: &Part, kinds: &[String]) -> bool {
+    let d = p.text.as_str();
+    !d.is_empty()
+        && d.bytes().all(|c| c.is_ascii_digit())
+        && kinds.iter().any(|k| match k.as_str() {
+            "Aadhaar" => d.len() == 12 && verhoeff(d),
+            "CreditCard" => card(d),
+            _ => false,
+        })
 }
 
 /// A card number: 13-19 digits, an issuer's first digit (2-6: Mastercard,
@@ -1304,8 +1322,26 @@ fn merge(
             // number): a string in its place would break its type, so the
             // request is refused.
             let p = &view.parts[e.view - 1];
+            let whole = e.start <= p.start && p.end <= e.end;
+            // Under a timestamp-like key that is no identifier key, a
+            // phone that is all of a number other than an epoch time
+            // refuses (a time with a phone in it), whatever its digits.
+            if p.time && !p.id_key && !p.epoch && whole && e.kinds.iter().any(|k| k == "Phone") {
+                return Err(Malformed);
+            }
             if p.verbatim {
-                if e.start <= p.start && p.end <= e.end && refuses_number(p, &e.kinds) {
+                if !p.id_key {
+                    // An epoch time there stays as written, unless a valid
+                    // card or Aadhaar number covers it: then it is a value,
+                    // redacted like any number.
+                    if whole && checksum_value(p, &e.kinds) {
+                        hits.push(e);
+                    } else {
+                        forget(&e.kinds);
+                    }
+                    continue;
+                }
+                if whole && refuses_number(p, &e.kinds) {
                     return Err(Malformed);
                 }
                 forget(&e.kinds);
@@ -1392,7 +1428,11 @@ fn merge(
                         continue;
                     }
                     if p.verbatim {
-                        if unmasked && start <= p.start && p.end <= end && refuses_number(p, &found)
+                        if p.id_key
+                            && unmasked
+                            && start <= p.start
+                            && p.end <= end
+                            && refuses_number(p, &found)
                         {
                             return Err(Malformed);
                         }
@@ -2157,6 +2197,8 @@ mod tests {
             num: true,
             verbatim: true,
             epoch,
+            id_key: true,
+            time: epoch,
             percent: false,
             encode: false,
         };

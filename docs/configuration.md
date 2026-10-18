@@ -116,13 +116,15 @@ Tags follow `replace.style` (there is no separate style for intercept).
     escaped, percent-encoded), so no reading of the forwarded body holds it: an escape such as
     `\n9876543210` cannot hide a number, nor `+` or `%40` a name or an e-mail. Numbers are text:
     one that holds a value becomes a JSON string holding its tag. Under identifier keys
-    (`create_time`, `*_id`) and timestamp-like keys (exactly `timestamp`, `ts`, `time`, `date`,
-    `created`, `updated`, `expires`; or ending in `_time`, `_at`, `_ts`, `_date`, `Time`, `At`,
-    `Date`) numbers meet the rules only and are kept as written, but a finding that covers a whole
-    number refuses the request (a string in its place would break its type). Two exemptions need
-    positive evidence: an epoch time from 2001 to 2100 (seconds, milliseconds, microseconds) under a
-    timestamp-like key that no valid card (issuer prefix and Luhn) or Aadhaar number (Verhoeff)
-    covers; and a number only a phone rule found that is no Indian mobile number. A value the whole text shows but
+    (`create_time`, `*_id`) numbers meet the rules only and are kept as written, but a finding that
+    covers a whole number refuses the request (a string in its place would break its type), except
+    on positive evidence: an epoch time from 2001 to 2100 (seconds, milliseconds, microseconds)
+    under a timestamp-like key (exactly `timestamp`, `ts`, `time`, `date`, `created`, `updated`,
+    `expires`; or ending in `_time`, `_at`, `_ts`, `_date`, `Time`, `At`, `Date`) that no valid
+    card (issuer prefix and Luhn) or Aadhaar number (Verhoeff) covers, or a number only a phone
+    rule found that is no Indian mobile number. Under a timestamp-like key that is no identifier
+    key, such an epoch time is kept as written; any other number is handled like a number under a
+    plain key, except that a phone found as the whole number refuses the request. A value the whole text shows but
     single tokens do not (`{"Ravi":"Kumar"}`) is replaced in each token it covers. Text that looks
     like escaped JSON (starting with `{`, `[` or `"`, or a line that does, holding a backslash;
     inside a body, text bracketed like JSON) but is not JSON is refused; what the user typed under
@@ -152,7 +154,7 @@ Tags follow `replace.style` (there is no separate style for intercept).
 
     | Status and code | When |
     |---|---|
-    | `400 parda_unparseable_body` | a body or multipart field typed as JSON that is not JSON; text that looks like escaped JSON but is not JSON (see above); a number under an identifier or timestamp-like key that a finding covers whole (see above); text past the reading depth that is still encoded; a JSON key given twice (anywhere, JSON inside strings, forms and queries included); two keys that redaction would make the same; a multipart body without a boundary, that does not split as RFC 2046 says, or whose preamble or epilogue holds the boundary |
+    | `400 parda_unparseable_body` | a body or multipart field typed as JSON that is not JSON; text that looks like escaped JSON but is not JSON (see above); a number under an identifier key that a finding covers whole, or under a timestamp-like key that a phone covers whole (see above); text past the reading depth that is still encoded; a JSON key given twice (anywhere, JSON inside strings, forms and queries included); two keys that redaction would make the same; a multipart body without a boundary, that does not split as RFC 2046 says, or whose preamble or epilogue holds the boundary |
     | `400 parda_not_utf8` | a body of any type declaring a charset other than UTF-8 or US-ASCII; a `Content-Type` holding bytes outside visible ASCII, or two different ones; a form or `text/*` body that is not UTF-8 or holds NUL bytes (UTF-16) |
     | `413 parda_body_too_large` | a body too large to filter |
     | `415 parda_unsupported_encoding` | a `content-encoding` parda cannot decode |
