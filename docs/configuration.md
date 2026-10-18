@@ -115,10 +115,11 @@ Tags follow `replace.style` (there is no separate style for intercept).
     one that holds a value becomes a JSON string holding its tag. Under identifier keys
     (`create_time`, `*_id`) numbers meet the rules only and are kept as written, unless the whole
     number is certainly a value (an Aadhaar number passing Verhoeff, a card passing Luhn, a valid
-    Indian mobile): then the request is refused, as a string in its place would break its type. An
-    epoch time (seconds, milliseconds or microseconds) under a timestamp-like key (`timestamp`,
-    `ts`, `*_time`, `*Time`, `*_at`, `*At`, `created*`, `updated*`, `expires*`, `date*`) is never
-    refused or rewritten. A value the whole text shows but
+    Indian mobile): then the request is refused, as a string in its place would break its type.
+    Numbers under timestamp-like keys (`timestamp`, `ts`, `*_time`, `*Time`, `*_at`, `*At`,
+    `created*`, `updated*`, `expires*`, `date*`) follow the same rule, and an epoch time between
+    2001-09-09 and 2100-01-01 (seconds, milliseconds or microseconds) there is never refused or
+    rewritten. A value the whole text shows but
     single tokens do not (`{"Ravi":"Kumar"}`) is replaced in each token it covers. Text that looks
     like escaped JSON (starting with `{`, `[` or `"`, or a line that does, holding a backslash;
     inside a body, text bracketed like JSON) but is not JSON is refused; what the user typed under

@@ -755,10 +755,11 @@ impl Part {
     fn json(raw: &str, t: Token, rules: &Rules<'_>) -> Part {
         if t.num {
             // Numbers are text (only the rules find values in them), but
-            // under an identifier key they are identifiers, and so is a
-            // plausible epoch time under a timestamp-like key.
+            // under an identifier or timestamp-like key they are kept as
+            // written unless certainly a value; a plausible epoch time under
+            // a timestamp-like key always is.
             let epoch = t.time && epoch_like(&raw[t.start..t.end]);
-            let verbatim = epoch || t.role == Role::Value { skipped: true };
+            let verbatim = t.time || t.role == Role::Value { skipped: true };
             return Part {
                 start: t.start,
                 end: t.end,
@@ -1157,11 +1158,14 @@ fn timestamp_key(key: &str) -> bool {
 }
 
 /// A plausible epoch time: seconds, milliseconds or microseconds since
-/// 1970 (2001 to 2286).
+/// 1970, from 2001-09-09 to 2100-01-01. (Every Indian mobile number, 6e9 and
+/// up, is past the seconds range.)
 fn epoch_like(number: &str) -> bool {
     number.parse::<f64>().is_ok_and(|n| {
         let n = n.abs();
-        (1e9..1e10).contains(&n) || (1e12..1e13).contains(&n) || (1e15..1e16).contains(&n)
+        (1e9..4.103e9).contains(&n)
+            || (1e12..4.103e12).contains(&n)
+            || (1e15..4.103e15).contains(&n)
     })
 }
 
@@ -2080,6 +2084,7 @@ mod tests {
             assert!(!timestamp_key(k), "{k}");
         }
         for n in [
+            "1000000000",
             "1760000000",
             "1760000000.5",
             "1760000000123",
@@ -2087,10 +2092,9 @@ mod tests {
         ] {
             assert!(epoch_like(n), "{n}");
         }
-        // A 10-digit mobile number is in the seconds range and a 16-digit
-        // card in the microseconds range: under a timestamp-like key they
-        // are kept, as ruled.
-        assert!(epoch_like("9876543210") && epoch_like("4111111111111111"));
+        // Mobile numbers and most cards fall outside the ranges.
+        assert!(!epoch_like("6000000000") && !epoch_like("4111111111111111"));
+        assert!(epoch_like("4102444800") && !epoch_like("4103000000"));
         for n in ["17600000000", "234567890124", "41111111111111", "176000000"] {
             assert!(!epoch_like(n), "{n}");
         }

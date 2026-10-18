@@ -703,6 +703,10 @@ fn identifier_numbers_meet_the_rules() {
         "{\"id\":234567890124}",
         "{\"order_id\":4111111111111111}",
         "{\"user_id\":9876543210}",
+        // Past plausible dates (2001-2100), a timestamp-like key follows
+        // the same rule.
+        "{\"timestamp\":9876543210}",
+        "{\"ts\":4111111111111111}",
     ] {
         for ct in ["application/json", "text/plain"] {
             assert_unparseable(body, &send(&t, ct, body).unwrap_err());
