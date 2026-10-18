@@ -23,6 +23,8 @@ struct Fake {
     hint_calls: usize,
     vault: Vec<Value>,
     fail_rules_set: bool,
+    /// How an offline daemon fails: "" not running, "timeout", "version".
+    down: &'static str,
 }
 
 impl Backend for Fake {
@@ -35,7 +37,15 @@ impl Backend for Fake {
                 .to_string(),
         );
         if !self.online {
-            anyhow::bail!("the parda daemon is not running");
+            return Err(match self.down {
+                "timeout" => parda_ipc::IpcError::Timeout,
+                "version" => parda_ipc::IpcError::Remote {
+                    code: "version_mismatch".into(),
+                    message: "client speaks protocol 2, daemon 1".into(),
+                },
+                _ => parda_ipc::IpcError::NotRunning,
+            }
+            .into());
         }
         Ok(match req {
             Request::Status => json!({
@@ -114,6 +124,7 @@ fn fake() -> Fake {
         started: 0,
         hint_calls: 0,
         fail_rules_set: false,
+        down: "",
         vault: vec![
             json!({"scope": "global", "kind": "Person", "count": 5}),
             json!({"scope": "global", "kind": "Email", "count": 2}),
@@ -985,12 +996,13 @@ fn toasts_expire() {
     press(&mut app, &mut b, KeyCode::Char('p'));
     assert!(app.message().is_some());
     assert!(render_text(&app, 80, 24).contains("protection OFF"));
-    let at = app
-        .next_wakeup(Instant::now())
-        .expect("a toast is waiting to expire");
-    app.tick(at + Duration::from_millis(1));
+    let now = Instant::now();
+    assert!(app.next_wakeup(now).is_some(), "a toast is waiting to expire");
+    // Warnings stay up to 8 s; info toasts 4 s.
+    app.tick(now + Duration::from_secs(9));
     assert!(app.message().is_none());
-    assert!(app.next_wakeup(Instant::now()).is_none());
+    // Nothing left to wake up for (the watchdog has fired already).
+    assert!(app.next_wakeup(now + Duration::from_secs(9)).is_none());
 }
 
 #[test]
@@ -1124,8 +1136,14 @@ fn nothing_changed_means_no_redraw() {
     app.request_refresh();
     app.sync(&mut b);
     assert!(!app.take_dirty(), "an unchanged refresh must not redraw");
-    // Idle: no timers pending, so the loop blocks until input or data.
-    assert!(app.next_wakeup(Instant::now()).is_none());
+    // Idle: only the status watchdog is pending (seconds away), so the
+    // loop blocks until input or data.
+    let now = Instant::now();
+    assert!(
+        app.next_wakeup(now)
+            .is_none_or(|t| t >= now + Duration::from_secs(2)),
+        "no frequent wake-ups when idle"
+    );
     app.tick(Instant::now());
     assert!(!app.take_dirty());
     // New data does redraw.
@@ -1267,7 +1285,7 @@ fn worker_thread_retries_offline_and_starts_only_when_asked() {
     };
     let t0 = Instant::now();
     let e = next_status().unwrap_err();
-    assert!(e.contains("not running"), "{e}");
+    assert_eq!(e, crate::Down::NotRunning);
     // The retry comes about a second later, on the worker's own timer.
     assert!(next_status().is_err());
     assert!(
@@ -1576,4 +1594,157 @@ fn i5_every_screen_renders_at_every_size_without_panicking() {
         }
     }
     assert!(failures.is_empty(), "panics: {failures:?}");
+}
+
+#[test]
+fn m4_start_is_offered_only_when_the_daemon_is_not_running() {
+    for (down, want) in [
+        ("timeout", "not answering"),
+        ("version", "incompatible version"),
+    ] {
+        let mut b = fake();
+        b.online = false;
+        b.down = down;
+        let mut app = online(&mut b);
+        assert!(app.offline());
+        let screen = render_text(&app, 80, 24);
+        assert!(screen.contains(want), "{down}: {screen}");
+        assert!(
+            !screen.contains("start it in the background"),
+            "{down}: {screen}"
+        );
+        assert_eq!(
+            b.hint_calls, 0,
+            "{down}: no start plan for a running daemon"
+        );
+        press(&mut app, &mut b, KeyCode::Char('s'));
+        assert_eq!(b.started, 0, "{down}");
+        assert!(
+            !app.palette_entries()
+                .iter()
+                .any(|e| e.action == crate::palette::Action::StartDaemon),
+            "{down}"
+        );
+    }
+    let mut b = fake();
+    b.online = false;
+    let app = online(&mut b);
+    assert!(render_text(&app, 80, 24).contains("start it in the background"));
+}
+
+#[test]
+fn m5_watchdog_marks_a_silent_daemon_unresponsive() {
+    let mut b = fake();
+    let mut app = online(&mut b);
+    let now = Instant::now();
+    let at = app
+        .next_wakeup(now)
+        .expect("the watchdog is armed while online");
+    assert!(at <= now + Duration::from_secs(4));
+    app.tick(now + Duration::from_secs(4));
+    assert!(app.take_dirty());
+    let top = render_text(&app, 160, 48)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(
+        top.contains("unresponsive") && top.contains("PROTECTION ?"),
+        "{top}"
+    );
+    // The next answer clears it.
+    app.request_refresh();
+    app.sync(&mut b);
+    let top = render_text(&app, 160, 48)
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(
+        top.contains("online") && top.contains("PROTECTION ON"),
+        "{top}"
+    );
+}
+
+mod m5_workers {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::Receiver;
+    use std::time::{Duration, Instant};
+
+    use parda_ipc::Request;
+    use serde_json::{Value, json};
+
+    use crate::worker::{Cmd, Msg, Role, Workers};
+    use crate::{Backend, UiEvent};
+
+    struct Ok_(Duration);
+    impl Backend for Ok_ {
+        fn call(&mut self, req: Request) -> anyhow::Result<Value> {
+            if req == Request::Status {
+                std::thread::sleep(self.0);
+            }
+            Ok(match req {
+                Request::Redact { text, .. } => json!({"text": text, "replaced": []}),
+                _ => json!({}),
+            })
+        }
+    }
+    struct Panicky;
+    impl Backend for Panicky {
+        fn call(&mut self, _: Request) -> anyhow::Result<Value> {
+            panic!("worker bug")
+        }
+    }
+
+    fn wait_for(rx: &Receiver<UiEvent>, what: impl Fn(&UiEvent) -> bool) -> Duration {
+        let t = Instant::now();
+        loop {
+            let ev = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("event in time");
+            if what(&ev) {
+                return t.elapsed();
+            }
+        }
+    }
+
+    #[test]
+    fn a_dead_worker_is_reported_and_restarted() {
+        let made = Arc::new(AtomicUsize::new(0));
+        let m2 = Arc::clone(&made);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut w = Workers::new(
+            Box::new(move |role| -> Box<dyn Backend + Send> {
+                if role == Role::Main && m2.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Box::new(Panicky)
+                } else {
+                    Box::new(Ok_(Duration::ZERO))
+                }
+            }),
+            tx,
+        );
+        wait_for(&rx, |e| matches!(e, UiEvent::WorkerDied(Role::Main)));
+        w.restart(Role::Main);
+        wait_for(&rx, |e| matches!(e, UiEvent::Msg(Msg::Status(Ok(_)))));
+        assert_eq!(made.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn redaction_never_waits_behind_a_slow_status() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut w = Workers::new(
+            Box::new(|role| -> Box<dyn Backend + Send> {
+                match role {
+                    Role::Main => Box::new(Ok_(Duration::from_secs(3))),
+                    Role::Inspector => Box::new(Ok_(Duration::ZERO)),
+                }
+            }),
+            tx,
+        );
+        std::thread::sleep(Duration::from_millis(100)); // main is now stuck in Status
+        w.send(Cmd::Redact("hello".into()));
+        let took = wait_for(&rx, |e| matches!(e, UiEvent::Msg(Msg::Redacted(_))));
+        assert!(took < Duration::from_secs(1), "{took:?}");
+    }
 }

@@ -23,7 +23,7 @@ use serde_json::Value;
 use crate::palette::{self, Action, Entry, Palette};
 use crate::settings::{self, Edit, Setting};
 use crate::theme::Theme;
-use crate::worker::{Cmd, Msg};
+use crate::worker::{Cmd, Down, Msg, Role};
 use crate::{Backend, ui};
 
 /// Events kept for the Live tab (oldest dropped first).
@@ -33,6 +33,8 @@ const MINUTES: u64 = 240;
 const TOAST_INFO: Duration = Duration::from_secs(4);
 const TOAST_WARN: Duration = Duration::from_secs(8);
 const SPIN: Duration = Duration::from_millis(120);
+/// No status answer for this long: the daemon counts as unresponsive.
+const WATCHDOG: Duration = Duration::from_secs(3);
 /// Offline keys are ignored this long after going offline closed an input.
 const INERT: Duration = Duration::from_millis(1500);
 /// Longest paste taken (characters).
@@ -160,8 +162,8 @@ pub enum Conn {
     /// No answer yet (first second after start).
     Connecting,
     Online,
-    /// Unreachable, with the reason.
-    Offline(String),
+    /// Unusable, and why (only `NotRunning` offers the start key).
+    Offline(Down),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +259,10 @@ pub struct App {
     /// Going offline closed an input: offline keys do nothing until then,
     /// so the rest of a sentence being typed cannot start the daemon.
     inert_until: Option<Instant>,
+    /// When the last status answer (or failure) arrived.
+    last_status: Option<Instant>,
+    /// Online, but no status answer for [`WATCHDOG`]: shown as unresponsive.
+    pub stale: bool,
     outbox: Vec<Cmd>,
     dirty: bool,
     /// Clickable regions of the last frame (topmost last).
@@ -325,6 +331,8 @@ impl App {
             spin: 0,
             next_spin: None,
             inert_until: None,
+            last_status: None,
+            stale: false,
             outbox: Vec::new(),
             dirty: true,
             hits: RefCell::new(Vec::new()),
@@ -345,6 +353,26 @@ impl App {
     /// Whether the offline screen is showing.
     pub fn offline(&self) -> bool {
         matches!(self.conn, Conn::Offline(_))
+    }
+
+    /// Offline because nothing listens: the only case the start key is for.
+    pub fn not_running(&self) -> bool {
+        self.conn == Conn::Offline(Down::NotRunning)
+    }
+
+    /// A worker thread died (`None`: found dead when sending to it). It
+    /// has been restarted; say so, and do not leave a spinner running.
+    pub fn on_worker_died(&mut self, role: Option<Role>) {
+        if role != Some(Role::Main) && self.inspector.busy {
+            self.inspector.busy = false;
+            self.inspector.error =
+                Some("the redaction worker stopped — press Enter to retry".into());
+        }
+        self.toast(
+            "a background worker stopped unexpectedly — it has been restarted",
+            Level::Error,
+        );
+        self.request_refresh();
     }
 
     /// Requests for the worker, in order.
@@ -413,6 +441,13 @@ impl App {
 
     /// Time-driven changes: toast expiry, spinner, giving up on a start.
     pub fn tick(&mut self, now: Instant) {
+        if self.conn == Conn::Online
+            && !self.stale
+            && self.last_status.is_some_and(|t| now >= t + WATCHDOG)
+        {
+            self.stale = true;
+            self.dirty = true;
+        }
         let n = self.toasts.len();
         self.toasts.retain(|t| t.until > now);
         if self.toasts.len() != n {
@@ -453,6 +488,13 @@ impl App {
             let give_up = t + START_WAIT;
             at = Some(at.map_or(give_up, |a| a.min(give_up)));
         }
+        if self.conn == Conn::Online
+            && !self.stale
+            && let Some(t) = self.last_status
+        {
+            let watchdog = t + WATCHDOG;
+            at = Some(at.map_or(watchdog, |a| a.min(watchdog)));
+        }
         at
     }
 
@@ -472,6 +514,10 @@ impl App {
     pub fn on_msg(&mut self, m: Msg) {
         match m {
             Msg::Status(Ok(s)) => {
+                self.last_status = Some(Instant::now());
+                if std::mem::take(&mut self.stale) {
+                    self.dirty = true;
+                }
                 if self.conn != Conn::Online {
                     self.conn = Conn::Online;
                     self.dirty = true;
@@ -500,6 +546,8 @@ impl App {
                 self.status = Some(s);
             }
             Msg::Status(Err(e)) => {
+                self.last_status = Some(Instant::now());
+                self.stale = false;
                 let next = Conn::Offline(e);
                 if self.conn != next {
                     if !self.offline() && self.close_inputs() {
@@ -1265,6 +1313,12 @@ impl App {
     fn start_daemon(&mut self) {
         if self.connected() {
             self.toast("the daemon is already running", Level::Info);
+        } else if !self.not_running() {
+            self.toast(
+                "the daemon is running but cannot be used — see the screen; start is only for a \
+                 daemon that is not running",
+                Level::Warn,
+            );
         } else if self.starting.is_some() {
             self.toast("already starting — waiting for the daemon", Level::Info);
         } else {
@@ -1375,7 +1429,7 @@ impl App {
             .zip(["1", "2", "3", "4", "5", "6"])
             .map(|(t, k)| Entry::new(format!("Go to {}", t.title()), k, Action::Tab(*t)))
             .collect();
-        if self.offline() {
+        if self.not_running() {
             v.insert(0, Entry::new("Start the daemon", "s", Action::StartDaemon));
         }
         let on = self.protection_on();

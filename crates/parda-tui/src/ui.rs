@@ -12,6 +12,7 @@ use crate::app::{App, Confirm, Conn, Hit, Level, Prompt, Tab};
 use crate::palette;
 use crate::settings::{self, Edit};
 use crate::tabs::{self, ACCENT, INTERCEPT, block, bold, dim, hit, level_style};
+use crate::worker::Down;
 
 pub fn draw(app: &App, f: &mut Frame) {
     app.hits.borrow_mut().clear();
@@ -89,13 +90,17 @@ fn status_bar(app: &App, f: &mut Frame, area: Rect) {
         " parda ",
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )]];
+    let red = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     segs.push(vec![match &app.conn {
+        Conn::Online if app.stale => {
+            Span::styled("◌ unresponsive", Style::default().fg(Color::Yellow))
+        }
         Conn::Online => Span::styled("● online", Style::default().fg(Color::Green)),
         Conn::Connecting => Span::styled("◌ connecting…", dim()),
-        Conn::Offline(_) => Span::styled(
-            "○ daemon offline",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
+        Conn::Offline(Down::NotRunning) => Span::styled("○ daemon offline", red),
+        Conn::Offline(Down::Unresponsive(_)) => Span::styled("○ daemon not answering", red),
+        Conn::Offline(Down::Incompatible(_)) => Span::styled("○ incompatible daemon", red),
+        Conn::Offline(Down::Failed(_)) => Span::styled("○ daemon unreachable", red),
     }]);
     let compact = area.width < 120;
     // ":8788" instead of "127.0.0.1:8788" on narrow screens.
@@ -105,7 +110,16 @@ fn status_bar(app: &App, f: &mut Frame, area: Rect) {
             _ => a.to_string(),
         }
     };
-    let badge = if app.offline() {
+    let badge = if app.stale || (app.offline() && !app.not_running()) {
+        // It may still be filtering; this client cannot tell.
+        Span::styled(
+            " ? PROTECTION ? ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if app.offline() {
         Span::styled(
             " □ NOT FILTERING ",
             Style::default()
@@ -291,12 +305,11 @@ pub fn footer_keys(app: &App) -> Vec<(&'static str, String)> {
         return vec![k("type", "filter"), k("Enter", "keep"), k("Esc", "clear")];
     }
     if app.offline() {
-        return vec![
-            k("s", "start the daemon"),
-            k(":", "commands"),
-            k("?", "help"),
-            k("q", "quit"),
-        ];
+        let mut v = vec![k(":", "commands"), k("?", "help"), k("q", "quit")];
+        if app.not_running() {
+            v.insert(0, k("s", "start the daemon"));
+        }
+        return v;
     }
     if app.tab == Tab::Inspector && app.inspector.editing {
         return vec![
@@ -646,55 +659,73 @@ fn help(_app: &App, f: &mut Frame, area: Rect) {
 // ── offline ─────────────────────────────────────────────────────────────
 
 fn offline(app: &App, f: &mut Frame, area: Rect) {
-    let reason = match &app.conn {
-        Conn::Offline(r) => r.clone(),
-        _ => String::new(),
+    let down = match &app.conn {
+        Conn::Offline(d) => d.clone(),
+        _ => Down::NotRunning,
     };
-    let b = block("daemon offline").border_style(Style::default().fg(Color::Red));
+    let (title, headline, detail) = match &down {
+        Down::NotRunning => (
+            "daemon offline",
+            "parda's daemon is not running",
+            "Agents and AI sites routed through parda cannot connect until it runs.",
+        ),
+        Down::Unresponsive(_) => (
+            "daemon not answering",
+            "the daemon is running but not answering",
+            "It may be busy or stuck. If it stays like this: `parda stop`, then start it again.",
+        ),
+        Down::Incompatible(_) => (
+            "incompatible version",
+            "incompatible version: the running daemon speaks another protocol",
+            "Restart it with this parda: `parda stop`, then `parda daemon` (or the service).",
+        ),
+        Down::Failed(_) => (
+            "daemon unreachable",
+            "cannot talk to the daemon",
+            "See the reason below; `parda doctor` explains most problems.",
+        ),
+    };
+    let b = block(title).border_style(Style::default().fg(Color::Red));
     let inner = b.inner(area);
     f.render_widget(b, area);
     let red = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     let mut lines = vec![
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  ○ ", red),
-            Span::styled("parda's daemon is not running", red),
-        ]),
-        Line::from(Span::styled(
-            "    Agents and AI sites routed through parda cannot connect until it runs.",
-            dim(),
-        )),
+        Line::from(vec![Span::styled("  ○ ", red), Span::styled(headline, red)]),
+        Line::from(Span::styled(format!("    {detail}"), dim())),
         Line::from(""),
     ];
-    let start_y = inner.y + lines.len() as u16;
-    match app.starting {
-        Some(t) => lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {} ", app.theme.spinner(app.spin)),
-                Style::default().fg(ACCENT),
-            ),
-            Span::raw(format!(
-                "starting… waiting for the daemon ({} s)",
-                t.elapsed().as_secs()
-            )),
-        ])),
-        None => lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                " s ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  start it in the background"),
-        ])),
-    }
-    if start_y < inner.bottom() {
-        hit(app, Rect::new(inner.x, start_y, inner.width, 1), Hit::Start);
-    }
-    if let Some(h) = &app.start_hint {
-        lines.push(Line::from(Span::styled(format!("       {h}"), dim())));
+    if down == Down::NotRunning {
+        let start_y = inner.y + lines.len() as u16;
+        match app.starting {
+            Some(t) => lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", app.theme.spinner(app.spin)),
+                    Style::default().fg(ACCENT),
+                ),
+                Span::raw(format!(
+                    "starting… waiting for the daemon ({} s)",
+                    t.elapsed().as_secs()
+                )),
+            ])),
+            None => lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    " s ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  start it in the background"),
+            ])),
+        }
+        if start_y < inner.bottom() {
+            hit(app, Rect::new(inner.x, start_y, inner.width, 1), Hit::Start);
+        }
+        if let Some(h) = &app.start_hint {
+            lines.push(Line::from(Span::styled(format!("       {h}"), dim())));
+        }
     }
     lines.extend([
         Line::from(""),
@@ -702,12 +733,19 @@ fn offline(app: &App, f: &mut Frame, area: Rect) {
             "  Retrying the connection every second; the dashboard opens by itself.",
             dim(),
         )),
-        Line::from(Span::styled(format!("  last answer: {reason}"), dim())),
-        Line::from(""),
         Line::from(Span::styled(
-            "  Or yourself: `parda daemon` in a terminal, or `parda service install`.",
+            format!("  last answer: {}", down.text()),
             dim(),
         )),
     ]);
+    if down == Down::NotRunning {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Or yourself: `parda daemon` in a terminal, or `parda service install`.",
+                dim(),
+            )),
+        ]);
+    }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }

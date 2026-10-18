@@ -8,9 +8,9 @@
 //! vault) — never the others.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use parda_core::Config;
@@ -68,7 +68,7 @@ pub struct Redaction {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
     /// The daemon status; `Err` = unreachable (the offline screen).
-    Status(Result<Value, String>),
+    Status(Result<Value, Down>),
     /// The daemon's config.toml.
     Config(String),
     Rules(String),
@@ -96,12 +96,53 @@ fn err(e: anyhow::Error) -> String {
     format!("{e:#}")
 }
 
+/// Why the daemon cannot be used. Only [`Down::NotRunning`] offers a start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Down {
+    /// Nothing listens: the start key applies.
+    NotRunning,
+    /// It accepted the connection but did not answer in time.
+    Unresponsive(String),
+    /// It answers in a protocol this parda does not speak.
+    Incompatible(String),
+    /// Anything else (permissions, a broken socket file …).
+    Failed(String),
+}
+
+impl Down {
+    pub fn text(&self) -> String {
+        match self {
+            Down::NotRunning => "the parda daemon is not running".into(),
+            Down::Unresponsive(e) | Down::Incompatible(e) | Down::Failed(e) => e.clone(),
+        }
+    }
+}
+
+/// Sort a failed request into a [`Down`].
+pub fn classify(e: &anyhow::Error) -> Down {
+    if parda_ipc::is_not_running(e) {
+        return Down::NotRunning;
+    }
+    let text = format!("{e:#}");
+    match e.chain().find_map(|c| c.downcast_ref::<IpcError>()) {
+        Some(IpcError::Timeout) => Down::Unresponsive(text),
+        Some(IpcError::Remote { code, .. }) if code == "version_mismatch" => {
+            Down::Incompatible(text)
+        }
+        Some(IpcError::Protocol(_) | IpcError::Json(_)) => Down::Incompatible(text),
+        _ => Down::Failed(text),
+    }
+}
+
 fn refresh(tab: Tab, b: &mut dyn Backend, out: &mut Vec<Msg>) {
     match b.call(Request::Status) {
         Ok(s) => out.push(Msg::Status(Ok(s))),
         Err(e) => {
-            out.push(Msg::Status(Err(err(e))));
-            if let Some(h) = b.start_hint() {
+            let down = classify(&e);
+            let offer = down == Down::NotRunning;
+            out.push(Msg::Status(Err(down)));
+            // Only a daemon that is not running gets a start plan.
+            if offer && let Some(h) = b.start_hint() {
                 out.push(Msg::StartHint(h));
             }
             return;
@@ -219,25 +260,40 @@ pub struct Starter {
     pub start: Box<dyn FnMut() -> anyhow::Result<String> + Send>,
 }
 
+/// A starter shared by the worker and its replacement after a restart.
+pub type SharedStarter = Arc<Mutex<Starter>>;
+
 /// The real daemon: (re)connects on demand and keeps an event subscription
 /// for each connection it makes.
 pub struct Live {
     dir: PathBuf,
     client: Option<Client>,
     tx: Sender<UiEvent>,
+    /// Subscribe to events on each new connection (the main worker only).
+    events: bool,
     /// Bumped per subscription; an older subscriber stops forwarding.
     sub_gen: Arc<AtomicU64>,
-    starter: Option<Starter>,
+    starter: Option<SharedStarter>,
     /// The starter's description, worked out once per offline spell.
     hint: Option<String>,
 }
 
 impl Live {
     pub fn new(dir: &Path, tx: Sender<UiEvent>, starter: Option<Starter>) -> Self {
+        Self::shared(dir, tx, starter.map(|s| Arc::new(Mutex::new(s))), true)
+    }
+
+    pub fn shared(
+        dir: &Path,
+        tx: Sender<UiEvent>,
+        starter: Option<SharedStarter>,
+        events: bool,
+    ) -> Self {
         Live {
             dir: dir.to_path_buf(),
             client: None,
             tx,
+            events,
             sub_gen: Arc::new(AtomicU64::new(0)),
             starter,
             hint: None,
@@ -246,15 +302,12 @@ impl Live {
 
     fn connect(&mut self) -> anyhow::Result<&mut Client> {
         if self.client.is_none() {
-            let c = Client::connect_with_timeout(&self.dir, Duration::from_secs(1)).map_err(
-                |e| match e {
-                    IpcError::NotRunning => anyhow::anyhow!("the parda daemon is not running"),
-                    other => anyhow::anyhow!(other),
-                },
-            )?;
+            let c = Client::connect_with_timeout(&self.dir, Duration::from_secs(1))?;
             self.client = Some(c);
             self.hint = None;
-            self.subscribe();
+            if self.events {
+                self.subscribe();
+            }
         }
         Ok(self.client.as_mut().expect("connected"))
     }
@@ -300,14 +353,20 @@ impl Backend for Live {
 
     fn start_hint(&mut self) -> Option<String> {
         if self.hint.is_none() {
-            self.hint = self.starter.as_mut().map(|s| (s.describe)());
+            self.hint = self
+                .starter
+                .as_ref()
+                .and_then(|s| s.lock().ok().map(|mut s| (s.describe)()));
         }
         self.hint.clone()
     }
 
     fn start_daemon(&mut self) -> anyhow::Result<String> {
-        match &mut self.starter {
-            Some(s) => (s.start)(),
+        match &self.starter {
+            Some(s) => (s
+                .lock()
+                .map_err(|_| anyhow::anyhow!("the start helper failed earlier"))?
+                .start)(),
             None => {
                 anyhow::bail!("start the daemon with `parda daemon` or `parda service install`")
             }
@@ -315,18 +374,63 @@ impl Backend for Live {
     }
 }
 
-/// Spawn the worker thread; it ends when the returned sender is dropped.
-pub fn spawn(mut backend: impl Backend + Send + 'static, tx: Sender<UiEvent>) -> Sender<Cmd> {
+/// Which worker runs a command: Inspector redactions get their own, so a
+/// slow status refresh never holds them up (and the other way round).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Main,
+    Inspector,
+}
+
+impl Cmd {
+    pub fn role(&self) -> Role {
+        match self {
+            Cmd::Redact(_) => Role::Inspector,
+            _ => Role::Main,
+        }
+    }
+}
+
+/// Tells the UI when a worker thread dies of a panic.
+struct DeathNotice(Sender<UiEvent>, Role);
+
+impl Drop for DeathNotice {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let _ = self.0.send(UiEvent::WorkerDied(self.1));
+        }
+    }
+}
+
+/// Spawn the main worker thread; it ends when the returned sender is dropped.
+pub fn spawn(backend: impl Backend + Send + 'static, tx: Sender<UiEvent>) -> Sender<Cmd> {
+    spawn_role(Role::Main, backend, tx)
+}
+
+/// Spawn a worker. The main one also refreshes on its own timer.
+pub fn spawn_role(
+    role: Role,
+    mut backend: impl Backend + Send + 'static,
+    tx: Sender<UiEvent>,
+) -> Sender<Cmd> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
     std::thread::spawn(move || {
+        let _notice = DeathNotice(tx.clone(), role);
         let mut tab = Tab::Dashboard;
         let mut next = Instant::now();
         loop {
-            let wait = next.saturating_duration_since(Instant::now());
-            let cmd = match cmd_rx.recv_timeout(wait) {
-                Ok(c) => c,
-                Err(RecvTimeoutError::Timeout) => Cmd::Refresh(tab),
-                Err(RecvTimeoutError::Disconnected) => break,
+            let cmd = if role == Role::Main {
+                let wait = next.saturating_duration_since(Instant::now());
+                match cmd_rx.recv_timeout(wait) {
+                    Ok(c) => c,
+                    Err(RecvTimeoutError::Timeout) => Cmd::Refresh(tab),
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match cmd_rx.recv() {
+                    Ok(c) => c,
+                    Err(_) => break,
+                }
             };
             match &cmd {
                 Cmd::Visible(t) => {
@@ -346,4 +450,59 @@ pub fn spawn(mut backend: impl Backend + Send + 'static, tx: Sender<UiEvent>) ->
         }
     });
     cmd_tx
+}
+
+/// Makes the backend for a (re)started worker.
+pub type MakeBackend = Box<dyn FnMut(Role) -> Box<dyn Backend + Send>>;
+
+/// The two workers, restarted when one dies.
+pub struct Workers {
+    make: MakeBackend,
+    tx: Sender<UiEvent>,
+    main: Sender<Cmd>,
+    inspector: Sender<Cmd>,
+}
+
+impl Workers {
+    pub fn new(mut make: MakeBackend, tx: Sender<UiEvent>) -> Self {
+        let main = spawn_role(Role::Main, make(Role::Main), tx.clone());
+        let inspector = spawn_role(Role::Inspector, make(Role::Inspector), tx.clone());
+        Workers {
+            make,
+            tx,
+            main,
+            inspector,
+        }
+    }
+
+    /// Replace a worker (after [`UiEvent::WorkerDied`]).
+    pub fn restart(&mut self, role: Role) {
+        let w = spawn_role(role, (self.make)(role), self.tx.clone());
+        match role {
+            Role::Main => self.main = w,
+            Role::Inspector => self.inspector = w,
+        }
+    }
+
+    /// Send to the right worker. Returns false if it was dead (it is then
+    /// restarted and the command resent).
+    pub fn send(&mut self, cmd: Cmd) -> bool {
+        let role = cmd.role();
+        let to = match role {
+            Role::Main => &self.main,
+            Role::Inspector => &self.inspector,
+        };
+        match to.send(cmd) {
+            Ok(()) => true,
+            Err(mpsc::SendError(cmd)) => {
+                self.restart(role);
+                let to = match role {
+                    Role::Main => &self.main,
+                    Role::Inspector => &self.inspector,
+                };
+                let _ = to.send(cmd);
+                false
+            }
+        }
+    }
 }

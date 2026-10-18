@@ -36,7 +36,7 @@ use serde_json::Value;
 
 pub use app::{App, Conn, Hit, Level, MAX_EVENTS, Tab};
 pub use theme::Theme;
-pub use worker::{Cmd, Msg, Starter};
+pub use worker::{Cmd, Down, Msg, Starter};
 
 /// Where requests go (the daemon, or a fake in tests).
 pub trait Backend {
@@ -53,6 +53,18 @@ pub trait Backend {
     }
 }
 
+impl<B: Backend + ?Sized> Backend for Box<B> {
+    fn call(&mut self, req: Request) -> anyhow::Result<Value> {
+        (**self).call(req)
+    }
+    fn start_hint(&mut self) -> Option<String> {
+        (**self).start_hint()
+    }
+    fn start_daemon(&mut self) -> anyhow::Result<String> {
+        (**self).start_daemon()
+    }
+}
+
 impl Backend for Client {
     fn call(&mut self, req: Request) -> anyhow::Result<Value> {
         Ok(Client::call(self, req)?)
@@ -63,6 +75,8 @@ impl Backend for Client {
 pub enum UiEvent {
     Term(event::Event),
     Msg(Msg),
+    /// A worker thread panicked; the loop restarts it.
+    WorkerDied(worker::Role),
 }
 
 /// Render `app` into a `width`×`height` text screen (no terminal needed).
@@ -138,8 +152,19 @@ fn run_loop(
     let (tx, rx) = mpsc::channel::<UiEvent>();
     let mut app = App::new();
     app.theme = Theme::from_env();
-    let cmds = worker::spawn(
-        worker::Live::new(runtime_dir, tx.clone(), starter),
+    let starter = starter.map(|s| std::sync::Arc::new(std::sync::Mutex::new(s)));
+    let dir = runtime_dir.to_path_buf();
+    let wtx = tx.clone();
+    let mut workers = worker::Workers::new(
+        Box::new(move |role| -> Box<dyn Backend + Send> {
+            Box::new(match role {
+                // The main worker owns the event subscription and the starter.
+                worker::Role::Main => {
+                    worker::Live::shared(&dir, wtx.clone(), starter.clone(), true)
+                }
+                worker::Role::Inspector => worker::Live::shared(&dir, wtx.clone(), None, false),
+            })
+        }),
         tx.clone(),
     );
     let input_tx = tx;
@@ -152,7 +177,9 @@ fn run_loop(
     });
     loop {
         for c in app.take_cmds() {
-            let _ = cmds.send(c);
+            if !workers.send(c) {
+                app.on_worker_died(None);
+            }
         }
         if app.should_quit() {
             return Ok(());
@@ -181,6 +208,10 @@ fn run_loop(
             match ev {
                 UiEvent::Term(e) => app.on_term(e),
                 UiEvent::Msg(m) => app.on_msg(m),
+                UiEvent::WorkerDied(role) => {
+                    workers.restart(role);
+                    app.on_worker_died(Some(role));
+                }
             }
         }
         app.tick(Instant::now());
