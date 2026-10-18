@@ -1135,6 +1135,140 @@ mod tests {
         ("plain [NAME_1] text", "plain [NAME_1] text"),
     ];
 
+    /// Feeds `pieces` to one guard; after each, the readings stay bounded.
+    /// Says, for each `[NAME_1]` in the text, whether it is in a URL part.
+    fn tags_guarded(pieces: &[String]) -> Vec<bool> {
+        let mut g = UrlGuard::default();
+        let mut mask = Vec::new();
+        for piece in pieces {
+            for part in g.split(piece) {
+                mask.extend(part.text.chars().map(|_| part.url));
+            }
+            assert!(
+                g.md.len() <= MAX_THREADS,
+                "{} markdown readings",
+                g.md.len()
+            );
+            assert!(g.tags.len() <= 7, "{} tag readings", g.tags.len());
+            assert!(g.css.len() <= 13, "{} CSS readings", g.css.len());
+            assert!(g.recent.chars().count() <= RECENT_CHARS);
+        }
+        let text: Vec<char> = pieces.concat().chars().collect();
+        let tag: Vec<char> = "[NAME_1]".chars().collect();
+        (0..text.len())
+            .filter(|&i| text[i..].starts_with(&tag))
+            .map(|i| mask[i])
+            .collect()
+    }
+
+    /// `text` in pieces of `n` characters.
+    fn chunks(text: &str, n: usize) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        chars.chunks(n).map(|c| c.iter().collect()).collect()
+    }
+
+    #[test]
+    fn state_holds_across_splits_after_long_inputs() {
+        let prose = "word ".repeat(40_000);
+        let cases: Vec<(String, Vec<bool>)> = vec![
+            // A destination after long prose, itself long.
+            (
+                format!("{prose}![x](//e/{}[NAME_1]) [NAME_1]", "a".repeat(100_000)),
+                vec![true, false],
+            ),
+            // A quoted value over 20 000 lines.
+            (
+                format!(
+                    "<img alt=\"{}\" src=\"//e/[NAME_1]\"> [NAME_1]",
+                    "l\n".repeat(20_000)
+                ),
+                vec![true, false],
+            ),
+            // A reference label of many lines, its destination on the next.
+            (
+                format!("[{}]:\n//e/[NAME_1]\n\n[NAME_1]", "l\n".repeat(300)),
+                vec![true, false],
+            ),
+            // Deep parentheses.
+            (
+                format!(
+                    "[a]({}[NAME_1]{}) [NAME_1]",
+                    "(".repeat(50_000),
+                    ")".repeat(50_000)
+                ),
+                vec![true, false],
+            ),
+            // Many readings at once: bounded, and the next constructs are
+            // still read.
+            (
+                format!("{}\n![a](//e/[NAME_1]) [NAME_1]", "](x(".repeat(50_000)),
+                vec![true, false],
+            ),
+            (
+                format!(
+                    "{}\n<img src=//e/[NAME_1]> [NAME_1]",
+                    "<a b='<c d=\"".repeat(20_000)
+                ),
+                vec![true, true],
+            ),
+            (
+                format!("{}')\"))\n[NAME_1]", "url(url('url(\"".repeat(20_000)),
+                vec![true],
+            ),
+        ];
+        for (text, want) in &cases {
+            for n in [1 << 12, 7, 1 << 20] {
+                assert_eq!(&tags_guarded(&chunks(text, n)), want, "pieces of {n}");
+            }
+        }
+        // Keywords split across calls after long text.
+        let long = "x ".repeat(100_000);
+        for pieces in [
+            vec![
+                format!("{long}ur"),
+                "l".into(),
+                "(//e/[NAME_1]) [NAME_1]".into(),
+            ],
+            vec![
+                format!("{long}@imp"),
+                "ort '//e/[NAME_1]';".into(),
+                " [NAME_1]".into(),
+            ],
+            vec![
+                format!("{long}<sty"),
+                "le>[NAME_1]</st".into(),
+                "yle> [NAME_1]".into(),
+            ],
+            vec![
+                format!("{long}ww"),
+                "w.e/[NAME_1]".into(),
+                " [NAME_1]".into(),
+            ],
+            vec![
+                format!("{long}htt"),
+                "p:/".into(),
+                "/e/[NAME_1] [NAME_1]".into(),
+            ],
+            vec![
+                format!("{long}![x]"),
+                "(".into(),
+                "//e/[NAME_1]) [NAME_1]".into(),
+            ],
+            vec![
+                format!("{long}<im"),
+                "g src".into(),
+                "=//e/[NAME_1]> [NAME_1]".into(),
+            ],
+            vec![
+                format!("{long}u\\72"),
+                "l(".into(),
+                "//e/[NAME_1]) [NAME_1]".into(),
+            ],
+        ] {
+            assert_eq!(tags_guarded(&pieces), [true, false], "{:?}", &pieces[1..]);
+        }
+    }
+
     #[test]
     fn markdown_destinations_follow_commonmark() {
         for &(input, want) in MD_EXACT {
