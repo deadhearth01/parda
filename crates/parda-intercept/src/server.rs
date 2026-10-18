@@ -1027,6 +1027,18 @@ fn emit(
     refused: Option<String>,
     unscanned: u32,
 ) {
+    // Diagnostics (opt-in with PARDA_LOG=…,parda_intercept=debug): the path
+    // and outcome only, never the query string or any value.
+    tracing::debug!(
+        host = %target.host,
+        %path,
+        status,
+        ?counts,
+        added_ms,
+        refused = refused.as_deref().unwrap_or(""),
+        unscanned,
+        "intercept: request"
+    );
     // No subscribers is fine.
     let _ = state.events.send(InterceptEvent {
         host: target.host.clone(),
