@@ -2722,6 +2722,7 @@ dependencies = [
  "clap",
  "dialoguer",
  "indicatif",
+ "libc",
  "parda-core",
  "parda-daemon",
  "parda-detect",

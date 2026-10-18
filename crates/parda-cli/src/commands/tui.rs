@@ -1,8 +1,8 @@
 //! `parda` / `parda tui`: the dashboard, and how its offline screen starts
 //! the daemon.
 
-use std::fs::OpenOptions;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -85,9 +85,24 @@ fn hint(plan: &Plan, home: Option<&Path>) -> String {
 /// Works out (lazily, on the TUI's worker thread) and runs the start plan.
 struct Launcher {
     paths: Paths,
+    /// The daemon this dashboard started, while it may still be running.
+    child: Option<Child>,
+    /// How to start it (tests use a harmless stand-in).
+    spawn: fn(&Paths) -> anyhow::Result<Child>,
+    /// How long to watch a fresh daemon for an immediate exit.
+    settle: Duration,
 }
 
 impl Launcher {
+    fn new(paths: Paths) -> Self {
+        Launcher {
+            paths,
+            child: None,
+            spawn: |p| Ok(daemon_command(p)?.spawn()?),
+            settle: Duration::from_millis(800),
+        }
+    }
+
     fn plan(&self) -> Plan {
         let installed = service::installed().ok().flatten();
         plan(installed.as_ref(), self.paths.home.as_deref())
@@ -100,17 +115,49 @@ impl Launcher {
     fn start(&mut self) -> anyhow::Result<String> {
         match self.plan() {
             Plan::Service => start_service(),
-            Plan::Spawn { .. } => spawn_daemon(&self.paths),
+            Plan::Spawn { .. } => self.spawn_once(),
         }
+    }
+
+    /// Start `parda daemon` unless the one started earlier still runs.
+    fn spawn_once(&mut self) -> anyhow::Result<String> {
+        if let Some(c) = &mut self.child
+            && c.try_wait()?.is_none()
+        {
+            anyhow::bail!(
+                "`parda daemon` (pid {}) started from here is still running — waiting for it",
+                c.id()
+            );
+        }
+        self.child = None;
+        self.paths.ensure()?;
+        let mut child = (self.spawn)(&self.paths)?;
+        // Its output goes nowhere (it logs to its own files), so catch a
+        // daemon that dies at once (vault locked, bad config) here.
+        let deadline = Instant::now() + self.settle;
+        while Instant::now() < deadline {
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!(
+                    "`parda daemon` exited at once ({status}) — run `parda daemon` in a terminal \
+                     to see why"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let pid = child.id();
+        self.child = Some(child);
+        Ok(format!(
+            "started `parda daemon` (pid {pid}) for {} — logs in {}",
+            home_label(self.paths.home.as_deref()),
+            self.paths.log_dir.display()
+        ))
     }
 }
 
 /// The offline screen's start key. Nothing is looked up or run until the
 /// daemon is found offline (describe) or the key is pressed (start).
 fn starter(paths: &Paths) -> parda_tui::Starter {
-    let l = Arc::new(Mutex::new(Launcher {
-        paths: paths.clone(),
-    }));
+    let l = Arc::new(Mutex::new(Launcher::new(paths.clone())));
     let l2 = Arc::clone(&l);
     parda_tui::Starter {
         describe: Box::new(move || l.lock().map(|mut l| l.describe()).unwrap_or_default()),
@@ -122,36 +169,61 @@ fn starter(paths: &Paths) -> parda_tui::Starter {
     }
 }
 
-fn run_ok(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
-    let out = Command::new(cmd)
+/// A system tool by absolute path, never whatever `PATH` finds first.
+fn tool(name: &str) -> PathBuf {
+    if cfg!(windows) {
+        let root = std::env::var_os("SystemRoot")
+            .filter(|r| !r.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        return root.join("System32").join(format!("{name}.exe"));
+    }
+    let candidates: &[&str] = match name {
+        "launchctl" => &["/bin/launchctl"],
+        "id" => &["/usr/bin/id"],
+        "systemctl" => &["/usr/bin/systemctl", "/bin/systemctl"],
+        _ => &[],
+    };
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists())
+        .or_else(|| candidates.first().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("/usr/bin").join(name))
+}
+
+/// Run a tool; its stdout, or an error with its stderr if it failed.
+fn run_ok(name: &str, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+    let out = Command::new(tool(name))
         .args(args)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| anyhow::anyhow!("running {cmd}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("running {name}: {e}"))?;
     if out.status.success() {
-        Ok(())
+        Ok(out.stdout)
     } else {
         anyhow::bail!(
-            "{cmd} failed: {}",
+            "{name} failed ({}): {}",
+            out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         )
     }
 }
 
+fn parse_uid(out: &[u8]) -> anyhow::Result<u32> {
+    String::from_utf8_lossy(out)
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("`id -u` gave no user id"))
+}
+
 fn start_service() -> anyhow::Result<String> {
     if cfg!(target_os = "macos") {
-        let uid = Command::new("id").arg("-u").output()?;
-        let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
+        let uid = parse_uid(&run_ok("id", &["-u"])?)?;
         let target = format!("gui/{uid}/{}", service::LAUNCHD_LABEL);
         if run_ok("launchctl", &["kickstart", &target]).is_err() {
             // Installed but not loaded (e.g. after `launchctl bootout`).
-            let plist = std::env::var_os("HOME")
-                .map(|h| {
-                    std::path::PathBuf::from(h)
-                        .join("Library/LaunchAgents")
-                        .join(format!("{}.plist", service::LAUNCHD_LABEL))
-                })
-                .ok_or_else(|| anyhow::anyhow!("cannot find the home directory"))?;
+            let plist = service::launchd_plist()?;
             run_ok(
                 "launchctl",
                 &[
@@ -171,27 +243,40 @@ fn start_service() -> anyhow::Result<String> {
     Ok("asked the login service to start parda — waiting for it".into())
 }
 
-fn spawn_daemon(paths: &Paths) -> anyhow::Result<String> {
-    std::fs::create_dir_all(&paths.log_dir)?;
-    let log_path = paths.log_dir.join("daemon.out.log");
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+/// `parda daemon` for this home, detached from the terminal: its own
+/// session, no stdio (it logs to its own files), the home as its working
+/// directory and PARDA_HOME, both absolute.
+fn daemon_command(paths: &Paths) -> anyhow::Result<Command> {
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("daemon")
         .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    if let Some(home) = &paths.home {
-        cmd.env("PARDA_HOME", home);
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match &paths.home {
+        Some(home) => {
+            let home = std::path::absolute(home)?;
+            cmd.current_dir(&home).env("PARDA_HOME", &home);
+        }
+        None => {
+            cmd.current_dir(std::path::absolute(&paths.data_dir)?)
+                .env_remove("PARDA_HOME");
+        }
     }
-    // Its own process group / console, so Ctrl-C and closing this terminal
-    // do not stop it.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
+        // SAFETY: setsid is async-signal-safe and touches no memory of
+        // this process; it runs in the forked child before exec, so
+        // closing the terminal or Ctrl-C in it does not reach the daemon.
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     #[cfg(windows)]
     {
@@ -200,16 +285,7 @@ fn spawn_daemon(paths: &Paths) -> anyhow::Result<String> {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
-    let mut child = cmd.spawn()?;
-    let pid = child.id();
-    // Reap it if it exits while the dashboard runs.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(format!(
-        "started `parda daemon` (pid {pid}) — output in {}",
-        log_path.display()
-    ))
+    Ok(cmd)
 }
 
 #[cfg(test)]
@@ -266,5 +342,77 @@ mod tests {
         );
         let h = hint(&Plan::Service, None);
         assert!(h.contains("login service") && h.contains("default"), "{h}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn m1_a_second_start_waits_for_the_daemon_started_from_here() {
+        let dir = std::env::temp_dir().join(format!("parda-launch-{}", std::process::id()));
+        let mut l = Launcher::new(Paths::under(dir.clone()));
+        // A harmless stand-in for the daemon; tests never start one.
+        l.spawn = |_| Ok(Command::new("/bin/sleep").arg("30").spawn()?);
+        l.settle = Duration::from_millis(50);
+        assert!(l.spawn_once().is_ok());
+        let e = l.spawn_once().unwrap_err().to_string();
+        assert!(e.contains("still running"), "{e}");
+        let c = l.child.as_mut().unwrap();
+        c.kill().unwrap();
+        c.wait().unwrap();
+        assert!(l.spawn_once().is_ok(), "once it has exited, start again");
+        let c = l.child.as_mut().unwrap();
+        c.kill().unwrap();
+        c.wait().unwrap();
+        // A daemon that dies at once says so instead of a silent wait.
+        l.spawn = |_| Ok(Command::new("/usr/bin/false").spawn()?);
+        l.settle = Duration::from_millis(1500);
+        let e = l.spawn_once().unwrap_err().to_string();
+        assert!(e.contains("exited at once"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn m2_the_daemon_runs_detached_in_its_absolute_home() {
+        let cmd = daemon_command(&Paths::under(PathBuf::from("rel-parda-home"))).unwrap();
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["daemon"]);
+        let dir = cmd.get_current_dir().unwrap().to_path_buf();
+        assert!(
+            dir.is_absolute() && dir.ends_with("rel-parda-home"),
+            "{dir:?}"
+        );
+        let env: Vec<_> = cmd.get_envs().collect();
+        assert!(
+            env.contains(&(std::ffi::OsStr::new("PARDA_HOME"), Some(dir.as_os_str()))),
+            "{env:?}"
+        );
+        let no_home = Paths {
+            home: None,
+            ..Paths::under(PathBuf::from("/x"))
+        };
+        let cmd = daemon_command(&no_home).unwrap();
+        assert!(cmd.get_current_dir().unwrap().is_absolute());
+        assert!(
+            cmd.get_envs()
+                .any(|(k, v)| k == "PARDA_HOME" && v.is_none()),
+            "an inherited PARDA_HOME is removed"
+        );
+    }
+
+    #[test]
+    fn m3_system_tools_by_absolute_path_and_checked_output() {
+        let tools: &[&str] = if cfg!(target_os = "macos") {
+            &["launchctl", "id"]
+        } else if cfg!(target_os = "linux") {
+            &["systemctl"]
+        } else if cfg!(windows) {
+            &["schtasks"]
+        } else {
+            &[]
+        };
+        for t in tools {
+            assert!(tool(t).is_absolute(), "{t}: {:?}", tool(t));
+        }
+        assert_eq!(parse_uid(b"501\n").unwrap(), 501);
+        assert!(parse_uid(b"").is_err());
+        assert!(parse_uid(b"root").is_err());
     }
 }
