@@ -17,7 +17,7 @@ use crate::server::MAX_REQUEST_BODY;
 use crate::sites;
 use crate::transform::RequestOutcome;
 use crate::walk::{
-    Found, Role, Rules, Sink, Tier, Visit, is_json_document, read_text, utf8_charset,
+    Found, Role, Rules, Sink, Tier, Visit, is_json_document, read_counted, read_text, utf8_charset,
     walk_multipart,
 };
 use crate::{BodyTransform, Refusal, StreamTransform};
@@ -109,10 +109,14 @@ impl EngineTransform {
 
         // Pass 1: collect the texts (identifiers skip only the ML model).
         let mut collect = Collect::default();
+        let mut unscanned = 0;
         if let Some(q) = query {
-            read_text(q, Role::Form, &rules, &mut collect).map_err(|_| unparseable())?;
+            unscanned += read_counted(q, Role::Form, &rules, &mut collect)
+                .map_err(|_| unparseable())?
+                .1;
         }
-        let (_, mut unscanned) = body.walk(&rules, &mut collect)?;
+        let (_, in_body) = body.walk(&rules, &mut collect)?;
+        unscanned += in_body;
         // An upgrade (WebSocket) tunnels its frames unread: one unscanned
         // part, refused before the handshake leaves under "block".
         if crate::server::is_upgrade(headers) {
@@ -301,12 +305,11 @@ impl ReqBody {
     fn walk(&mut self, rules: &Rules<'_>, f: Visit<'_>) -> Result<(Option<Bytes>, u32), Refusal> {
         Ok(match self {
             ReqBody::Empty => (None, 0),
-            ReqBody::Text { text, role } => (
-                read_text(text, *role, rules, f)
-                    .map_err(|_| unparseable())?
-                    .map(Bytes::from),
-                0,
-            ),
+            ReqBody::Text { text, role } => {
+                let (new, unscanned) =
+                    read_counted(text, *role, rules, f).map_err(|_| unparseable())?;
+                (new.map(Bytes::from), unscanned)
+            }
             ReqBody::Multipart { raw, boundary } => {
                 let w = walk_multipart(raw, boundary, rules, f).map_err(|_| unparseable())?;
                 (w.body.map(Bytes::from), w.unscanned)
@@ -1081,19 +1084,17 @@ pub(crate) mod tests {
             rewrite(&t, "chatgpt.com", "application/json", ids.clone()).body,
             ids
         );
-        // Beyond the JSON-in-string depth limit the rest is redacted as text.
+        // Beyond the JSON-in-string depth limit parda fails closed: JSON
+        // still there is refused, never read as text only.
         let mut s = json!({"note": "Ravi Kumar, ravi@example.com"}).to_string();
         for _ in 0..6 {
             s = json!([s]).to_string();
         }
-        let out = rewrite(
+        assert_unparseable(&refusal(
             &t,
-            "chatgpt.com",
             "application/json",
             json_body(&json!({"blob": s})),
-        );
-        let text = String::from_utf8(out.body.to_vec()).unwrap();
-        assert!(!text.contains("Ravi") && !text.contains("ravi@"), "{text}");
+        ));
         // A string that only looks like JSON is text.
         let v = send(json!({"blob": "[Ravi Kumar, ravi@example.com"}));
         assert_eq!(v["blob"], "[[NAME_1], [EMAIL_3]");

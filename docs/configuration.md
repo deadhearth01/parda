@@ -106,12 +106,16 @@ Tags follow `replace.style` (there is no separate style for intercept).
     among other text; leading and trailing Unicode whitespace such as `\f`, `\v` or NBSP and a
     byte-order mark skipped); and, when it holds `%XX`, `+` or `=`, decoded as a form (`+` a space).
     Each string, key and number found that way is read the same ways again (JSON inside a string,
-    such as Gemini's `f.req`, or inside a form value), four levels deep; deeper, it is read literally.
+    such as Gemini's `f.req`, or inside a form value), four levels deep (a level is a reading that
+    decodes or opens something). Deeper, parda fails closed: text still JSON-looking, escaped,
+    `%XX`- or `+`-encoded there is refused; anything else is read literally and counted unscanned.
     What any reading finds is replaced in the bytes that go out, encoded as each layer needs (JSON
     escaped, percent-encoded), so no reading of the forwarded body holds it: an escape such as
     `\n9876543210` cannot hide a number, nor `+` or `%40` a name or an e-mail. Numbers are text:
-    one that holds a value becomes a JSON string holding its tag, except under identifier keys
-    (`create_time`, `*_id`), where numbers are kept as written. A value the whole text shows but
+    one that holds a value becomes a JSON string holding its tag. Under identifier keys
+    (`create_time`, `*_id`) numbers meet the rules only and are kept as written, unless a rule finds
+    the whole number (an id that is a phone, card or Aadhaar number): then the request is refused,
+    as a string in its place would break its type. A value the whole text shows but
     single tokens do not (`{"Ravi":"Kumar"}`) is replaced in each token it covers. Text that looks
     like escaped JSON (starting with `{`, `[` or `"`, or a line that does, holding a backslash;
     inside a body, text bracketed like JSON) but is not JSON is refused; what the user typed under
@@ -133,14 +137,15 @@ Tags follow `replace.style` (there is no separate style for intercept).
     UTF-8 (a declared charset other than UTF-8, or NUL bytes, as UTF-16 has), or use another
     transfer encoding (quoted-printable); bodies of any type other than form, `text/*` or JSON
     that are not UTF-8 or hold NUL bytes (images, binary data); WebSocket (and other protocol
-    upgrade) connections, whose frames are tunnelled without inspection, so with `"block"` the
+    upgrade) connections, whose frames are tunnelled without inspection; text past the reading depth,
+    read only literally, so with `"block"` the
     upgrade request is refused before it reaches the site. Headers other than `Referer` are
     forwarded as they are.
   - *Refused, never sent unfiltered.* The message names the problem and never quotes the request.
 
     | Status and code | When |
     |---|---|
-    | `400 parda_unparseable_body` | a body or multipart field typed as JSON that is not JSON; text that looks like escaped JSON but is not JSON (see above); a JSON key given twice (anywhere, JSON inside strings, forms and queries included); two keys that redaction would make the same; a multipart body without a boundary, that does not split as RFC 2046 says, or whose preamble or epilogue holds the boundary |
+    | `400 parda_unparseable_body` | a body or multipart field typed as JSON that is not JSON; text that looks like escaped JSON but is not JSON (see above); a number under an identifier key that is wholly a phone, card or Aadhaar number; text past the reading depth that is still encoded; a JSON key given twice (anywhere, JSON inside strings, forms and queries included); two keys that redaction would make the same; a multipart body without a boundary, that does not split as RFC 2046 says, or whose preamble or epilogue holds the boundary |
     | `400 parda_not_utf8` | a body of any type declaring a charset other than UTF-8 or US-ASCII; a `Content-Type` holding bytes outside visible ASCII, or two different ones; a form or `text/*` body that is not UTF-8 or holds NUL bytes (UTF-16) |
     | `413 parda_body_too_large` | a body too large to filter |
     | `415 parda_unsupported_encoding` | a `content-encoding` parda cannot decode |

@@ -1038,6 +1038,11 @@ fn visit(text: &str, tier: Tier, f: Visit<'_>) -> Vec<Edit> {
 /// layer needs; a value the literal reading finds across JSON tokens is
 /// replaced in each token it covers (never in an identifier).
 ///
+/// A level of depth is a reading that decodes or opens something (a split
+/// at `&` or `=` that decodes nothing is not). Past `MAX_DEPTH` parda fails
+/// closed: text still encoded there (see [`still_encoded`]) is refused, and
+/// anything else is read literally and counted in `unscanned`.
+///
 /// Also returns whether JSON was read in `raw` (at any depth).
 fn read(
     raw: &str,
@@ -1045,9 +1050,21 @@ fn read(
     depth: usize,
     rules: &Rules<'_>,
     f: Visit<'_>,
+    unscanned: &mut u32,
 ) -> Result<(Vec<Edit>, bool), Malformed> {
     if raw.trim_matches(skippable).is_empty() {
         return Ok((Vec::new(), false));
+    }
+    if depth >= MAX_DEPTH
+        && !matches!(
+            serde_json::from_str::<Value>(raw.trim()),
+            Ok(Value::Number(_))
+        )
+    {
+        if still_encoded(raw) {
+            return Err(Malformed);
+        }
+        *unscanned += 1;
     }
     let tier = role.tier(raw, rules);
     let role = if tier == Tier::Identifier {
@@ -1062,9 +1079,11 @@ fn read(
     };
     // The literal reading, identifiers hidden: they skip the model.
     let mut literal = raw.as_bytes().to_vec();
+    let mut masked = false;
     if tier == Tier::Text {
         for p in view.parts.iter().filter(|p| p.ident) {
             literal[p.start..p.end].fill(b'_');
+            masked = true;
         }
     }
     // Whole characters became `_`: still UTF-8.
@@ -1073,14 +1092,39 @@ fn read(
     // before the fragments the literal reading may see.
     let mut edits = Vec::new();
     let mut json = vec![false; view.parts.len()];
-    for (n, part) in view.parts.iter().enumerate().filter(|(_, p)| !p.verbatim) {
-        let (found, is_json) = read(&part.text, part.role, depth + 1, rules, f)?;
+    for (n, part) in view.parts.iter().enumerate() {
+        let decodes = !part.percent || part.text != raw[part.start..part.end];
+        let depth = depth + usize::from(decodes);
+        let (found, is_json) = read(&part.text, part.role, depth, rules, f, unscanned)?;
         json[n] = is_json;
         edits.extend(found.into_iter().map(|e| part.lift(raw, e, n + 1)));
     }
     edits.extend(visit(&literal, tier, f));
+    // The rules see the identifiers too: a value across them is not hidden.
+    if masked {
+        edits.extend(visit(raw, Tier::Identifier, f).into_iter().map(|e| Edit {
+            view: UNMASKED,
+            ..e
+        }));
+    }
     let has_json = !view.docs.is_empty() || json.contains(&true);
     Ok((merge(raw, edits, &view, &json, f)?, has_json))
+}
+
+/// The view of the literal reading that the rules make of the unmasked text
+/// (identifiers included).
+const UNMASKED: usize = usize::MAX;
+
+/// Text at the depth limit that still reads differently some other way:
+/// JSON-looking (`{`, `[` or `"` after whitespace), JSON escapes, `%XX` or
+/// `+`.
+fn still_encoded(text: &str) -> bool {
+    let b = text.as_bytes();
+    opens_json(&text[trimmed(text, 0, text.len())])
+        || b.windows(2)
+            .any(|w| w[0] == b'\\' && b"\"\\/bfnrtu".contains(&w[1]))
+        || has_escape(text)
+        || text.contains('+')
 }
 
 /// Merge what the readings of `raw` found into disjoint edits, as `raw`
@@ -1098,17 +1142,31 @@ fn merge(
     f: Visit<'_>,
 ) -> Result<Vec<Edit>, Malformed> {
     let mut forget = |kinds: &[String]| kinds.iter().for_each(|k| f.forget(k));
+    let literal = |e: &Edit| e.view == 0 || e.view == UNMASKED;
     let found_in_parts: Vec<(usize, usize, usize)> = edits
         .iter()
-        .filter(|e| e.view != 0)
+        .filter(|e| !literal(e))
         .map(|e| (e.start, e.end, e.view))
         .collect();
     let mut hits = Vec::with_capacity(edits.len());
     for e in edits {
-        if e.view != 0 {
+        if !literal(&e) {
+            // A number under an identifier key keeps its value unless the
+            // value is all a finding (an id that is a phone or card
+            // number): a string in its place would break its type, so the
+            // request is refused.
+            let p = &view.parts[e.view - 1];
+            if p.verbatim {
+                if e.start <= p.start && p.end <= e.end {
+                    return Err(Malformed);
+                }
+                forget(&e.kinds);
+                continue;
+            }
             hits.push(e);
             continue;
         }
+        let unmasked = e.view == UNMASKED;
         // What the literal reading found, cut where it enters or leaves a
         // JSON value.
         let mut cuts = Vec::new();
@@ -1171,8 +1229,24 @@ fn merge(
                 // across them is replaced in each (identifiers keep theirs).
                 // Where a string's own (unescaped) reading found something,
                 // it decides: read raw, escapes glue letters to a value.
+                // Wholly inside one identifier, the identifier's own (rules)
+                // reading decides: a rule that fires on its key nearby
+                // (`"token":…`) must not change a token the site needs.
+                let only = view.parts.iter().filter(|p| p.overlaps(&cut)).count() == 1;
                 for (n, p) in view.parts.iter().enumerate() {
-                    if p.ident || !p.overlaps(&cut) {
+                    if !p.overlaps(&cut) {
+                        continue;
+                    }
+                    if only && p.ident && !p.verbatim && p.start <= start && end <= p.end {
+                        continue;
+                    }
+                    if p.verbatim {
+                        if unmasked && start <= p.start && p.end <= end {
+                            return Err(Malformed);
+                        }
+                        continue;
+                    }
+                    if p.ident && !unmasked {
                         continue;
                     }
                     let (start, end) = p.align(start.max(p.start), end.min(p.end));
@@ -1318,12 +1392,24 @@ pub(crate) fn read_text(
     rules: &Rules<'_>,
     f: Visit<'_>,
 ) -> Result<Option<String>, Malformed> {
-    let (edits, _) = read(raw, role, 0, rules, f)?;
+    read_counted(raw, role, rules, f).map(|(text, _)| text)
+}
+
+/// [`read_text`], also returning how many texts past the depth limit were
+/// only read literally (unscanned).
+pub(crate) fn read_counted(
+    raw: &str,
+    role: Role,
+    rules: &Rules<'_>,
+    f: Visit<'_>,
+) -> Result<(Option<String>, u32), Malformed> {
+    let mut unscanned = 0;
+    let (edits, _) = read(raw, role, 0, rules, f, &mut unscanned)?;
     if edits.is_empty() {
-        return Ok(None);
+        return Ok((None, unscanned));
     }
     let out = apply(raw, &edits)?;
-    Ok((out != raw).then_some(out))
+    Ok(((out != raw).then_some(out), unscanned))
 }
 
 /// Redact a multipart field named `name` (see [`read_text`]); one declared
@@ -1334,12 +1420,12 @@ fn read_field(
     json: bool,
     rules: &Rules<'_>,
     f: Visit<'_>,
-) -> Result<Option<String>, Malformed> {
+) -> Result<(Option<String>, u32), Malformed> {
     if json && !is_json_document(text)? {
         return Err(Malformed);
     }
     let role = name.map_or(Role::Body, |n| Role::Body.member(n, rules));
-    read_text(text, role, rules, f)
+    read_counted(text, role, rules, f)
 }
 
 /// What a multipart walk did.
@@ -1347,7 +1433,8 @@ fn read_field(
 pub(crate) struct MultipartWalk {
     /// The rewritten body, when a text part changed.
     pub(crate) body: Option<Vec<u8>>,
-    /// File parts (and non-text or non-UTF-8 fields) forwarded unscanned.
+    /// File parts (and non-text or non-UTF-8 fields) forwarded unscanned,
+    /// and texts past the reading depth read only literally.
     pub(crate) unscanned: u32,
 }
 
@@ -1579,7 +1666,9 @@ pub(crate) fn walk_multipart(
                     .content_type
                     .as_deref()
                     .is_some_and(|t| t.starts_with("application/json") || t.contains("+json"));
-                if let Some(value) = read_field(&text, part.name.as_deref(), json, rules, f)? {
+                let (value, deep) = read_field(&text, part.name.as_deref(), json, rules, f)?;
+                walk.unscanned += deep;
+                if let Some(value) = value {
                     new = Some(if base64 {
                         base64_encode(value.as_bytes())
                     } else {
@@ -1872,6 +1961,9 @@ mod tests {
         })
         .to_string();
         let mut seen = visits(&body, Role::Body, &r);
+        // Last the whole text unmasked, for the rules only (a value across
+        // identifiers is not hidden from them).
+        assert_eq!(seen.pop().unwrap(), format!("#{body}"));
         let literal = seen.pop().unwrap();
         // Every string, key and number is read on its own. Identifier-shaped
         // values under identifier keys (or looking like ids) skip only the
@@ -1910,6 +2002,7 @@ mod tests {
                 "timezone_offset_min",
                 "#-330",
                 "#create_time",
+                "#1760000000.123",
                 "#client_contextual_info",
                 "page_title",
                 "x",
@@ -1974,17 +2067,14 @@ mod tests {
         for v in ["id", "Ravi Kumar", "ab12"] {
             assert!(seen.iter().any(|s| s == v), "{seen:?}");
         }
-        // Nesting beyond the limit is read literally, never skipped.
+        // Nesting beyond the limit fails closed: still JSON there, refused.
         let mut s = String::from("\"deep Ravi\"");
         for _ in 0..6 {
             s = serde_json::to_string(&json!([s])).unwrap();
         }
-        let out = read_text(&s, Role::Body, &r, &mut { ravi_anywhere })
-            .unwrap()
-            .unwrap();
-        assert!(
-            !out.contains("deep Ravi") && out.contains("deep RAVI"),
-            "{out}"
+        assert_eq!(
+            read_text(&s, Role::Body, &r, &mut { ravi_anywhere }),
+            Err(Malformed)
         );
     }
 
@@ -2077,6 +2167,18 @@ mod tests {
             find(ids, Role::Body, &[("1760000000", "[X]")]),
             Ok(ids.into())
         );
+        // The rules see identifiers in the whole text too: a value across an
+        // identifier and text is replaced in each piece, the identifier's
+        // included; one wholly inside an identifier is left to the
+        // identifier's own reading.
+        assert_eq!(
+            find(
+                r#"{"id":"98765","n":"43210"}"#,
+                Role::Body,
+                &[(r#"98765","n":"43210"#, "[X]")]
+            ),
+            Ok(r#"{"id":"[X]","[X]":"[X]"}"#.into())
+        );
         // The strings and numbers of a JSON line among text change; the text
         // around is read literally.
         assert_eq!(
@@ -2111,7 +2213,21 @@ mod tests {
         ] {
             assert!(seen.iter().any(|s| s == v), "{v}: {seen:?}");
         }
-        assert!(!seen.last().unwrap().contains("AJvLN6M"));
+        // The model's literal reading hides identifiers; the rules' does not.
+        let whole: Vec<_> = seen
+            .iter()
+            .filter(|s| s.trim_start_matches('#').len() == raw.len())
+            .collect();
+        assert!(
+            whole
+                .iter()
+                .any(|s| !s.starts_with('#') && !s.contains("AJvLN6M"))
+        );
+        assert!(
+            whole
+                .iter()
+                .any(|s| s.starts_with('#') && s.contains("AJvLN6M"))
+        );
         let ravi = |s: &mut String, t: Tier| {
             if s.starts_with("Ravi") {
                 upper(s, t)

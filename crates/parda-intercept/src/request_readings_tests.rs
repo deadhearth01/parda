@@ -688,3 +688,65 @@ mod generated {
         }
     }
 }
+
+/// Scan on 31c4d85, ruling 1: numbers under identifier keys still meet the
+/// rules. One that is a phone, card or Aadhaar number refuses the request
+/// (a string would break its type); a timestamp whose digits merely contain
+/// a phone-shaped run is kept. A value the rules see across identifier
+/// parts is not hidden from them.
+#[test]
+fn identifier_numbers_meet_the_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = transform(&engine(dir.path()), |_| {});
+    for body in [
+        "{\"id\":9876543210}",
+        "{\"order_id\":4111111111111111}",
+        "{\"timestamp\":234567890124}",
+    ] {
+        for ct in ["application/json", "text/plain"] {
+            assert_unparseable(body, &send(&t, ct, body).unwrap_err());
+        }
+    }
+    let body = "{\"create_time\":1760000000.123,\"parent_message_id\":\"client-created-root\"}";
+    let out = send(&t, "application/json", body).unwrap();
+    assert_eq!(out.body, body);
+}
+
+/// Scan on 31c4d85, ruling 2: past the reading depth parda fails closed.
+/// Text still encoded there (JSON-looking, escapes, `%XX`, `+`) is refused;
+/// anything else is read literally and counted as unscanned.
+#[test]
+fn past_the_depth_limit_parda_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = transform(&engine(dir.path()), |_| {});
+    let nest = |inner: &str, levels: usize| {
+        let mut s = inner.to_string();
+        for _ in 0..levels {
+            s = Value::String(s).to_string();
+        }
+        format!("{{\"blob\":{s}}}")
+    };
+    // Four JSON-in-string levels hold a still-encoded text: refused.
+    for inner in ["{\"m\":\"x\"}", "\"x\"", "a\\nb", "a%20b", "a+b"] {
+        let body = nest(inner, 4);
+        assert_unparseable(&body, &send(&t, "application/json", &body).unwrap_err());
+    }
+    // Plain text there: read literally, counted unscanned (refused under
+    // "block").
+    let body = nest("hello Ravi Kumar", 4);
+    let out = send(&t, "application/json", &body).unwrap();
+    assert_gone(&body, &out.body, "Kumar");
+    assert_eq!(out.unscanned, 1);
+    let block = transform(&engine(dir.path()), |c| {
+        c.unscanned = parda_core::UnscannedMedia::Block
+    });
+    assert_eq!(
+        send(&block, "application/json", &body).unwrap_err().status,
+        415
+    );
+    // Two levels are read in full.
+    let body = nest("{\"m\":\"Contact:\\n9876543210\"}", 2);
+    let out = send(&t, "application/json", &body).unwrap();
+    assert_gone(&body, &out.body, "9876543210");
+    assert_eq!(out.unscanned, 0);
+}
