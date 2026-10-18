@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crate::engine::Inner;
+use crate::restore::{UrlRun, not_url_like};
 
 pub struct StreamRestorer {
     inner: Arc<Inner>,
@@ -15,6 +16,8 @@ pub struct StreamRestorer {
     pending: String,
     /// Last character already emitted (for the word-boundary test).
     prev: Option<char>,
+    /// Url-safe mode: the URL rule's run state before `pending`.
+    url_safe: Option<UrlRun>,
 }
 
 impl StreamRestorer {
@@ -24,6 +27,26 @@ impl StreamRestorer {
             scope: scope.to_string(),
             pending: String::new(),
             prev: None,
+            url_safe: None,
+        }
+    }
+
+    /// Never restore a surrogate that follows a URL-like run of text (see
+    /// [`crate::Engine::restore_url_safe`]).
+    pub fn url_safe(mut self) -> Self {
+        self.url_safe = Some(UrlRun::default());
+        self
+    }
+
+    /// Text that went out around this restorer (left as it was): it counts
+    /// as context for what comes next. Call it with nothing held back (after
+    /// [`StreamRestorer::finish`]).
+    pub fn skip(&mut self, text: &str) {
+        if let Some(c) = text.chars().next_back() {
+            self.prev = Some(c);
+        }
+        if let Some(run) = &mut self.url_safe {
+            run.advance(text);
         }
     }
 
@@ -34,7 +57,10 @@ impl StreamRestorer {
             return self.emit_all_raw();
         };
         let mut cut = table.hold_start(&self.pending);
-        let found = table.find(&self.pending, self.prev);
+        let mut found = table.find(&self.pending, self.prev);
+        if let Some(run) = &self.url_safe {
+            found = not_url_like(&self.pending, &found, run);
+        }
         // Never cut through a complete match.
         if let Some(f) = found.iter().find(|f| f.start < cut && f.end > cut) {
             cut = f.start;
@@ -42,6 +68,9 @@ impl StreamRestorer {
         let out = table.apply_found(&self.pending[..cut], found.iter().filter(|f| f.end <= cut));
         if let Some(c) = self.pending[..cut].chars().next_back() {
             self.prev = Some(c);
+        }
+        if let Some(run) = &mut self.url_safe {
+            run.advance(&self.pending[..cut]);
         }
         self.pending.drain(..cut);
         out
@@ -52,7 +81,10 @@ impl StreamRestorer {
         let Some(table) = self.inner.table(&self.scope) else {
             return self.emit_all_raw();
         };
-        let out = table.apply(&self.pending, self.prev);
+        let out = match &mut self.url_safe {
+            Some(run) => table.apply_url_safe(&self.pending, self.prev, run),
+            None => table.apply(&self.pending, self.prev),
+        };
         if let Some(c) = self.pending.chars().next_back() {
             self.prev = Some(c);
         }
@@ -68,6 +100,9 @@ impl StreamRestorer {
     fn emit_all_raw(&mut self) -> String {
         if let Some(c) = self.pending.chars().next_back() {
             self.prev = Some(c);
+        }
+        if let Some(run) = &mut self.url_safe {
+            run.advance(&self.pending);
         }
         std::mem::take(&mut self.pending)
     }

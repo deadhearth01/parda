@@ -3,11 +3,13 @@
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+use parda_daemon::sysproxy::{Platform, SystemRunner};
 use parda_daemon::{load_config, load_rules};
 use parda_ipc::Request;
 use parda_ml::{ModelManager, default_model_id};
 use parda_vault::{KeySource, find_key};
 
+use super::intercept::{self, Level};
 use super::{daemon_client, paths};
 
 struct Report {
@@ -119,9 +121,11 @@ pub fn run() -> anyhow::Result<()> {
         .to_lowercase(),
     );
 
+    let mut daemon_status = None;
     match daemon_client(&p) {
         Ok(Some(mut c)) => {
             let s = c.call(Request::Status)?;
+            daemon_status = Some(s.clone());
             r.ok("daemon", format!("running (pid {})", s["pid"]));
             if let Some(err) = s["model_error"].as_str() {
                 r.warn("daemon model", err);
@@ -166,6 +170,20 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         Err(e) => r.warn("daemon", format!("{e:#}")),
+    }
+
+    for c in intercept::doctor_checks(
+        &p,
+        &mut SystemRunner,
+        Platform::current(),
+        &config,
+        daemon_status.as_ref(),
+    ) {
+        match c.level {
+            Level::Ok => r.ok(c.what, c.detail),
+            Level::Warn => r.warn(c.what, c.detail),
+            Level::Info => r.info(c.what, c.detail),
+        }
     }
 
     match arboard::Clipboard::new() {

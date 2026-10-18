@@ -115,13 +115,15 @@ fn run(cmd: &str, args: &[&str]) -> anyhow::Result<std::process::Output> {
         .with_context(|| format!("running {cmd}"))
 }
 
-fn launchd_plist() -> anyhow::Result<PathBuf> {
+/// The LaunchAgent file `install` writes.
+pub fn launchd_plist() -> anyhow::Result<PathBuf> {
     Ok(home()?
         .join("Library/LaunchAgents")
         .join(format!("{LAUNCHD_LABEL}.plist")))
 }
 
-fn systemd_unit() -> anyhow::Result<PathBuf> {
+/// The systemd user unit `install` writes.
+pub fn systemd_unit() -> anyhow::Result<PathBuf> {
     Ok(home()?.join(".config/systemd/user").join(SYSTEMD_UNIT))
 }
 
@@ -131,6 +133,122 @@ fn gui_domain() -> anyhow::Result<String> {
         "gui/{}",
         String::from_utf8_lossy(&out.stdout).trim()
     ))
+}
+
+/// What an installed service runs: its binary and its `PARDA_HOME` (None:
+/// the service sets none, so the daemon uses the platform folders).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Installed {
+    pub exe: Option<PathBuf>,
+    pub home: Option<PathBuf>,
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// The text of the first `<tag>…</tag>` at or after `from`.
+fn xml_element<'a>(s: &'a str, tag: &str, from: usize) -> Option<(&'a str, usize)> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = from + s.get(from..)?.find(&open)? + open.len();
+    let end = start + s[start..].find(&close)?;
+    Some((&s[start..end], end + close.len()))
+}
+
+/// Read back a plist written by [`render_launchd`].
+pub fn parse_launchd(plist: &str) -> Installed {
+    let after = |key: &str| {
+        plist
+            .find(&format!("<key>{key}</key>"))
+            .and_then(|i| xml_element(plist, "string", i))
+            .map(|(v, _)| PathBuf::from(xml_unescape(v.trim())))
+    };
+    Installed {
+        exe: after("ProgramArguments"),
+        home: after("PARDA_HOME"),
+    }
+}
+
+fn unquote(v: &str) -> &str {
+    let v = v.trim();
+    v.strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .unwrap_or(v)
+}
+
+/// Read back a unit written by [`render_systemd`].
+pub fn parse_systemd(unit: &str) -> Installed {
+    let mut out = Installed::default();
+    for line in unit.lines().map(str::trim) {
+        if let Some(cmd) = line.strip_prefix("ExecStart=") {
+            let cmd = cmd.trim();
+            let exe = match cmd.strip_prefix('"') {
+                Some(rest) => rest.split('"').next().unwrap_or(""),
+                None => cmd.split_whitespace().next().unwrap_or(""),
+            };
+            if !exe.is_empty() {
+                out.exe = Some(PathBuf::from(exe));
+            }
+        } else if let Some(env) = line.strip_prefix("Environment=")
+            && let Some(home) = unquote(env).strip_prefix("PARDA_HOME=")
+        {
+            out.home = Some(PathBuf::from(home));
+        }
+    }
+    out
+}
+
+/// Read back `schtasks /Query /XML` for the task `install` creates (it
+/// sets no environment, so `home` is always None).
+pub fn parse_windows_task_xml(xml: &str) -> Installed {
+    Installed {
+        exe: xml_element(xml, "Command", 0).map(|(v, _)| PathBuf::from(unquote(&xml_unescape(v)))),
+        home: None,
+    }
+}
+
+/// The service `install` set up for this user, if any (reads its file;
+/// on Windows asks Task Scheduler).
+pub fn installed() -> anyhow::Result<Option<Installed>> {
+    if cfg!(target_os = "macos") {
+        let f = launchd_plist()?;
+        Ok(f.exists()
+            .then(|| std::fs::read_to_string(&f))
+            .transpose()?
+            .map(|t| parse_launchd(&t)))
+    } else if cfg!(target_os = "linux") {
+        let f = systemd_unit()?;
+        Ok(f.exists()
+            .then(|| std::fs::read_to_string(&f))
+            .transpose()?
+            .map(|t| parse_systemd(&t)))
+    } else if cfg!(target_os = "windows") {
+        let out = run("schtasks", &["/Query", "/TN", WINDOWS_TASK, "/XML"])?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        // schtasks may answer in UTF-16.
+        let b = &out.stdout;
+        let text = if b.len() >= 2 && b.iter().skip(1).step_by(2).take(16).all(|x| *x == 0) {
+            let units: Vec<u16> = b
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
+                .collect();
+            String::from_utf16_lossy(&units)
+        } else {
+            String::from_utf8_lossy(b).into_owned()
+        };
+        Ok(Some(parse_windows_task_xml(&text)))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Install and start the service. Returns a human-readable summary.
@@ -290,6 +408,47 @@ mod tests {
         assert!(s.contains("Restart=on-failure"));
         assert!(s.contains("PARDA_HOME=/srv/parda"));
         assert!(s.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn installed_services_report_their_binary_and_home() {
+        let p = Paths::under(PathBuf::from("/tmp/a&b <home>"));
+        let got = parse_launchd(&render_launchd(Path::new("/Users/x/.local/bin/parda"), &p));
+        assert_eq!(
+            got,
+            Installed {
+                exe: Some(PathBuf::from("/Users/x/.local/bin/parda")),
+                home: Some(PathBuf::from("/tmp/a&b <home>")),
+            }
+        );
+        let no_home = Paths {
+            home: None,
+            ..p.clone()
+        };
+        let got = parse_launchd(&render_launchd(Path::new("/x/parda"), &no_home));
+        assert_eq!(got.exe, Some(PathBuf::from("/x/parda")));
+        assert_eq!(got.home, None);
+
+        let got = parse_systemd(&render_systemd(
+            Path::new("/opt/parda/bin/parda"),
+            &Paths::under(PathBuf::from("/srv/parda")),
+        ));
+        assert_eq!(got.exe, Some(PathBuf::from("/opt/parda/bin/parda")));
+        assert_eq!(got.home, Some(PathBuf::from("/srv/parda")));
+        let got = parse_systemd(&render_systemd(Path::new("/opt/parda"), &no_home));
+        assert_eq!(got.home, None);
+
+        let xml = r#"<Task><Actions><Exec><Command>"C:\Program Files\parda\parda.exe"</Command>
+            <Arguments>daemon</Arguments></Exec></Actions></Task>"#;
+        let got = parse_windows_task_xml(xml);
+        assert_eq!(
+            got.exe,
+            Some(PathBuf::from(r"C:\Program Files\parda\parda.exe"))
+        );
+        assert_eq!(got.home, None, "the logon task sets no PARDA_HOME");
+
+        assert_eq!(parse_launchd("not a plist"), Installed::default());
+        assert_eq!(parse_systemd(""), Installed::default());
     }
 
     #[test]

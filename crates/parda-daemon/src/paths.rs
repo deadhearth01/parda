@@ -3,7 +3,7 @@
 //! ```text
 //! $PARDA_HOME/config.toml, rules.toml
 //! $PARDA_HOME/data/vault.db, vault.key, models/
-//! $PARDA_HOME/run/parda.sock, proxy.addr
+//! $PARDA_HOME/run/parda.sock, proxy.addr, intercept.addr
 //! $PARDA_HOME/logs/parda.log.*
 //! ```
 //!
@@ -77,6 +77,12 @@ impl Paths {
     /// Written by the daemon with the proxy's actual address.
     pub fn proxy_addr_file(&self) -> PathBuf {
         self.runtime_dir.join("proxy.addr")
+    }
+
+    /// Written by the daemon with the intercept listener's actual address
+    /// while it listens.
+    pub fn intercept_addr_file(&self) -> PathBuf {
+        self.runtime_dir.join("intercept.addr")
     }
 
     /// Create every directory, owner-only.

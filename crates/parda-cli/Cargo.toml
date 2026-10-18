@@ -32,6 +32,10 @@ indicatif.workspace = true
 tracing.workspace = true
 arboard.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# setsid() for the daemon the dashboard starts.
+libc = "0.2"
+
 [features]
 default = []
 coreml = ["parda-ml/coreml"]

@@ -1,8 +1,9 @@
 //! Daemon start-up, the IPC request handler and shutdown.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -10,13 +11,16 @@ use parda_clip::ClipHandle;
 use parda_core::{Config, MlDetector};
 use parda_detect::RulesFile;
 use parda_engine::{Engine, EngineError, EngineOptions};
+use parda_intercept::{EngineTransform, HostList, InterceptState, serve_with_shutdown};
 use parda_ipc::{Event, Handler, Request, Response};
 use parda_ml::ExecutionProvider;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{broadcast, watch};
+use tokio::task::JoinHandle;
 
-use crate::events::{self, Activity, emit};
+use crate::events::{self, Activity, emit, intercept_notice, notify};
 use crate::paths::{Paths, load_config, load_rules, write_private};
+use crate::{ca_store, sysproxy};
 
 /// Which services to start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +44,19 @@ impl Default for RunOptions {
 }
 
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
+/// How long the proxy and the intercept listener get to finish requests in
+/// progress when the daemon stops.
+const STOP_WITHIN: Duration = Duration::from_secs(5);
+/// How long a restarted intercept listener waits for its old address to be
+/// released.
+const REBIND_WITHIN: Duration = Duration::from_secs(2);
+/// How often the daemon checks whether the root certificate on disk was
+/// replaced (`parda ca create --force`) while the listener runs.
+const CA_CHECK_EVERY: Duration = Duration::from_secs(2);
+
+/// Why intercept is on but not listening, when no root certificate exists.
+const NO_CA: &str = "intercept: no CA — run `parda ca create` (then `parda ca install`); \
+                     AI sites are not filtered until then";
 
 /// Lowest model threshold the Settings tab offers; the model decodes at this.
 const MODEL_THRESHOLD_FLOOR: f32 = 0.3;
@@ -83,8 +100,27 @@ pub fn load_model(paths: &Paths, config: &Config) -> (Option<Arc<dyn MlDetector>
     }
 }
 
+/// The running intercept listener.
+struct InterceptRun {
+    addr: SocketAddr,
+    /// The `intercept.listen` it was started with.
+    listen: String,
+    /// The root certificate (PEM) it signs with, to notice a replaced CA.
+    ca_pem: String,
+    /// `intercept.hosts` as last applied, to notice added sites.
+    hosts: Vec<String>,
+    transform: Arc<EngineTransform>,
+    stop: watch::Sender<bool>,
+    task: JoinHandle<anyhow::Result<()>>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 struct Shared {
     paths: Paths,
+    opts: RunOptions,
     engine: Engine,
     config: RwLock<Config>,
     events: broadcast::Sender<Event>,
@@ -93,6 +129,16 @@ struct Shared {
     proxy_addr: RwLock<Option<SocketAddr>>,
     /// The running proxy, for settings that apply without a restart.
     proxy: RwLock<Option<Arc<parda_proxy::ProxyState>>>,
+    /// The runtime the services run on (set when serving starts), so IPC
+    /// handlers can start the intercept listener.
+    rt: OnceLock<tokio::runtime::Handle>,
+    intercept: Mutex<Option<InterceptRun>>,
+    /// Why intercept is enabled but not listening.
+    intercept_error: Mutex<Option<String>>,
+    /// The CA files the last failed start saw: a check starts the listener
+    /// again once they differ (`parda ca create` after "no CA", the end of
+    /// a rotation).
+    ca_tried: Mutex<Option<ca_store::CaFiles>>,
     /// Serialises ConfigSet / Reload (write the file, then apply).
     config_lock: Mutex<()>,
     model_error: Option<String>,
@@ -172,6 +218,7 @@ impl Daemon {
         Ok(Daemon {
             shared: Arc::new(Shared {
                 paths,
+                opts,
                 engine,
                 config: RwLock::new(config),
                 events,
@@ -179,6 +226,10 @@ impl Daemon {
                 clip,
                 proxy_addr: RwLock::new(None),
                 proxy: RwLock::new(None),
+                rt: OnceLock::new(),
+                intercept: Mutex::new(None),
+                intercept_error: Mutex::new(None),
+                ca_tried: Mutex::new(None),
                 config_lock: Mutex::new(()),
                 model_error,
                 shutdown,
@@ -224,12 +275,8 @@ impl Daemon {
         }
         // Only remove the address file this daemon wrote (and nobody
         // replaced since).
-        let ours = *shared.proxy_addr.read().unwrap_or_else(|e| e.into_inner());
-        let file = shared.paths.proxy_addr_file();
-        if let Some(addr) = ours
-            && std::fs::read_to_string(&file).is_ok_and(|s| s.trim() == addr.to_string())
-        {
-            let _ = std::fs::remove_file(file);
+        if let Some(addr) = *shared.proxy_addr.read().unwrap_or_else(|e| e.into_inner()) {
+            remove_addr_file(&shared.paths.proxy_addr_file(), addr);
         }
         tracing::info!("parda daemon stopped");
         result
@@ -237,6 +284,7 @@ impl Daemon {
 
     async fn serve_inner(self) -> anyhow::Result<()> {
         let shared = self.shared.clone();
+        let _ = shared.rt.set(tokio::runtime::Handle::current());
         let config = shared
             .config
             .read()
@@ -273,6 +321,11 @@ impl Daemon {
                 },
             )));
             tracing::info!(%addr, "proxy listening");
+        }
+        {
+            // Reads the CA key: off the async workers.
+            let (s, c) = (shared.clone(), config.clone());
+            tokio::task::spawn_blocking(move || s.sync_intercept(&c, true)).await?;
         }
 
         let ipc = {
@@ -319,6 +372,20 @@ impl Daemon {
                 }
             }
         };
+        // A replaced certificate sends no config change: notice it here, or
+        // the listener keeps signing with a CA the system no longer trusts.
+        let ca_watch = {
+            let shared = shared.clone();
+            async move {
+                let mut tick = tokio::time::interval(CA_CHECK_EVERY);
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let s = shared.clone();
+                    let _ = tokio::task::spawn_blocking(move || s.check_ca()).await;
+                }
+            }
+        };
         let mut stop_rx = shared.shutdown.subscribe();
         let _ = shared
             .events
@@ -334,16 +401,337 @@ impl Daemon {
             _ = stop_rx.wait_for(|stop| *stop) => Ok(()),
             _ = terminate_signal() => Ok(()),
             _ = prune => Ok(()),
+            _ = ca_watch => Ok(()),
         };
         let _ = shared.shutdown.send(true);
-        if let Some(t) = proxy_task {
-            match tokio::time::timeout(Duration::from_secs(5), t).await {
-                Ok(Ok(Err(e))) => tracing::warn!(error = %e, "proxy stopped with an error"),
-                Err(_) => tracing::warn!("proxy did not stop within 5 s"),
+        // Both get the same 5 s to finish requests in progress.
+        let deadline = tokio::time::Instant::now() + STOP_WITHIN;
+        let intercept_task = lock(&shared.intercept)
+            .take()
+            .map(|run| shared.stop_intercept(run));
+        for (name, task) in [("proxy", proxy_task), ("intercept", intercept_task)] {
+            let Some(t) = task else { continue };
+            match tokio::time::timeout_at(deadline, t).await {
+                Ok(Ok(Err(e))) => tracing::warn!(error = %e, "{name} stopped with an error"),
+                Err(_) => tracing::warn!("{name} did not stop within 5 s"),
                 _ => {}
             }
         }
         result
+    }
+}
+
+/// Remove an address file, but only if it still holds `addr` (another
+/// daemon or listener may have replaced it).
+fn remove_addr_file(file: &Path, addr: SocketAddr) {
+    if std::fs::read_to_string(file).is_ok_and(|s| s.trim() == addr.to_string()) {
+        let _ = std::fs::remove_file(file);
+    }
+}
+
+/// Bind `listen` for the intercept listener: loopback only, never another
+/// machine's traffic. `retry` waits briefly for an address a listener that
+/// was just stopped is still releasing.
+fn bind_loopback(listen: &str, retry: bool) -> Result<std::net::TcpListener, String> {
+    let addrs: Vec<SocketAddr> = listen
+        .to_socket_addrs()
+        .map_err(|e| format!("intercept.listen = {listen:?} is not a host:port address ({e})"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("intercept.listen = {listen:?} names no address"));
+    }
+    if let Some(bad) = addrs.iter().find(|a| !a.ip().is_loopback()) {
+        return Err(format!(
+            "parda intercept must listen on a loopback address, not {bad} \
+             (intercept.listen, e.g. 127.0.0.1:8788)"
+        ));
+    }
+    let deadline = Instant::now() + if retry { REBIND_WITHIN } else { Duration::ZERO };
+    loop {
+        match std::net::TcpListener::bind(&addrs[..]) {
+            Ok(l) => {
+                l.set_nonblocking(true)
+                    .map_err(|e| format!("cannot listen on {listen}: {e}"))?;
+                return Ok(l);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => return Err(format!("intercept: cannot listen on {listen}: {e}")),
+        }
+    }
+}
+
+impl Shared {
+    /// A daemon notice: on the feed and in the recent history, never in the
+    /// activity totals.
+    fn notice(&self, e: Event) {
+        notify(&self.events, &self.activity, e);
+    }
+
+    /// Make the intercept listener match `config`: start it, restart it (a
+    /// new listen address or a replaced CA), change it in place (hosts,
+    /// scope, unscanned, skip_keys) or stop it. Never fails: why it is not
+    /// listening is kept for the status and sent as a warning event. The CA
+    /// is never created here. Blocking (reads the CA key).
+    fn sync_intercept(&self, config: &Config, initial: bool) {
+        let want = self.opts.proxy && config.intercept.enabled;
+        let mut slot = lock(&self.intercept);
+        let mut stopped = false;
+        if let Some(run) = slot.as_mut() {
+            let same_ca = std::fs::read_to_string(ca_store::ca_cert_path(&self.paths))
+                .is_ok_and(|pem| pem == run.ca_pem);
+            if want && run.listen == config.intercept.listen && same_ca && !run.task.is_finished() {
+                run.transform.set_config(&config.intercept);
+                let added: Vec<&str> = config
+                    .intercept
+                    .hosts
+                    .iter()
+                    .filter(|h| !run.hosts.contains(h))
+                    .map(String::as_str)
+                    .collect();
+                self.warn_if_pac_cached(&added);
+                run.hosts = config.intercept.hosts.clone();
+                return;
+            }
+            if let Some(run) = slot.take() {
+                // Its requests in progress finish in the background.
+                drop(self.stop_intercept(run));
+                stopped = true;
+            }
+        }
+        if !want {
+            *lock(&self.intercept_error) = None;
+            if stopped || initial {
+                self.warn_if_pac_set();
+            }
+            return;
+        }
+        // Read before the start, so a change made while it runs is seen as
+        // a change by the next check.
+        let tried = ca_store::CaFiles::read(&self.paths);
+        match self.start_intercept(config, stopped) {
+            Ok(run) => {
+                *lock(&self.ca_tried) = None;
+                *lock(&self.intercept_error) = None;
+                self.warn_if_pac_elsewhere(run.addr);
+                *slot = Some(run);
+            }
+            Err(why) => {
+                *lock(&self.ca_tried) = Some(tried);
+                tracing::warn!(error = %why, "intercept is not listening");
+                let mut last = lock(&self.intercept_error);
+                // Say it once, not on every reload.
+                if last.as_deref() != Some(why.as_str()) {
+                    self.notice(intercept_notice(why.clone(), true));
+                    *last = Some(why);
+                    drop(last);
+                    self.warn_if_pac_set();
+                }
+            }
+        }
+    }
+
+    /// Whether the CA files call for a new start: the running listener
+    /// signs with a root certificate other than the one on disk (replaced
+    /// or removed since it started), or intercept is wanted, nothing
+    /// listens, and the files changed since the start that failed.
+    fn ca_changed(&self) -> bool {
+        let files = ca_store::CaFiles::read(&self.paths);
+        match lock(&self.intercept).as_ref() {
+            Some(run) => files.cert.as_deref() != Some(run.ca_pem.as_str()),
+            None => {
+                let enabled = self
+                    .config
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .intercept
+                    .enabled;
+                self.opts.proxy && enabled && lock(&self.ca_tried).as_ref() != Some(&files)
+            }
+        }
+    }
+
+    /// Start or restart the listener with the CA on disk when it changed
+    /// (on a timer and before every status answer). Blocking.
+    fn check_ca(&self) {
+        if !self.ca_changed() {
+            return;
+        }
+        let _serial = lock(&self.config_lock);
+        let config = self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        tracing::info!("the root certificate changed; (re)starting the intercept listener");
+        self.sync_intercept(&config, false);
+    }
+
+    /// The system proxy still points AI sites at parda while nothing
+    /// listens: say so (they fail to load rather than go out unfiltered).
+    fn warn_if_pac_set(&self) {
+        if let Ok(Some(state)) = sysproxy::load_state(&self.paths) {
+            self.notice(intercept_notice(
+                format!(
+                    "intercept: the system proxy still sends AI sites to parda ({}) but \
+                     nothing is listening — they will fail to load until intercept is on \
+                     again; `parda intercept off` restores your previous settings",
+                    state.pac_url
+                ),
+                true,
+            ));
+        }
+    }
+
+    /// Sites added to `intercept.hosts` while the system proxy points at
+    /// parda: the PAC URL stays the same, so browsers and the OS that cached
+    /// it keep sending them direct (unfiltered) until they fetch it again.
+    fn warn_if_pac_cached(&self, added: &[&str]) {
+        if added.is_empty() || !matches!(sysproxy::load_state(&self.paths), Ok(Some(_))) {
+            return;
+        }
+        self.notice(intercept_notice(
+            format!(
+                "intercept: {} added — filtered once your browsers fetch the PAC file again \
+                 (restart them, or `parda intercept off` then `parda intercept on`); until then \
+                 they may still go there direct, unfiltered",
+                added.join(", ")
+            ),
+            true,
+        ));
+    }
+
+    /// The system proxy sends AI sites to a parda PAC on another address
+    /// than this listener (`intercept.listen` changed after `parda intercept
+    /// on`): nothing serves it, so they fail to load. Say so.
+    fn warn_if_pac_elsewhere(&self, addr: SocketAddr) {
+        if let Ok(Some(state)) = sysproxy::load_state(&self.paths)
+            && !sysproxy::pac_points_at(&state.pac_url, addr)
+        {
+            self.notice(intercept_notice(
+                format!(
+                    "intercept: the system proxy still points at {} but parda now listens on \
+                     {addr} — AI sites fail to load; run `parda intercept on` again",
+                    state.pac_url
+                ),
+                true,
+            ));
+        }
+    }
+
+    fn start_intercept(&self, config: &Config, rebind: bool) -> Result<InterceptRun, String> {
+        if !ca_store::ca_exists(&self.paths) {
+            return Err(NO_CA.into());
+        }
+        let ca_pem = std::fs::read_to_string(ca_store::ca_cert_path(&self.paths))
+            .map_err(|e| format!("intercept: cannot read the CA certificate: {e}"))?;
+        let ca = ca_store::load_ca(&self.paths, config.vault.use_keyring)
+            .map_err(|e| format!("intercept: cannot load the CA: {e:#}"))?;
+        let rt = self
+            .rt
+            .get()
+            .ok_or("intercept: the daemon is not serving yet")?
+            .clone();
+        let listen = config.intercept.listen.clone();
+        let listener = bind_loopback(&listen, rebind)?;
+        let _rt = rt.enter();
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .map_err(|e| format!("intercept: cannot listen on {listen}: {e}"))?;
+        let addr = listener
+            .local_addr()
+            .map_err(|e| format!("intercept: cannot listen on {listen}: {e}"))?;
+
+        let (tx, mut rx) = broadcast::channel(256);
+        let transform = Arc::new(EngineTransform::new(self.engine.clone(), &config.intercept));
+        let hosts = HostList::new(&config.intercept.hosts);
+        let sites = hosts.entries().len();
+        let state = InterceptState::new(Arc::new(ca), hosts, transform.clone(), tx)
+            .map_err(|e| format!("intercept: {e:#}"))?;
+        write_private(&self.paths.intercept_addr_file(), &addr.to_string())
+            .map_err(|e| format!("intercept: cannot write intercept.addr: {e}"))?;
+
+        // Ends when the listener and its last connection are gone.
+        let (events, activity, engine) = (
+            self.events.clone(),
+            self.activity.clone(),
+            self.engine.clone(),
+        );
+        rt.spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        let paused = !engine.config().protection.enabled;
+                        emit(&events, &activity, events::from_intercept(&ev, paused));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        let (stop, mut stop_rx) = watch::channel(false);
+        let mut down = self.shutdown.subscribe();
+        let task = rt.spawn(serve_with_shutdown(listener, Arc::new(state), async move {
+            tokio::select! {
+                _ = stop_rx.wait_for(|s| *s) => {}
+                _ = down.wait_for(|s| *s) => {}
+            }
+        }));
+        tracing::info!(%addr, sites, "intercept listening");
+        self.notice(intercept_notice(
+            format!("intercept: listening on {addr} for {sites} AI site(s)"),
+            false,
+        ));
+        Ok(InterceptRun {
+            addr,
+            listen,
+            ca_pem,
+            hosts: config.intercept.hosts.clone(),
+            transform,
+            stop,
+            task,
+        })
+    }
+
+    /// Stop accepting and remove `intercept.addr`; returns the task, which
+    /// ends once requests in progress have finished.
+    fn stop_intercept(&self, run: InterceptRun) -> JoinHandle<anyhow::Result<()>> {
+        run.stop.send_replace(true);
+        remove_addr_file(&self.paths.intercept_addr_file(), run.addr);
+        tracing::info!(addr = %run.addr, "intercept stopped");
+        self.notice(intercept_notice(
+            format!("intercept: stopped listening on {}", run.addr),
+            false,
+        ));
+        run.task
+    }
+
+    /// `"intercept"` in the status: listener address, CA present, why it is
+    /// not listening, the PAC `parda intercept on` set and whether this
+    /// listener serves it.
+    fn intercept_status(&self, config: &Config) -> Value {
+        let listening = lock(&self.intercept)
+            .as_ref()
+            .filter(|r| !r.task.is_finished())
+            .map(|r| r.addr);
+        let pac = sysproxy::load_state(&self.paths)
+            .ok()
+            .flatten()
+            .map(|s| s.pac_url);
+        // Whether the system PAC is served by this listener (null when
+        // either is missing).
+        let pac_matches = match (&pac, listening) {
+            (Some(url), Some(addr)) => Some(sysproxy::pac_points_at(url, addr)),
+            _ => None,
+        };
+        json!({
+            "enabled": config.intercept.enabled,
+            "listening": listening.map(|a| a.to_string()),
+            "ca": ca_store::ca_exists(&self.paths),
+            "error": *lock(&self.intercept_error),
+            "pac": pac,
+            "pac_matches": pac_matches,
+        })
     }
 }
 
@@ -437,6 +825,9 @@ impl DaemonHandle {
 
     fn status(&self) -> Response {
         let s = &self.shared;
+        // Never report a listener as healthy while it signs with a
+        // certificate that was replaced.
+        s.check_ca();
         let config = self.config();
         let proxy = *s.proxy_addr.read().unwrap_or_else(|e| e.into_inner());
         Response::ok(json!({
@@ -444,6 +835,7 @@ impl DaemonHandle {
             "pid": std::process::id(),
             "uptime_s": s.started.elapsed().as_secs(),
             "proxy": proxy.map(|a| a.to_string()),
+            "intercept": s.intercept_status(&config),
             "clipboard": s.clip.is_some(),
             "hotkey": config.clipboard.hotkey,
             "model": s.engine.model_name(),
@@ -465,8 +857,9 @@ impl DaemonHandle {
     }
 
     /// Apply a configuration to the running daemon. Returns true if part
-    /// of it (listen address, service on/off, model, hotkey) only takes
-    /// effect after a restart; everything else applies now.
+    /// of it (proxy listen address, service on/off, model, hotkey) only
+    /// takes effect after a restart; everything else applies now (the
+    /// intercept listener starts, stops or moves at once).
     fn apply_config(&self, config: Config) -> bool {
         let old = self.config();
         let restart = old.proxy.listen != config.proxy.listen
@@ -482,12 +875,22 @@ impl DaemonHandle {
         if let Some(clip) = &self.shared.clip {
             clip.set_config(config.clipboard.clone());
         }
+        self.shared.sync_intercept(&config, false);
         *self
             .shared
             .config
             .write()
             .unwrap_or_else(|e| e.into_inner()) = config;
         restart
+    }
+
+    /// The answer to ConfigSet / Reload: whether a restart is needed, and
+    /// the intercept listener's state after the change.
+    fn applied(&self, restart: bool) -> Response {
+        Response::ok(json!({
+            "restart_required": restart,
+            "intercept": self.shared.intercept_status(&self.config()),
+        }))
     }
 
     fn handle_inner(&self, req: Request) -> anyhow::Result<Response> {
@@ -567,7 +970,7 @@ impl DaemonHandle {
                     let _serial = s.config_lock.lock().unwrap_or_else(|e| e.into_inner());
                     write_private(&s.paths.config_file(), &config.to_toml_string()?)?;
                     let restart = self.apply_config(config);
-                    Response::ok(json!({"restart_required": restart}))
+                    self.applied(restart)
                 }
                 Err(e) => Response::err("invalid_config", e.to_string()),
             },
@@ -577,7 +980,7 @@ impl DaemonHandle {
                 let rules = load_rules(&s.paths)?;
                 s.engine.reload_rules(rules);
                 let restart = self.apply_config(config);
-                Response::ok(json!({"restart_required": restart}))
+                self.applied(restart)
             }
             Request::Shutdown => {
                 // Answer first: stopping drops the IPC connections.

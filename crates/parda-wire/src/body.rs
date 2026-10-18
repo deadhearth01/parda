@@ -7,10 +7,11 @@ use std::io::Read;
 use bytes::Bytes;
 use http::HeaderMap;
 use http::header::CONTENT_ENCODING;
-use serde_json::Value;
+use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Number, Value};
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum BodyError {
+pub enum BodyError {
     /// A `Content-Encoding` parda cannot decode (415).
     UnsupportedEncoding(String),
     /// The decoded body is larger than `proxy.max_body_bytes` (413).
@@ -38,13 +39,13 @@ fn codings(headers: &HeaderMap) -> Vec<String> {
 }
 
 /// True if the request declares a `Content-Encoding` other than identity.
-pub(crate) fn is_encoded(headers: &HeaderMap) -> bool {
+pub fn is_encoded(headers: &HeaderMap) -> bool {
     !codings(headers).is_empty()
 }
 
 /// Undo every `Content-Encoding` (gzip, deflate, br, zstd), never producing
 /// more than `max` bytes.
-pub(crate) fn decode(headers: &HeaderMap, body: Bytes, max: usize) -> Result<Bytes, BodyError> {
+pub fn decode(headers: &HeaderMap, body: Bytes, max: usize) -> Result<Bytes, BodyError> {
     let mut data = body;
     for coding in codings(headers).iter().rev() {
         data = decode_one(coding, &data, max)?;
@@ -89,7 +90,7 @@ fn decode_one(coding: &str, data: &[u8], max: usize) -> Result<Bytes, BodyError>
 /// lone UTF-16 surrogate escapes (`"\ud83d"` from a JS client that cut an
 /// emoji in half) become U+FFFD; anything else that is not JSON — including
 /// nesting deeper than serde_json's limit — is an error.
-pub(crate) fn parse_json(body: &[u8]) -> Result<Value, BodyError> {
+pub fn parse_json(body: &[u8]) -> Result<Value, BodyError> {
     let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
     match serde_json::from_slice(body) {
         Ok(v) => Ok(v),
@@ -105,7 +106,7 @@ pub(crate) fn parse_json(body: &[u8]) -> Result<Value, BodyError> {
 /// [`parse_json`] for the bodies of routes parda rewrites: every one of them
 /// is a JSON object, so any other value (`["text"]`, a bare string, …) is
 /// refused rather than walked as if it held no text.
-pub(crate) fn parse_object(body: &[u8]) -> Result<Value, BodyError> {
+pub fn parse_object(body: &[u8]) -> Result<Value, BodyError> {
     let v = parse_json(body)?;
     if v.is_object() {
         return Ok(v);
@@ -120,6 +121,100 @@ pub(crate) fn parse_object(body: &[u8]) -> Result<Value, BodyError> {
     Err(BodyError::Unparseable(format!(
         "the top-level value must be a JSON object, not {found}"
     )))
+}
+
+/// Why [`parse_json_unique`] refused a body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonError {
+    /// Not JSON, even read leniently.
+    Invalid,
+    /// JSON with an object that names the same key twice. Parsers keep one
+    /// of the two values (serde the last, others the first), so a filter
+    /// that reads one could forward the other unread.
+    DuplicateKey,
+}
+
+/// [`parse_json`] (BOM and lone surrogates tolerated), but an object that
+/// names a key twice is an error rather than silently keeping the last.
+pub fn parse_json_unique(body: &[u8]) -> Result<Value, JsonError> {
+    fn parse(body: &[u8]) -> Result<Value, JsonError> {
+        serde_json::from_slice::<Unique>(body)
+            .map(|u| u.0)
+            .map_err(|e| {
+                // Only the visitor raises data errors: a repeated key.
+                if e.is_data() {
+                    JsonError::DuplicateKey
+                } else {
+                    JsonError::Invalid
+                }
+            })
+    }
+    let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
+    match parse(body) {
+        Err(JsonError::Invalid) => match replace_lone_surrogates(body) {
+            Some(fixed) => parse(&fixed),
+            None => Err(JsonError::Invalid),
+        },
+        other => other,
+    }
+}
+
+/// A JSON value whose objects have distinct keys.
+struct Unique(Value);
+
+impl<'de> Deserialize<'de> for Unique {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(UniqueVisitor).map(Unique)
+    }
+}
+
+struct UniqueVisitor;
+
+impl<'de> Visitor<'de> for UniqueVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+    fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+        Ok(Value::Bool(v))
+    }
+    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+        Ok(Value::Number(v.into()))
+    }
+    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+        Ok(Value::Number(v.into()))
+    }
+    fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
+        Ok(Number::from_f64(v).map_or(Value::Null, Value::Number))
+    }
+    fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+        Ok(Value::String(v.to_string()))
+    }
+    fn visit_string<E>(self, v: String) -> Result<Value, E> {
+        Ok(Value::String(v))
+    }
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(Unique(v)) = seq.next_element()? {
+            items.push(v);
+        }
+        Ok(Value::Array(items))
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut out = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if out.contains_key(&key) {
+                return Err(A::Error::custom("duplicate object key"));
+            }
+            let Unique(v) = map.next_value()?;
+            out.insert(key, v);
+        }
+        Ok(Value::Object(out))
+    }
 }
 
 fn hex4(b: &[u8]) -> Option<u16> {
@@ -202,6 +297,35 @@ fn replace_lone_surrogates(body: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unique_parse_refuses_repeated_keys() {
+        let ok = br#"{"a":[1,-2,3.5,true,null,{"b":"\u0061"}],"c":{"a":1}}"#;
+        assert_eq!(
+            parse_json_unique(ok).unwrap(),
+            serde_json::from_slice::<Value>(ok).unwrap()
+        );
+        assert_eq!(
+            parse_json_unique(b"\xEF\xBB\xBF[\"\\ud83d x\"]").unwrap(),
+            serde_json::json!(["\u{fffd} x"])
+        );
+        for dup in [
+            &br#"{"a":1,"a":2}"#[..],
+            br#"[{"x":{"a":1,"b":2,"a":3}}]"#,
+            br#"{"a":1,"\u0061":2}"#,
+            b"{\"a\":\"\\ud83d\",\"a\":1}",
+        ] {
+            assert_eq!(
+                parse_json_unique(dup),
+                Err(JsonError::DuplicateKey),
+                "{}",
+                String::from_utf8_lossy(dup)
+            );
+        }
+        for bad in [&b"{"[..], b"Ravi", b"{\"a\":1}x", b""] {
+            assert_eq!(parse_json_unique(bad), Err(JsonError::Invalid));
+        }
+    }
 
     fn fix(s: &str) -> Option<String> {
         replace_lone_surrogates(s.as_bytes()).map(|v| String::from_utf8(v).unwrap())

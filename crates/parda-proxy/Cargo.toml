@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 parda-core.workspace = true
 parda-engine.workspace = true
+parda-wire.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -22,12 +23,11 @@ reqwest.workspace = true
 bytes.workspace = true
 futures.workspace = true
 http.workspace = true
-# Decoding compressed request bodies before redaction.
-flate2 = "1"
-brotli-decompressor = "6"
-ruzstd = "0.9"
 
 [dev-dependencies]
+# Compressing test request bodies.
+flate2 = "1"
+ruzstd = "0.9"
 parda-detect.workspace = true
 tempfile.workspace = true
 brotli = "9"

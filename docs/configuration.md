@@ -44,6 +44,16 @@ hotkey = "default"                 # Cmd+Alt+V on macOS, Ctrl+Alt+V elsewhere; e
 restore_on_copy = true
 scope = "global"
 
+[intercept]                        # AI websites and desktop apps (see "Intercept" below)
+enabled = false
+listen = "127.0.0.1:8788"
+hosts = ["chatgpt.com", "chat.openai.com", "claude.ai", "gemini.google.com", "copilot.microsoft.com",
+         "perplexity.ai", "chat.deepseek.com", "chat.mistral.ai", "grok.com", "meta.ai", "poe.com"]
+scope = "per-host"                 # per-host (each host its own scope) | global | fixed:<name>
+unscanned = "allow"                # allow | block — file uploads and binary bodies
+skip_keys = []                     # extra identifier keys, e.g. ["trace_tag"]: identifier-shaped
+                                   # values under them skip only the name model (rules still apply)
+
 [privacy]
 log_values = false
 ```
@@ -74,12 +84,167 @@ openai_upstream = "http://127.0.0.1:11434"
 passthrough_paths = ["/api/*"]
 ```
 
+### Intercept
+
+`[intercept]` filters what you type into AI websites (and desktop apps that use the system proxy).
+Only the listed hosts and their subdomains are decrypted; everything else is tunnelled untouched.
+Tags follow `replace.style` (there is no separate style for intercept).
+
+- **Scope**: with `scope = "per-host"` (the default) each host gets its own vault scope,
+  `intercept:<host>` named by the exact host (for example `intercept:chatgpt.com`; a subdomain such
+  as `x.chatgpt.com` gets a scope of its own). A site's answers can only restore tags that were
+  issued for text sent to that same host — never names you sent to another site or subdomain, the
+  clipboard or the agent proxy. `scope = "global"` shares one scope, `global`, across every site, the
+  clipboard and the agent proxy; `scope = "fixed:<name>"` shares the scope `<name>` across every site
+  (a name is 1 to 64 of `A-Z a-z 0-9 _ . : -`). Any other value (`per_host`, `web`) is an error when
+  the config loads, naming these three forms, so a typo never quietly shares one scope.
+- **Requests** to a listed site:
+  - *What is read.* Every JSON string value and every JSON object key, at any depth (a key that holds
+    a name is renamed where it stands). Form and query-string values, keys and value-less pieces
+    (`?Ravi%20Kumar`). Text bodies. Multipart text fields, including base64-encoded ones. Compressed
+    bodies are decoded first.
+  - *Every way the site may read it, whatever the content type says.* One reader serves every body,
+    multipart text field, form value and JSON string: UTF-8 text is read literally; as JSON of any
+    kind (one value, or one value per line: NDJSON, RFC 7464 records with their RS, a JSON line
+    among other text; leading and trailing Unicode whitespace such as `\f`, `\v` or NBSP and a
+    byte-order mark skipped); and, when it holds `%XX`, `+` or `=`, decoded as a form (`+` a space).
+    Each string, key and number found that way is read the same ways again (JSON inside a string,
+    such as Gemini's `f.req`, or inside a form value), four levels deep (a level is a reading that
+    decodes or opens something). Deeper, parda fails closed: text still JSON-looking, escaped,
+    `%XX`- or `+`-encoded there is refused; anything else is read literally and counted unscanned.
+    What any reading finds is replaced in the bytes that go out, encoded as each layer needs (JSON
+    escaped, percent-encoded), so no reading of the forwarded body holds it: an escape such as
+    `\n9876543210` cannot hide a number, nor `+` or `%40` a name or an e-mail. Numbers are text:
+    one that holds a value becomes a JSON string holding its tag. Under identifier keys
+    (`create_time`, `*_id`) numbers meet the rules only and are kept as written, but a finding that
+    covers a whole number refuses the request (a string in its place would break its type), except
+    on positive evidence: an epoch time from 2001 to 2100 (seconds, milliseconds, microseconds)
+    under a timestamp-like key (exactly `timestamp`, `ts`, `time`, `date`, `created`, `updated`,
+    `expires`; or ending in `_time`, `_at`, `_ts`, `_date`, `Time`, `At`, `Date`) that no valid
+    card (issuer prefix and Luhn) or Aadhaar number (Verhoeff) covers, or a number only a phone
+    rule found that is no Indian mobile number. Under a timestamp-like key that is no identifier
+    key, such an epoch time is kept as written; any other number is handled like a number under a
+    plain key, except that a phone found as the whole number refuses the request. A value the whole text shows but
+    single tokens do not (`{"Ravi":"Kumar"}`) is replaced in each token it covers. Text that looks
+    like escaped JSON (starting with `{`, `[` or `"`, or a line that does, holding a backslash;
+    inside a body, text bracketed like JSON) but is not JSON is refused; what the user typed under
+    a content key (`prompt`, `parts`, …) never is.
+  - *URLs inside strings.* A link's path segments, query and fragment are read decoded too, its
+    query keys with the key rules (telemetry often carries the page URL, prompt included).
+  - *Identifiers.* Keys such as `id`, `*_id`, `*Id`, `uuid`, `model`, `token`, `nonce`,
+    `timestamp`, `parent*`, `client_*`, `type`, `role`, `status` (plus `skip_keys` and a built-in
+    list per site), and values that look like identifiers (UUIDs, long hex or base64 strings, links
+    to the site itself), skip only the name model, and only when the value is identifier-shaped (up
+    to 64 characters of `A-Z a-z 0-9 _ . : / + = -`). The dictionary and rule tiers still see them,
+    so an e-mail, phone number, Aadhaar or key is redacted wherever it sits; a value with a space or
+    an `@` is redacted under any key.
+  - *`Referer`.* Its query and fragment are removed. A page opened with the prompt in its address
+    (`chatgpt.com/?q=…`, `perplexity.ai/search?q=…`) would otherwise send the prompt again with
+    every request it makes.
+  - *Not read, counted as unscanned* (with `unscanned = "block"` the request is refused,
+    `415 parda_unscanned_blocked`): file parts; multipart fields that are not text or JSON, are not
+    UTF-8 (a declared charset other than UTF-8, or NUL bytes, as UTF-16 has), or use another
+    transfer encoding (quoted-printable); bodies of any type other than form, `text/*` or JSON
+    that are not UTF-8 or hold NUL bytes (images, binary data); WebSocket (and other protocol
+    upgrade) connections, whose frames are tunnelled without inspection; text past the reading depth,
+    read only literally, so with `"block"` the
+    upgrade request is refused before it reaches the site. Headers other than `Referer` are
+    forwarded as they are.
+  - *Refused, never sent unfiltered.* The message names the problem and never quotes the request.
+
+    | Status and code | When |
+    |---|---|
+    | `400 parda_unparseable_body` | a body or multipart field typed as JSON that is not JSON; text that looks like escaped JSON but is not JSON (see above); a number under an identifier key that a finding covers whole, or under a timestamp-like key that a phone covers whole (see above); text past the reading depth that is still encoded; a JSON key given twice (anywhere, JSON inside strings, forms and queries included); two keys that redaction would make the same; a multipart body without a boundary, that does not split as RFC 2046 says, or whose preamble or epilogue holds the boundary |
+    | `400 parda_not_utf8` | a body of any type declaring a charset other than UTF-8 or US-ASCII; a `Content-Type` holding bytes outside visible ASCII, or two different ones; a form or `text/*` body that is not UTF-8 or holds NUL bytes (UTF-16) |
+    | `413 parda_body_too_large` | a body too large to filter |
+    | `415 parda_unsupported_encoding` | a `content-encoding` parda cannot decode |
+    | `415 parda_unscanned_blocked` | an unscanned part (a file, binary data, a WebSocket upgrade) while `unscanned = "block"` |
+    | `503 parda_ml_unavailable` | `detect.mode = "strict"` and the name detector failed |
+    | `403 parda_blocked` | a kind whose action is `block` (the message names kinds, not values) |
+    | `500 parda_internal` | anything else that went wrong while filtering |
+
+- **Answers** get the real values back only where they are the user's own, and only on the exact
+  hosts parda knows (those named below, plus `www.meta.ai` and `www.perplexity.ai`). Requests to
+  a subdomain of a listed host (`x.chatgpt.com`) and to a host you added yourself are filtered as
+  usual, but their answers keep their tags:
+  - *chatgpt.com, chat.openai.com, claude.ai, gemini.google.com:* only the answers to sending a
+    message (chatgpt `/backend-api/conversation` and `/backend-api/f/conversation`; claude
+    `…/chat_conversations/*/completion` and `…/retry_completion`; Gemini `StreamGenerate`), and the
+    user's own history (chatgpt `GET /backend-api/conversation/*` and `/backend-api/conversations`;
+    claude `GET /api/organizations/*/chat_conversations[/*]`). Gemini history comes from
+    `batchexecute`, which is never restored, so **old Gemini chats show tags**.
+  - *copilot.microsoft.com, perplexity.ai, chat.deepseek.com, chat.mistral.ai, grok.com, meta.ai,
+    poe.com:* only answers to a `POST` that stream, by their content type
+    (`text/event-stream` or an NDJSON type such as `application/x-ndjson`). Anything typed as JSON
+    (a single document, or one followed by more lines, as a GraphQL answer ends in
+    `{"extensions":…}`), a text body or anything a `GET` returns keeps its tags.
+  - Shared conversations, GPT or bot descriptions and public pages therefore keep their tags: a
+    page someone else wrote cannot make your browser show (or send on) your real values. Paths are
+    matched decoded once, case-insensitively, without the query; a path with an empty, `.` or `..`
+    segment, an encoded `/`, `%` or `\`, a `;` or a control character matches nothing.
+  - *Formats.* JSON, NDJSON, server-sent-event streams, Google's `)]}'` frames (lengths recomputed)
+    and plain text, including tags split across stream events. Real values only land inside JSON
+    strings (escaped as JSON) or plain text; data that looks like JSON but does not parse passes
+    through with its tags. A streamed text is JSON text once it reaches a string or an object
+    (`{"`, `["`), not because it starts with a bracket (`[NAME_1] said`, `[1] see` are text); JSON
+    text that turns into prose goes on unrestored. A line break (CR, LF or CRLF) in a real value
+    restored into event-stream text starts a new `data:` line, so it never splits the event; it
+    reads back as LF. HTML pages and other types pass through unchanged, and so does an answer with
+    several `Content-Type` headers that name different types, or one that lists several types (a
+    comma outside a quoted string), is empty or does not parse: a browser might read it as another
+    type than parda did. A single event, line or frame larger than 16 MiB passes through, with the
+    rest of that answer, unrestored.
+  - **A tag inside a URL is never restored**, so a prompt-injected image or link cannot carry your
+    real data to another server. URLs are read as markdown renderers and browsers read them:
+    markdown link and image targets (`](…)`, `](<…>)`, backslash escapes, spaces in `<…>`) and
+    reference definitions (`[r]: …`, also inside quotes and lists), autolinks (`<https:…>`,
+    `www.…`), every attribute value inside an HTML tag, and CSS `url(…)`, `image-set(…)` and
+    `@import`. On top of that, a tag is never restored when the text before it, back to the last
+    ASCII space or line break, holds any of `/ ? = & % \ : @`, follows `www.` or is longer than
+    2 KiB, so `key=[NAME_1]` and `path/[NAME_1]` keep their tags too. Unicode spaces never end a
+    URL.
+- **Known limit.** parda filters what reaches the listed hosts over the network. The site's own page
+  scripts see what you type before it is sent, and anything they send to other (unlisted) hosts,
+  such as third-party analytics, is not filtered.
+
+**The listener** runs inside the daemon while `enabled = true`, and only with the root certificate
+from `parda ca create` (parda never creates one on its own; without it the daemon warns "no CA" and
+does not listen). It binds `listen` (loopback only), writes the address it got to `intercept.addr` in
+the runtime folder and serves the PAC file at `http://<listen>/parda.pac`. Changes apply without a
+daemon restart:
+
+- `hosts`, `scope`, `unscanned` and `skip_keys` go to the running listener. A site *added* to
+  `hosts` is filtered only once your browsers and the OS fetch the PAC file again (restart the
+  browser, or `parda intercept off` then `parda intercept on`); until then it may go there direct,
+  and the daemon warns about it.
+- `enabled` starts or stops the listener. `listen` moves it — but the system proxy keeps the PAC
+  address `parda intercept on` set, so run `parda intercept on` again after changing it (the daemon,
+  `parda status`, `parda intercept status`, `parda doctor` and the TUI warn that AI sites fail to load
+  until you do).
+- A new or replaced certificate (`parda ca create`, `parda ca create --force`) starts or restarts
+  the listener: the daemon checks the files every 2 s and before each status answer, and `parda ca
+  create` prints what the daemon then reports (listening, or why not). `parda ca uninstall` is
+  refused while intercept is in use — `parda intercept off` first.
+
+The TUI dashboard (and the daemon's status) shows whether it listens and whether the system proxy
+points at it; if the system proxy still points at parda while nothing listens, AI sites fail to load
+(by design: they are never sent unfiltered) — run `parda intercept off` to restore your previous
+settings.
+
 ## Changing settings
 
-- **TUI** (`parda tui`, tab 6 *Settings*): every option above as a list. ↑↓ or the mouse wheel selects,
-  Enter / Space / click changes the value, ← or right-click goes back. Options marked ↻ take effect
-  after the daemon restarts. Turning on `privacy.log_values` asks for confirmation.
-- **Protection switch**: `p` anywhere in the TUI, a click on the header switch, or `parda off` /
+- **TUI** (`parda` or `parda tui`, tab 6 *Settings*): every option above as a list. ↑↓ / `jk` or the
+  mouse wheel selects. Switches toggle with Enter / Space / click; choices cycle with Enter / → / click
+  and go back with ← or right-click; numbers (model threshold 0.30–0.95, model time budget 10–60000
+  ms, vault TTL 1–3650 days) and text (model id, agent proxy and intercept listener addresses —
+  `IP:PORT` or `localhost:PORT`, loopback only, except that the agent proxy takes any address
+  when `proxy.allow_non_loopback = true` — and the paste-safe hotkey) open an inline editor on
+  Enter: the value is checked before it is sent, Esc cancels, and the daemon's answer appears as a
+  message (pasting works too; a newline in a paste never submits). ←/→ step numbers to the next
+  larger / smaller preset. Options marked ↻ take effect after the daemon restarts (the AI-sites
+  rows apply at once). Turning on `privacy.log_values` asks for confirmation. The command palette
+  (`:` or Ctrl-K) also switches intercept, the agent proxy, the clipboard, mode and style by name.
+- **Protection switch**: `p` anywhere in the TUI, a click on the status-bar badge, or `parda off` /
   `parda on`. While off, every surface (proxy, paste-safe, `parda redact`) passes text through
   unchanged and records a warning event; stand-ins sent earlier are still restored in answers.
 - **By hand**: edit `config.toml`, then `parda` picks it up on the next daemon start (or send a reload

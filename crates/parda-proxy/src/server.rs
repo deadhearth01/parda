@@ -19,7 +19,6 @@ use parda_core::{ProxyConfig, UnscannedMedia};
 use parda_engine::{Engine, EngineError};
 use serde_json::Value;
 
-use crate::body::{self, BodyError};
 use crate::error::error_response;
 use crate::route::{Provider, route};
 use crate::route::{SUPPORTED, normalize_path, passthrough_listed};
@@ -29,6 +28,7 @@ use crate::{
     DEFAULT_SCOPE, ProxyEvent, ProxyState, anthropic, guard, legacy, openai_chat, openai_responses,
     sse,
 };
+use parda_wire::body::{self, BodyError};
 
 /// Header naming the vault scope of a request (default `global`).
 pub const SCOPE_HEADER: &str = "x-parda-scope";

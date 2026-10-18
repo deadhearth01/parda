@@ -1,6 +1,6 @@
 # Architecture
 
-parda is one binary. `parda daemon` is a long-running process that owns everything stateful; `parda` subcommands and `parda tui` are thin clients that talk to it over a local socket and fall back to an in-process engine when it is not running.
+parda is one binary. `parda daemon` is a long-running process that owns everything stateful; `parda` subcommands and the dashboard (`parda` alone, or `parda tui`) are thin clients that talk to it over a local socket; the subcommands fall back to an in-process engine when it is not running, the dashboard shows an offline screen whose `s` key starts it.
 
 ```text
  clients:  parda tui ──┐   parda redact/scan/… ──┐   parda paste-safe ──┐
@@ -26,7 +26,7 @@ parda is one binary. `parda daemon` is a long-running process that owns everythi
 | `parda-clip` | Clipboard watcher, paste-safe, restore-on-copy, global hotkey |
 | `parda-ipc` | Request/response/event protocol over Unix sockets / named pipes |
 | `parda-daemon` | Wiring, paths, logging, event conversion, service install |
-| `parda-tui` | ratatui dashboard |
+| `parda-tui` | ratatui dashboard: UI thread (state, keys, drawing on change only) + a worker thread that owns the IPC client and event subscription |
 | `parda` (`crates/parda-cli`) | The command-line interface |
 | `parda-bench` | Golden-corpus evaluation, latency harness, mock upstream |
 

@@ -34,6 +34,8 @@ windows-sys = { version = "0.59", features = ["Win32_Networking_WinInet"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+# Intercept tests drive the listener like a browser would.
+reqwest.workspace = true
 
 [lints]
 workspace = true

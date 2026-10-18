@@ -23,6 +23,7 @@ parda-daemon = { path = "crates/parda-daemon", version = "0.1.0" }
 parda-clip = { path = "crates/parda-clip", version = "0.1.0" }
 parda-tui = { path = "crates/parda-tui", version = "0.1.0" }
 parda-intercept = { path = "crates/parda-intercept", version = "0.1.0" }
+parda-wire = { path = "crates/parda-wire", version = "0.1.0" }
 
 # general
 serde = { version = "1", features = ["derive"] }

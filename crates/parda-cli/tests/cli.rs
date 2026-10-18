@@ -271,3 +271,77 @@ fn ca_create_path_and_status_without_touching_the_system() {
         .success()
         .stdout(predicate::str::contains("created"));
 }
+
+/// Every file under `dir` with its contents.
+fn files(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.insert(p.clone(), std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// `intercept status` only reads (no certificate here, so no trust check;
+/// the system proxy is only queried), and changes no file.
+#[test]
+fn intercept_status_reports_and_changes_nothing() {
+    let h = home();
+    let before = files(h.path());
+    parda(&h)
+        .args(["intercept", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("certificate:  not created"))
+        .stdout(predicate::str::contains("daemon not running"))
+        .stdout(predicate::str::contains("chatgpt.com"))
+        .stdout(predicate::str::contains("per-host"));
+    assert_eq!(files(h.path()), before);
+}
+
+#[test]
+fn intercept_help_lists_on_off_and_status() {
+    let h = home();
+    parda(&h)
+        .args(["intercept", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("on").and(predicate::str::contains("off")))
+        .stdout(predicate::str::contains("changes nothing"));
+}
+
+#[test]
+fn parda_alone_without_a_terminal_prints_help_and_starts_nothing() {
+    // Under the test harness stdin/stdout are pipes: scripts get the short
+    // help, not a dashboard, and no daemon is started.
+    let h = home();
+    parda(&h)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: parda"))
+        .stdout(predicate::str::contains("tui"))
+        .stdout(
+            predicate::str::contains("Run `parda` alone in a terminal for the dashboard").not(),
+        );
+    assert!(
+        !h.path().join("logs").join("daemon.out.log").exists(),
+        "nothing was started"
+    );
+}
+
+#[test]
+fn tui_dump_without_a_daemon_still_fails_cleanly() {
+    let h = home();
+    parda(&h)
+        .args(["tui", "--dump"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot reach the daemon"));
+}

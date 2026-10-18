@@ -51,6 +51,24 @@ fn state_path(paths: &Paths) -> PathBuf {
     paths.data_dir.join(STATE_FILE)
 }
 
+/// Where the saved settings live (`intercept-state.json` in the data folder).
+pub fn state_file(paths: &Paths) -> PathBuf {
+    state_path(paths)
+}
+
+/// Move the state file aside (to `intercept-state.json.damaged`), for
+/// `parda intercept off --forget` when it cannot be read. Returns where it
+/// went, `None` when there was none.
+pub fn set_aside_state(paths: &Paths) -> anyhow::Result<Option<PathBuf>> {
+    let from = state_path(paths);
+    let to = from.with_extension("json.damaged");
+    match std::fs::rename(&from, &to) {
+        Ok(()) => Ok(Some(to)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("moving {} aside", from.display())),
+    }
+}
+
 pub fn load_state(paths: &Paths) -> anyhow::Result<Option<State>> {
     match std::fs::read_to_string(state_path(paths)) {
         Ok(s) => Ok(Some(
@@ -85,6 +103,29 @@ pub fn is_parda_pac(url: &str, pac_url: &str) -> bool {
     path == "parda.pac" && matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
+/// Whether the parda PAC at `url` is served by a listener bound to `addr`:
+/// same port, and the same loopback address (`localhost` matches either).
+/// A PAC left on an old port makes AI sites fail to load.
+pub fn pac_points_at(url: &str, addr: std::net::SocketAddr) -> bool {
+    let Some(authority) = url
+        .strip_prefix("http://")
+        .and_then(|rest| rest.strip_suffix("/parda.pac"))
+    else {
+        return false;
+    };
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return false;
+    };
+    if port.parse::<u16>().ok() != Some(addr.port()) {
+        return false;
+    }
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return addr.ip().is_loopback();
+    }
+    host.parse::<std::net::IpAddr>().ok() == Some(addr.ip())
+}
+
 /// A setting that already points at parda is not an "original" setting.
 fn forget_ours(mut s: Saved, pac_url: &str) -> Saved {
     if s.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url)) {
@@ -92,6 +133,26 @@ fn forget_ours(mut s: Saved, pac_url: &str) -> Saved {
         s.enabled = false;
     }
     s
+}
+
+/// Keep `now` as `target`'s original, unless an earlier `on` saved one and
+/// the setting still points at parda (`ours`). A setting someone changed
+/// while parda was on (a VPN's PAC, auto-proxy switched off) is the new
+/// original: `off` must put *that* back, not the one from before.
+fn remember(saved: &mut Vec<Saved>, target: &str, ours: bool, now: Saved) {
+    match saved.iter_mut().find(|s| s.target == target) {
+        Some(_) if ours => {}
+        Some(s) => *s = now,
+        None => saved.push(now),
+    }
+}
+
+/// [`remember`] for the single Windows / GNOME entry (whose `target` is
+/// not a fixed name).
+fn remember_only(saved: &mut Vec<Saved>, ours: bool, now: Saved) {
+    if saved.is_empty() || !ours {
+        *saved = vec![now];
+    }
 }
 
 // ---------- macOS ----------
@@ -232,8 +293,9 @@ fn gnome_set(r: &mut dyn Runner, mode: &str, url: &str) -> anyhow::Result<()> {
 // ---------- public API ----------
 
 /// Point the system at `pac_url`. The original settings are saved first; an
-/// existing state file (from an earlier `on`, or a crash) keeps its originals,
-/// and services enabled since then are added to it. If any change fails,
+/// existing state file (from an earlier `on`, or a crash) keeps its originals
+/// for settings that still point at parda, takes the current value of those
+/// changed since (by the user or a VPN), and adds services enabled since then. If any change fails,
 /// everything done so far is rolled back before the error is returned.
 pub fn enable(
     r: &mut dyn Runner,
@@ -259,27 +321,27 @@ pub fn enable(
                 bail!("no enabled network service found (networksetup -listallnetworkservices)");
             }
             for svc in &services {
-                if !state.saved.iter().any(|s| &s.target == svc) {
-                    state.saved.push(forget_ours(mac_get(r, svc)?, pac_url));
-                }
+                let now = mac_get(r, svc)?;
+                let ours =
+                    now.enabled && now.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url));
+                remember(&mut state.saved, svc, ours, forget_ours(now, pac_url));
             }
             targets = services;
         }
         Platform::Windows => {
-            if state.saved.is_empty() {
-                state.saved.push(forget_ours(win_get(r), pac_url));
-            }
+            let now = win_get(r);
+            let ours = now.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url));
+            remember_only(&mut state.saved, ours, forget_ours(now, pac_url));
         }
         Platform::Linux => {
-            if state.saved.is_empty() {
-                let mut s = gnome_get(r)?;
-                if s.target == "auto" && s.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url))
-                {
-                    s.target = "none".into();
-                    s.url = None;
-                }
-                state.saved.push(s);
+            let mut now = gnome_get(r)?;
+            let ours = now.target == "auto"
+                && now.url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url));
+            if ours {
+                now.target = "none".into();
+                now.url = None;
             }
+            remember_only(&mut state.saved, ours, now);
         }
     }
     save_state(paths, &state)?;
@@ -312,6 +374,98 @@ pub fn enable(
         });
     }
     Ok(state)
+}
+
+/// The automatic proxy setting one target uses right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Current {
+    /// macOS network service, `user` (Windows) or `GNOME`.
+    pub target: String,
+    /// The configured PAC URL, if any (it may be switched off).
+    pub url: Option<String>,
+    /// Whether the PAC URL is in use.
+    pub active: bool,
+    /// In use, and it is a parda PAC (any port).
+    pub parda: bool,
+}
+
+/// What the system uses now — every enabled macOS network service, the
+/// Windows user setting or the GNOME setting. Only reads; never changes
+/// anything (for `parda intercept status` and `parda doctor`).
+pub fn inspect(
+    r: &mut dyn Runner,
+    platform: Platform,
+    pac_url: &str,
+) -> anyhow::Result<Vec<Current>> {
+    let current = |target: String, url: Option<String>, active: bool| {
+        let parda = active && url.as_deref().is_some_and(|u| is_parda_pac(u, pac_url));
+        Current {
+            target,
+            url,
+            active,
+            parda,
+        }
+    };
+    Ok(match platform {
+        Platform::MacOs => {
+            let mut out = Vec::new();
+            for (name, on) in mac_services(r)? {
+                if on {
+                    let s = mac_get(r, &name)?;
+                    out.push(current(s.target, s.url, s.enabled));
+                }
+            }
+            out
+        }
+        Platform::Windows => {
+            let url = win_query(r);
+            let active = url.is_some();
+            vec![current("user".into(), url, active)]
+        }
+        Platform::Linux => {
+            let s = gnome_get(r)?;
+            vec![current("GNOME".into(), s.url, s.target == "auto")]
+        }
+    })
+}
+
+/// Switch off every automatic proxy setting that uses a parda PAC, without
+/// saved state: for `parda intercept off` when intercept-state.json is
+/// missing or damaged but the system still sends AI sites to parda. macOS:
+/// auto-proxy off for that service; Windows: AutoConfigURL removed; GNOME:
+/// mode `none`. Other settings are never touched. `restored` lists what was
+/// switched off, `failed` what could not be.
+pub fn switch_off_parda(
+    r: &mut dyn Runner,
+    platform: Platform,
+    pac_url: &str,
+) -> anyhow::Result<Restored> {
+    let mut out = Restored::default();
+    for c in inspect(r, platform, pac_url)?
+        .into_iter()
+        .filter(|c| c.parda)
+    {
+        let done = match platform {
+            Platform::MacOs => r
+                .run("networksetup", &["-setautoproxystate", &c.target, "off"])
+                .map(drop),
+            Platform::Windows => win_set(r, None),
+            Platform::Linux => r
+                .run(
+                    "gsettings",
+                    &["set", "org.gnome.system.proxy", "mode", "none"],
+                )
+                .map(drop),
+        };
+        match done {
+            Ok(()) => out.restored.push(c.target),
+            Err(e) => {
+                tracing::warn!(target = %c.target, error = %e, "could not switch off parda's PAC");
+                out.failed.push(c.target);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Whether the current setting of `s.target` still points at parda.
@@ -664,6 +818,64 @@ mod tests {
     }
 
     #[test]
+    fn on_again_after_an_outside_change_saves_that_change_for_off() {
+        let (_d, p) = paths();
+        let mut os = mac();
+        enable(&mut os, &p, Platform::MacOs, PAC).unwrap();
+        // A VPN client points Thunderbolt Bridge at its own PAC; the user
+        // switches iPhone USB's auto-proxy off; Wi-Fi stays parda's.
+        os.mac.get_mut("Thunderbolt Bridge").unwrap().0 = Some("http://vpn/new.pac".into());
+        os.mac.get_mut("iPhone USB").unwrap().1 = false;
+        enable(&mut os, &p, Platform::MacOs, PAC).unwrap();
+        assert_eq!(os.mac["Thunderbolt Bridge"].0.as_deref(), Some(PAC));
+        let r = disable(&mut os, &p).unwrap().unwrap();
+        assert_eq!(r.restored.len(), 3, "{r:?}");
+        assert_eq!(
+            os.mac["Thunderbolt Bridge"],
+            (Some("http://vpn/new.pac".into()), true, true),
+            "the VPN's PAC is back, not the one from before the first on"
+        );
+        assert!(!os.mac["iPhone USB"].1, "switched off as the user left it");
+        assert!(!os.mac["Wi-Fi"].1, "Wi-Fi's original (no proxy) kept");
+    }
+
+    #[test]
+    fn on_again_after_an_outside_change_on_windows_and_gnome() {
+        let (_d, p) = paths();
+        let mut os = Os {
+            win: Some("http://corp/w.pac".into()),
+            ..Default::default()
+        };
+        enable(&mut os, &p, Platform::Windows, PAC).unwrap();
+        os.win = Some("http://vpn/w.pac".into());
+        enable(&mut os, &p, Platform::Windows, PAC).unwrap();
+        disable(&mut os, &p).unwrap().unwrap();
+        assert_eq!(os.win.as_deref(), Some("http://vpn/w.pac"));
+
+        let (_d, p) = paths();
+        let mut os = Os {
+            gnome: ("none".into(), String::new()),
+            ..Default::default()
+        };
+        enable(&mut os, &p, Platform::Linux, PAC).unwrap();
+        os.gnome = ("manual".into(), String::new());
+        enable(&mut os, &p, Platform::Linux, PAC).unwrap();
+        disable(&mut os, &p).unwrap().unwrap();
+        assert_eq!(os.gnome.0, "manual");
+
+        // Still parda's on the second on: the original stays.
+        let (_d, p) = paths();
+        let mut os = Os {
+            win: Some("http://corp/w.pac".into()),
+            ..Default::default()
+        };
+        enable(&mut os, &p, Platform::Windows, PAC).unwrap();
+        enable(&mut os, &p, Platform::Windows, PAC).unwrap();
+        disable(&mut os, &p).unwrap().unwrap();
+        assert_eq!(os.win.as_deref(), Some("http://corp/w.pac"));
+    }
+
+    #[test]
     fn no_enabled_service_is_an_error_and_changes_nothing() {
         let (_d, p) = paths();
         let mut os = Os::default();
@@ -711,6 +923,149 @@ mod tests {
             os.gnome,
             ("manual".to_string(), "http://corp/g.pac".to_string())
         );
+    }
+
+    /// Calls that would change a setting.
+    fn writes(os: &Os) -> Vec<&String> {
+        os.calls
+            .iter()
+            .filter(|c| {
+                c.starts_with("networksetup -set")
+                    || c.starts_with("reg add")
+                    || c.starts_with("reg delete")
+                    || c.starts_with("gsettings set")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inspect_reads_every_enabled_macos_service_without_changing_anything() {
+        let (_d, p) = paths();
+        let mut os = mac();
+        enable(&mut os, &p, Platform::MacOs, PAC).unwrap();
+        os.mac.get_mut("iPhone USB").unwrap().1 = false; // user switched it off
+        os.calls.clear();
+        let before = snapshot(&os);
+        let now = inspect(&mut os, Platform::MacOs, PAC).unwrap();
+        assert!(writes(&os).is_empty(), "{:?}", os.calls);
+        assert_eq!(snapshot(&os), before);
+        let get = |t: &str| now.iter().find(|c| c.target == t).cloned();
+        assert!(
+            get("Bluetooth PAN").is_none(),
+            "disabled services are skipped"
+        );
+        let wifi = get("Wi-Fi").unwrap();
+        assert!(wifi.active && wifi.parda, "{wifi:?}");
+        assert_eq!(wifi.url.as_deref(), Some(PAC));
+        let usb = get("iPhone USB").unwrap();
+        assert!(!usb.active && !usb.parda, "{usb:?}");
+    }
+
+    #[test]
+    fn inspect_recognises_an_old_port_and_other_pacs_on_windows_and_gnome() {
+        let mut os = Os {
+            win: Some("http://127.0.0.1:9999/parda.pac".into()),
+            gnome: ("manual".into(), PAC.into()),
+            ..Default::default()
+        };
+        let w = inspect(&mut os, Platform::Windows, PAC).unwrap();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].active && w[0].parda, "{w:?}");
+        let g = inspect(&mut os, Platform::Linux, PAC).unwrap();
+        assert!(
+            !g[0].active && !g[0].parda,
+            "manual mode: the PAC is unused"
+        );
+        os.gnome.0 = "auto".into();
+        assert!(inspect(&mut os, Platform::Linux, PAC).unwrap()[0].parda);
+        os.win = None;
+        let w = inspect(&mut os, Platform::Windows, PAC).unwrap();
+        assert!(!w[0].active && w[0].url.is_none());
+        assert!(writes(&os).is_empty(), "{:?}", os.calls);
+        assert_eq!(os.refreshed, 0);
+    }
+
+    #[test]
+    fn switch_off_parda_turns_off_every_parda_pac_without_saved_state() {
+        let mut os = mac();
+        os.mac.get_mut("Wi-Fi").unwrap().0 = Some(PAC.into());
+        os.mac.get_mut("Wi-Fi").unwrap().1 = true;
+        // An older run on another port.
+        os.mac.get_mut("iPhone USB").unwrap().0 = Some("http://127.0.0.1:9999/parda.pac".into());
+        os.mac.get_mut("iPhone USB").unwrap().1 = true;
+        let before = snapshot(&os);
+        let r = switch_off_parda(&mut os, Platform::MacOs, PAC).unwrap();
+        assert_eq!(r.restored, ["Wi-Fi", "iPhone USB"]);
+        assert!(r.failed.is_empty());
+        assert!(!os.mac["Wi-Fi"].1 && !os.mac["iPhone USB"].1);
+        assert_eq!(
+            os.mac["Thunderbolt Bridge"], before["Thunderbolt Bridge"],
+            "someone else's PAC is left alone"
+        );
+        // Nothing of parda's left: nothing to do.
+        os.calls.clear();
+        let r = switch_off_parda(&mut os, Platform::MacOs, PAC).unwrap();
+        assert_eq!(r, Restored::default());
+        assert!(writes(&os).is_empty(), "{:?}", os.calls);
+
+        os.mac.get_mut("Wi-Fi").unwrap().1 = true;
+        os.failing
+            .push("networksetup -setautoproxystate Wi-Fi".into());
+        let r = switch_off_parda(&mut os, Platform::MacOs, PAC).unwrap();
+        assert_eq!(r.failed, ["Wi-Fi"]);
+
+        let mut os = Os {
+            win: Some(PAC.into()),
+            gnome: ("auto".into(), PAC.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            switch_off_parda(&mut os, Platform::Windows, PAC)
+                .unwrap()
+                .restored,
+            ["user"]
+        );
+        assert_eq!(os.win, None);
+        assert_eq!(
+            switch_off_parda(&mut os, Platform::Linux, PAC)
+                .unwrap()
+                .restored,
+            ["GNOME"]
+        );
+        assert_eq!(os.gnome.0, "none");
+        // Not parda's: left alone.
+        let mut os = Os {
+            win: Some("http://corp/w.pac".into()),
+            gnome: ("auto".into(), "http://corp/g.pac".into()),
+            ..Default::default()
+        };
+        assert!(
+            switch_off_parda(&mut os, Platform::Windows, PAC)
+                .unwrap()
+                .restored
+                .is_empty()
+        );
+        assert!(
+            switch_off_parda(&mut os, Platform::Linux, PAC)
+                .unwrap()
+                .restored
+                .is_empty()
+        );
+        assert!(writes(&os).is_empty(), "{:?}", os.calls);
+    }
+
+    #[test]
+    fn a_pac_points_at_the_listener_only_with_its_port_and_address() {
+        let at = |u: &str, a: &str| pac_points_at(u, a.parse().unwrap());
+        assert!(at(PAC, "127.0.0.1:8788"));
+        assert!(!at(PAC, "127.0.0.1:9999"), "another port");
+        assert!(at("http://localhost:8788/parda.pac", "127.0.0.1:8788"));
+        assert!(at("http://localhost:8788/parda.pac", "[::1]:8788"));
+        assert!(at("http://[::1]:8788/parda.pac", "[::1]:8788"));
+        assert!(!at("http://[::1]:8788/parda.pac", "127.0.0.1:8788"));
+        assert!(!at("http://127.0.0.1/parda.pac", "127.0.0.1:80"), "no port");
+        assert!(!at("http://corp:8788/parda.pac", "127.0.0.1:8788"));
+        assert!(!at("http://127.0.0.1:8788/other.pac", "127.0.0.1:8788"));
     }
 
     #[test]

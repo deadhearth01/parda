@@ -1,25 +1,61 @@
-//! Rendering of each tab.
+//! The body of each tab. Lists build widgets for the visible rows only.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap,
+    Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Sparkline, Table, TableState,
+    Wrap,
 };
 use serde_json::Value;
 
-use crate::app::{App, Hit, Prompt, Tab};
-use crate::settings;
+use crate::app::{App, Filter, Hit, Level, SURFACES};
+use crate::settings::{self, Edit};
 
-const ACCENT: Color = Color::Cyan;
+pub const ACCENT: Color = Color::Cyan;
+/// Intercepted AI-site traffic, told apart from the agent proxy at a glance.
+pub const INTERCEPT: Color = Color::Magenta;
+pub const DIM: Color = Color::DarkGray;
 
-fn hit(app: &App, r: Rect, h: Hit) {
+pub fn surface_color(surface: &str) -> Color {
+    match surface {
+        "intercept" => INTERCEPT,
+        "clipboard" => Color::Blue,
+        _ => ACCENT,
+    }
+}
+
+pub fn level_style(l: Level) -> Style {
+    match l {
+        Level::Info => Style::default().fg(ACCENT),
+        Level::Warn => Style::default().fg(Color::Yellow),
+        Level::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    }
+}
+
+pub fn dim() -> Style {
+    Style::default().fg(DIM)
+}
+
+pub fn bold() -> Style {
+    Style::default().add_modifier(Modifier::BOLD)
+}
+
+pub fn hit(app: &App, r: Rect, h: Hit) {
     app.hits.borrow_mut().push((r, h));
 }
 
+/// Mark the inside of a bordered box as user / answer text.
+pub fn protect(app: &App, r: Rect) {
+    app.text_areas
+        .borrow_mut()
+        .push(r.inner(ratatui::layout::Margin::new(1, 1)));
+}
+
 /// First visible row so that `sel` stays inside a window of `height` rows.
-fn window_start(sel: usize, height: usize) -> usize {
+pub fn window_start(sel: usize, height: usize) -> usize {
     if height == 0 || sel < height {
         0
     } else {
@@ -27,184 +63,17 @@ fn window_start(sel: usize, height: usize) -> usize {
     }
 }
 
-pub fn draw(app: &App, f: &mut Frame) {
-    app.hits.borrow_mut().clear();
-    let area = f.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    let titles: Vec<Line> = Tab::ALL
-        .iter()
-        .enumerate()
-        .map(|(i, t)| Line::from(format!("{} {}", i + 1, t.title())))
-        .collect();
-    let selected = Tab::ALL.iter().position(|t| *t == app.tab).unwrap_or(0);
-    let state = if app.connected {
-        "● connected"
-    } else {
-        "○ daemon offline"
-    };
-    let on = app.protection_on();
-    let switch = if on {
-        Span::styled(
-            " ■ PROTECTION ON ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(
-            " □ PROTECTION OFF — p to resume ",
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::Red)
-                .add_modifier(Modifier::BOLD),
-        )
-    };
-    let switch_w = switch.width() as u16;
-    let header = chunks[0];
-    let tabs = Tabs::new(titles.clone())
-        .select(selected)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(if on {
-                    Style::default()
-                } else {
-                    Style::default().fg(Color::Red)
-                })
-                .title(Line::from(vec![
-                    Span::styled(
-                        " parda ",
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!("{state} ")),
-                ]))
-                .title_top(Line::from(switch).right_aligned()),
-        )
-        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
-    f.render_widget(tabs, header);
-    // Clickable regions: the switch (right end of the top border) and each
-    // tab title (Tabs draws " title " separated by a 1-cell divider).
-    if header.width > switch_w + 2 {
-        hit(
-            app,
-            Rect::new(header.right() - 1 - switch_w, header.y, switch_w, 1),
-            Hit::Protection,
-        );
-    }
-    let mut x = header.x + 1;
-    for (t, title) in Tab::ALL.iter().zip(&titles) {
-        let w = title.width() as u16 + 2;
-        if x >= header.right() {
-            break;
-        }
-        hit(
-            app,
-            Rect::new(x, header.y + 1, w.min(header.right() - x), 1),
-            Hit::Tab(*t),
-        );
-        x += w + 1;
-    }
-
-    match app.tab {
-        Tab::Dashboard => dashboard(app, f, chunks[1]),
-        Tab::Live => live(app, f, chunks[1]),
-        Tab::Inspector => inspector(app, f, chunks[1]),
-        Tab::Rules => rules(app, f, chunks[1]),
-        Tab::Vault => vault(app, f, chunks[1]),
-        Tab::Settings => settings_tab(app, f, chunks[1]),
-    }
-
-    let footer = match (&app.message, app.tab) {
-        (Some(m), _) => m.clone(),
-        (None, Tab::Inspector) => {
-            "i/Enter/click edit · Enter run · r restore preview · Esc clear · q quit".into()
-        }
-        (None, Tab::Rules) => {
-            "a add person · w allow term · d delete · ↑↓/wheel/click select · q quit".into()
-        }
-        (None, Tab::Vault) => "w wipe all · q quit".into(),
-        (None, Tab::Live) => "↑↓/wheel scroll · End newest · p protection · q quit".into(),
-        (None, Tab::Settings) => {
-            "↑↓ select · Enter/Space/click change · ←/right-click back · p protection · q quit"
-                .into()
-        }
-        _ => "1-6 or click tabs · p protection on/off · ? help · q quit".into(),
-    };
-    f.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
-        chunks[2],
-    );
-
-    if let Some((kind, buf)) = &app.prompt {
-        let title = match kind {
-            Prompt::AddPerson => " Person to always mask ",
-            Prompt::AllowTerm => " Term never to mask ",
-        };
-        let r = centered(area, 60, 3);
-        f.render_widget(Clear, r);
-        f.render_widget(
-            Paragraph::new(format!("{buf}▏"))
-                .block(Block::default().borders(Borders::ALL).title(title)),
-            r,
-        );
-    }
-    if app.help {
-        let r = centered(area, 72, 15);
-        f.render_widget(Clear, r);
-        f.render_widget(
-            Paragraph::new(vec![
-                Line::from("1 Dashboard  2 Live  3 Inspector  4 Rules  5 Vault  6 Settings"),
-                Line::from(""),
-                Line::from("p (anywhere) or click the header switch: protection on / off"),
-                Line::from("Inspector: type text, Enter shows what would be sent"),
-                Line::from("Rules: a add a person, w allow a term, d delete"),
-                Line::from("Vault: w wipes every mapping (asks first)"),
-                Line::from(
-                    "Settings: Enter/Space/click changes a value, ← or right-click goes back",
-                ),
-                Line::from(""),
-                Line::from("Mouse: click tabs, rows and the switch; wheel scrolls lists."),
-                Line::from("Hold Shift (Option on macOS) while dragging to select text."),
-                Line::from("Values are never shown in the live feed: kinds and counts only."),
-                Line::from("? closes this help · q quits"),
-            ])
-            .block(Block::default().borders(Borders::ALL).title(" help ")),
-            r,
-        );
-    }
-}
-
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let w = width.min(area.width);
-    let h = height.min(area.height);
-    Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
-        w,
-        h,
-    )
-}
-
-fn block(title: &str) -> Block<'_> {
+pub fn block(title: &str) -> Block<'_> {
     Block::default()
         .borders(Borders::ALL)
         .title(format!(" {title} "))
 }
 
-fn s<'a>(v: &'a Value, path: &[&str]) -> &'a Value {
+pub fn s<'a>(v: &'a Value, path: &[&str]) -> &'a Value {
     path.iter().fold(v, |acc, k| &acc[*k])
 }
 
-fn text(v: &Value) -> String {
+pub fn text(v: &Value) -> String {
     match v {
         Value::Null => "-".into(),
         Value::String(s) => s.clone(),
@@ -234,17 +103,154 @@ fn kv_rows(map: &Value) -> Vec<(String, u64)> {
     rows
 }
 
-fn dashboard(app: &App, f: &mut Frame, area: Rect) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
-        .split(area);
+fn uptime(s: u64) -> String {
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m {}s", s / 60, s % 60),
+        _ => format!("{}h {}m", s / 3600, (s / 60) % 60),
+    }
+}
+
+fn clock(ts_ms: u64) -> String {
+    let secs = (ts_ms / 1000) % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    )
+}
+
+/// A one-line `/` filter bar on top of `area` when the filter is in use;
+/// returns the rest.
+fn filter_bar(app: &App, f: &mut Frame, area: Rect, filter: &Filter, what: &str) -> Rect {
+    if !filter.active() && !filter.editing {
+        return area;
+    }
+    let [bar, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+    let cursor = if filter.editing {
+        app.theme.cursor()
+    } else {
+        ""
+    };
+    let hint = if filter.editing {
+        "  Enter keep · Esc clear"
+    } else {
+        "  / edit · Esc clear"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" / {what}: "), Style::default().fg(ACCENT)),
+            Span::styled(format!("{}{cursor}", filter.text), bold()),
+            Span::styled(hint, dim()),
+        ])),
+        bar,
+    );
+    app.text_areas.borrow_mut().push(bar);
+    rest
+}
+
+// ── Dashboard ───────────────────────────────────────────────────────────
+
+/// Problems worth a box of their own on the dashboard.
+pub fn warnings(st: &Value) -> Vec<(String, Level)> {
+    let mut w = Vec::new();
+    let it = &st["intercept"];
+    if it.is_object() {
+        let enabled = it["enabled"].as_bool() == Some(true);
+        let listening = it["listening"].as_str();
+        let pac = it["pac"].as_str();
+        match (pac, listening) {
+            (Some(_), None) => w.push((
+                "the system proxy sends AI sites to parda, but nothing listens — they fail to \
+                 load (parda intercept on, or parda intercept off)"
+                    .to_string(),
+                Level::Error,
+            )),
+            (Some(pac), Some(addr)) if it["pac_matches"].as_bool() == Some(false) => w.push((
+                format!(
+                    "the system proxy points at {pac} but the listener is on {addr} — run parda \
+                     intercept on"
+                ),
+                Level::Error,
+            )),
+            _ => {}
+        }
+        if enabled && it["ca"].as_bool() == Some(false) {
+            w.push((
+                "AI-site filtering is on but there is no CA — run parda ca create, then parda \
+                 ca install"
+                    .into(),
+                Level::Error,
+            ));
+        } else if enabled && listening.is_none() {
+            match it["error"].as_str() {
+                Some(e) => w.push((format!("intercept not listening — {e}"), Level::Error)),
+                None => w.push((crate::app::NO_PROXY.to_string(), Level::Warn)),
+            }
+        }
+    }
+    match (st["model"].as_str(), st["model_error"].as_str()) {
+        (None, Some(e)) => w.push((
+            format!("name model unavailable — {e} (format rules still run)"),
+            Level::Warn,
+        )),
+        (None, None) if st["model_configured"].as_str().is_some_and(|m| m != "none") => w.push((
+            "name model not loaded — only format rules run".into(),
+            Level::Warn,
+        )),
+        _ => {}
+    }
+    w
+}
+
+/// The dashboard's intercept line, from the daemon status; `None` for a
+/// daemon too old to report it.
+fn intercept_line(it: &Value) -> Option<Line<'static>> {
+    if !it.is_object() {
+        return None;
+    }
+    let label = Span::raw("intercept  ");
+    let pac_set = it["pac"].is_string();
+    let warn = Style::default().fg(Color::Yellow);
+    let bad = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let (msg, style) = match (it["listening"].as_str(), it["error"].as_str()) {
+        (Some(addr), _) if pac_set && it["pac_matches"].as_bool() == Some(false) => (
+            format!(
+                "on · {addr} · system proxy points at {} — AI sites fail to load; run parda \
+                 intercept on",
+                it["pac"].as_str().unwrap_or_default()
+            ),
+            bad,
+        ),
+        (Some(addr), _) if pac_set => (
+            format!("on · {addr} · system proxy set"),
+            Style::default().fg(INTERCEPT),
+        ),
+        (Some(addr), _) => (
+            format!("on · {addr} · NO system proxy (parda intercept on)"),
+            warn,
+        ),
+        (None, Some(e)) => (format!("NOT LISTENING — {e}"), bad),
+        (None, None) if it["enabled"].as_bool() == Some(true) => {
+            (crate::app::NO_PROXY.to_string(), bad)
+        }
+        (None, None) if pac_set => (
+            "OFF but the system proxy still points here — AI sites fail to load; \
+             run parda intercept off"
+                .to_string(),
+            bad,
+        ),
+        (None, None) => ("off".to_string(), dim()),
+    };
+    Some(Line::from(vec![label, Span::styled(msg, style)]))
+}
+
+fn status_lines(app: &App) -> Vec<Line<'static>> {
     let null = Value::Null;
     let st = app.status.as_ref().unwrap_or(&null);
     let stats = &st["stats"];
     let act = &st["activity"];
-
-    // Latency: daemon-side percentiles, else what this session has seen.
     let lat = match (
         act["latency_ms"]["p50"].as_u64(),
         act["latency_ms"]["p95"].as_u64(),
@@ -258,7 +264,7 @@ fn dashboard(app: &App, f: &mut Frame, area: Rect) {
             let latencies: Vec<u64> = app
                 .events
                 .iter()
-                .filter(|e| e.surface == "proxy")
+                .filter(|e| e.surface == "proxy" || e.surface == "intercept")
                 .filter_map(|e| e.latency_ms)
                 .collect();
             match (
@@ -296,7 +302,7 @@ fn dashboard(app: &App, f: &mut Frame, area: Rect) {
     let total: u64 = kv_rows(&stats["entities"]).iter().map(|(_, n)| n).sum();
     let protection = if app.protection_on() {
         Line::from(vec![
-            Span::styled("protection ", Style::default().fg(Color::DarkGray)),
+            Span::styled("protection ", dim()),
             Span::styled(
                 "ON",
                 Style::default()
@@ -306,17 +312,17 @@ fn dashboard(app: &App, f: &mut Frame, area: Rect) {
         ])
     } else {
         Line::from(vec![
-            Span::styled("protection ", Style::default().fg(Color::DarkGray)),
+            Span::styled("protection ", dim()),
             Span::styled(
                 "OFF — text is sent unfiltered (press p)",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
         ])
     };
-    let lines = vec![
+    let mut lines = vec![
         protection,
         Line::from(vec![
-            Span::styled("filtered   ", Style::default().fg(Color::DarkGray)),
+            Span::styled("filtered   ", dim()),
             Span::styled(
                 format!("{total} values"),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -325,7 +331,7 @@ fn dashboard(app: &App, f: &mut Frame, area: Rect) {
         ]),
         Line::from(format!(
             "daemon     {}",
-            if app.connected {
+            if app.connected() {
                 format!(
                     "running · pid {} · up {}",
                     text(&st["pid"]),
@@ -342,6 +348,11 @@ fn dashboard(app: &App, f: &mut Frame, area: Rect) {
                 .map(|a| format!("http://{a}"))
                 .unwrap_or_else(|| "off".into())
         )),
+    ];
+    if let Some(l) = intercept_line(&st["intercept"]) {
+        lines.push(l);
+    }
+    lines.extend([
         Line::from(format!(
             "clipboard  {}",
             if st["clipboard"].as_bool() == Some(true) {
@@ -367,124 +378,434 @@ fn dashboard(app: &App, f: &mut Frame, area: Rect) {
             num(&stats["cache_hits"]),
             frags
         )),
-    ];
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(block("Status"))
-            .wrap(Wrap { trim: true }),
-        cols[0],
-    );
+    ]);
+    lines
+}
 
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(cols[1]);
-    let bold = Style::default().add_modifier(Modifier::BOLD);
-    let kind_rows: Vec<Row> = kv_rows(&stats["entities"])
+/// Per-minute values for the last `n` minutes (oldest first).
+fn series(app: &App, n: usize, f: impl Fn(&crate::app::Bucket) -> u64) -> Vec<u64> {
+    let mut out = vec![0u64; n];
+    if n == 0 {
+        return out;
+    }
+    let last = app.buckets.back().map_or(0, |b| b.minute);
+    let end = last.max(app.now_ms / 60_000);
+    let start = (end + 1).saturating_sub(n as u64);
+    for b in &app.buckets {
+        if b.minute >= start && b.minute <= end {
+            out[(b.minute - start) as usize] = f(b);
+        }
+    }
+    out
+}
+
+fn p95(xs: &[u64]) -> u64 {
+    percentile(xs.to_vec(), 0.95).unwrap_or(0)
+}
+
+fn activity(app: &App, f: &mut Frame, area: Rect) {
+    let b = block("Activity this session (per minute)");
+    let inner = b.inner(area);
+    f.render_widget(b, area);
+    if inner.height == 0 || inner.width < 20 {
+        return;
+    }
+    let rows = inner.height as usize;
+    let per = (rows / 2).max(1) as u16;
+    let label_w = 15u16;
+    let value_w = 22u16.min(inner.width / 3);
+    let spark_w = inner.width.saturating_sub(label_w + value_w + 1);
+    let all_lat: Vec<u64> = app
+        .buckets
+        .iter()
+        .flat_map(|b| b.latencies.iter().copied())
+        .collect();
+    let this_min = series(app, 1, |b| b.values)[0];
+    let values = series(app, spark_w as usize, |b| b.values);
+    let lat = series(app, spark_w as usize, |b| p95(&b.latencies));
+    let lines = [
+        (
+            "values/min",
+            values,
+            format!("{this_min} this minute"),
+            Style::default().fg(ACCENT),
+        ),
+        (
+            "latency p95",
+            lat,
+            match (percentile(all_lat.clone(), 0.5), percentile(all_lat, 0.95)) {
+                (Some(a), Some(b)) => format!("p50 {a} · p95 {b} ms"),
+                _ => "no requests yet".into(),
+            },
+            Style::default().fg(INTERCEPT),
+        ),
+    ];
+    for (i, (label, data, value, style)) in lines.into_iter().enumerate() {
+        let y = inner.y + i as u16 * per;
+        if y >= inner.bottom() {
+            break;
+        }
+        let h = per.min(inner.bottom() - y);
+        f.render_widget(
+            Paragraph::new(Span::styled(label, dim())),
+            Rect::new(inner.x, y, label_w, 1).intersection(inner),
+        );
+        f.render_widget(
+            Sparkline::default()
+                .data(&data)
+                .bar_set(symbols::bar::NINE_LEVELS)
+                .style(style),
+            Rect::new(inner.x + label_w, y, spark_w, h).intersection(inner),
+        );
+        f.render_widget(
+            Paragraph::new(Span::raw(value)),
+            Rect::new(inner.x + label_w + spark_w + 1, y, value_w, 1).intersection(inner),
+        );
+    }
+}
+
+fn kinds_table(app: &App, f: &mut Frame, area: Rect) {
+    let null = Value::Null;
+    let st = app.status.as_ref().unwrap_or(&null);
+    let rows_all = kv_rows(&st["stats"]["entities"]);
+    let total: u64 = rows_all.iter().map(|(_, n)| n).sum();
+    let height = area.height.saturating_sub(3) as usize;
+    let max = rows_all.first().map_or(1, |r| r.1.max(1));
+    let bar_w = area.width.saturating_sub(2 + 16 + 8) as u64;
+    let rows: Vec<Row> = rows_all
         .into_iter()
-        .map(|(k, n)| Row::new(vec![Cell::from(k), Cell::from(n.to_string())]))
+        .take(height)
+        .map(|(k, n)| {
+            let bar = "■".repeat(((n * bar_w).div_ceil(max)) as usize);
+            Row::new(vec![
+                Cell::from(k),
+                Cell::from(n.to_string()),
+                Cell::from(Span::styled(bar, Style::default().fg(ACCENT))),
+            ])
+        })
         .collect();
     let title = format!("Filtered by kind ({total})");
     let table = Table::new(
-        kind_rows,
-        [Constraint::Percentage(70), Constraint::Percentage(30)],
+        rows,
+        [
+            Constraint::Length(16),
+            Constraint::Length(7),
+            Constraint::Min(1),
+        ],
     )
-    .header(Row::new(vec!["kind", "count"]).style(bold))
+    .header(Row::new(vec!["kind", "count", ""]).style(bold()))
     .block(block(&title));
-    f.render_widget(table, right[0]);
+    f.render_widget(table, area);
+}
 
-    let mut rows: Vec<Row> = kv_rows(&stats["by_source"])
+fn where_from(app: &App, f: &mut Frame, area: Rect) {
+    let null = Value::Null;
+    let st = app.status.as_ref().unwrap_or(&null);
+    let mut rows: Vec<Row> = kv_rows(&st["stats"]["by_source"])
         .into_iter()
         .map(|(k, n)| Row::new(vec!["found by".to_string(), k, n.to_string()]))
         .collect();
-    if let Some(surfaces) = act["surfaces"].as_object() {
+    if let Some(surfaces) = st["activity"]["surfaces"].as_object() {
         for (name, s) in surfaces {
             if name == "daemon" {
                 continue;
             }
-            rows.push(Row::new(vec![
-                "surface".to_string(),
-                format!("{name} ({} events)", num(&s["events"])),
-                num(&s["redacted"]).to_string(),
-            ]));
+            let warn = num(&s["warnings"]);
+            let style = if warn > 0 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(surface_color(name))
+            };
+            rows.push(
+                Row::new(vec![
+                    "surface".to_string(),
+                    if warn > 0 {
+                        format!("{name} ({} events, {warn} warn)", num(&s["events"]))
+                    } else {
+                        format!("{name} ({} events)", num(&s["events"]))
+                    },
+                    num(&s["redacted"]).to_string(),
+                ])
+                .style(style),
+            );
         }
     }
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(25),
-            Constraint::Percentage(50),
-            Constraint::Percentage(25),
+            Constraint::Length(9),
+            Constraint::Min(10),
+            Constraint::Length(7),
         ],
     )
-    .header(Row::new(vec!["", "source", "values"]).style(bold))
+    .header(Row::new(vec!["", "source", "values"]).style(bold()))
     .block(block("Where from"));
-    f.render_widget(table, right[1]);
+    f.render_widget(table, area);
 }
 
-fn uptime(s: u64) -> String {
-    match s {
-        0..=59 => format!("{s}s"),
-        60..=3599 => format!("{}m {}s", s / 60, s % 60),
-        _ => format!("{}h {}m", s / 3600, (s / 60) % 60),
+pub fn dashboard(app: &App, f: &mut Frame, area: Rect) {
+    let null = Value::Null;
+    let st = app.status.as_ref().unwrap_or(&null);
+    let warns = warnings(st);
+    let mut constraints = Vec::new();
+    if !warns.is_empty() {
+        constraints.push(Constraint::Length((warns.len() as u16 + 2).min(6)));
+    }
+    let activity_h = if area.height >= 36 { 6 } else { 4 };
+    constraints.push(Constraint::Min(6));
+    constraints.push(Constraint::Length(activity_h));
+    let parts = Layout::vertical(constraints).split(area);
+    let mut i = 0;
+    if !warns.is_empty() {
+        let lines: Vec<Line> = warns
+            .iter()
+            .map(|(t, l)| Line::from(Span::styled(format!("! {t}"), level_style(*l))))
+            .collect();
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: true })
+                .block(block("Warnings").border_style(Style::default().fg(Color::Red))),
+            parts[0],
+        );
+        i = 1;
+    }
+    let main = parts[i];
+    let status = Paragraph::new(status_lines(app))
+        .block(block("Status"))
+        .wrap(Wrap { trim: true });
+    if area.width < 70 {
+        // Narrow: status above the per-kind counters.
+        let [a, b] = Layout::vertical([Constraint::Min(6), Constraint::Length(7)]).areas(main);
+        f.render_widget(status, a);
+        kinds_table(app, f, b);
+    } else {
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)])
+                .areas(main);
+        f.render_widget(status, left);
+        let [k, w] =
+            Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(right);
+        kinds_table(app, f, k);
+        where_from(app, f, w);
+    }
+    activity(app, f, parts[i + 1]);
+}
+
+// ── Live ────────────────────────────────────────────────────────────────
+
+/// (target, status) from an event summary such as
+/// `chatgpt.com → 200 · 2 redacted` or `anthropic /v1/messages → 200 · …`.
+pub fn summary_parts(summary: &str) -> (Option<&str>, Option<&str>) {
+    match summary.split_once(" → ") {
+        Some((target, rest)) => (
+            Some(target.trim()),
+            rest.split([' ', '·']).find(|t| !t.is_empty()),
+        ),
+        None => (None, None),
     }
 }
 
-fn live(app: &App, f: &mut Frame, area: Rect) {
-    let height = area.height.saturating_sub(2) as usize;
-    let scroll = app.live_scroll.min(app.events.len().saturating_sub(1));
-    let items: Vec<ListItem> = app
-        .events
-        .iter()
-        .rev()
-        .skip(scroll)
-        .take(height.max(1))
-        .rev()
-        .map(|e| {
-            let secs = (e.ts_ms / 1000) % 86_400;
-            let ts = format!(
-                "{:02}:{:02}:{:02}",
-                secs / 3600,
-                (secs / 60) % 60,
-                secs % 60
-            );
-            let kinds: Vec<String> = e.counts.iter().map(|(k, n)| format!("{k}×{n}")).collect();
-            let ms = e.latency_ms.map(|m| format!(" {m}ms")).unwrap_or_default();
-            let style = if e.level == "warn" {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default()
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{ts} "), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:<9} ", e.surface), Style::default().fg(ACCENT)),
-                Span::styled(e.summary.clone(), style),
-                Span::raw(format!("{ms} {}", kinds.join(" "))),
-            ]))
-        })
-        .collect();
-    let title = if scroll > 0 {
-        format!(
-            "Live ({} events · {scroll} newer hidden, End to jump · values never shown)",
-            app.events.len()
-        )
-    } else {
-        format!("Live ({} events · values never shown)", app.events.len())
-    };
-    f.render_widget(List::new(items).block(block(&title)), area);
+/// Why a request was refused or failed, from its summary.
+pub fn refusal(summary: &str) -> Option<String> {
+    if let Some(i) = summary.find("refused, not sent (") {
+        let r = &summary[i + "refused, not sent (".len()..];
+        let end = r.rfind(')').unwrap_or(r.len());
+        return Some(r[..end].to_string());
+    }
+    if let Some(i) = summary.find("blocked by policy") {
+        return Some(summary[i..].to_string());
+    }
+    if let Some((_, rest)) = summary.split_once(" → ")
+        && let (Some(open), Some(close)) = (rest.find('('), rest.rfind(')'))
+        && open < close
+        && !rest.contains("redacted")
+    {
+        return Some(rest[open + 1..close].to_string());
+    }
+    None
 }
 
-fn inspector(app: &App, f: &mut Frame, area: Rect) {
+fn live_title(app: &App, hidden: usize) -> String {
+    let mut t = format!("Live ({} events", app.live_len());
+    if let Some(s) = SURFACES[app.live.surface] {
+        t.push_str(&format!(" · surface {s}"));
+    }
+    if let Some(k) = &app.live.kind {
+        t.push_str(&format!(" · kind {k}"));
+    }
+    if app.live.paused.is_some() {
+        t.push_str(&format!(" · PAUSED, {} new", app.live_held()));
+    }
+    if hidden > 0 {
+        t.push_str(&format!(" · {hidden} newer hidden, End to jump"));
+    }
+    t.push_str(" · values never shown)");
+    t
+}
+
+fn event_detail(app: &App, f: &mut Frame, area: Rect) {
+    let Some(e) = app.live_selected() else {
+        f.render_widget(
+            Paragraph::new("no event selected").block(block("Event")),
+            area,
+        );
+        return;
+    };
+    let (target, status) = summary_parts(&e.summary);
+    let kinds = if e.counts.is_empty() {
+        "-".to_string()
+    } else {
+        e.counts
+            .iter()
+            .map(|(k, n)| format!("{k} {n}"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    let row =
+        |k: &str, v: String| Line::from(vec![Span::styled(format!("{k:<9}"), dim()), Span::raw(v)]);
+    let mut lines = vec![
+        row("time", clock(e.ts_ms)),
+        Line::from(vec![
+            Span::styled(format!("{:<9}", "surface"), dim()),
+            Span::styled(
+                e.surface.clone(),
+                Style::default().fg(surface_color(&e.surface)),
+            ),
+        ]),
+    ];
+    if let Some(t) = target {
+        lines.push(row("target", t.to_string()));
+    }
+    if let Some(s) = status {
+        lines.push(row("status", s.to_string()));
+    }
+    lines.push(row("kinds", kinds));
+    lines.push(row(
+        "latency",
+        e.latency_ms
+            .map_or("-".into(), |m| format!("{m} ms added by parda")),
+    ));
+    if e.level == "warn" {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<9}", "level"), dim()),
+            Span::styled("warning", Style::default().fg(Color::Yellow)),
+        ]));
+    }
+    if let Some(r) = refusal(&e.summary) {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<9}", "reason"), dim()),
+            Span::styled(r, Style::default().fg(Color::Red)),
+        ]));
+    }
+    lines.push(row("summary", e.summary.clone()));
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(block("Event (kinds and counts only)")),
+        area,
+    );
+}
+
+pub fn live(app: &App, f: &mut Frame, area: Rect) {
+    let area = filter_bar(app, f, area, &app.live.filter, "filter events");
+    let (list_area, detail_area) = if app.live.detail {
+        if area.width >= 110 {
+            let [a, b] =
+                Layout::horizontal([Constraint::Min(40), Constraint::Length(46)]).areas(area);
+            (a, Some(b))
+        } else {
+            let [a, b] = Layout::vertical([Constraint::Min(4), Constraint::Length(10)]).areas(area);
+            (a, Some(b))
+        }
+    } else {
+        (area, None)
+    };
+    let h = list_area.height.saturating_sub(2) as usize;
+    app.page.set(h.max(1));
+    let n = app.live_len();
+    let cursor = app.live.cursor.min(n.saturating_sub(1));
+    let hidden = cursor.saturating_sub(h.saturating_sub(1));
+    let end = n - hidden.min(n);
+    let start = end.saturating_sub(h);
+    let mark = app.live.cursor > 0 || app.live.detail || app.live.paused.is_some();
+    let sel_idx = n.saturating_sub(1).saturating_sub(cursor);
+    let mut items = Vec::with_capacity(end - start);
+    for (row, (idx, (_, e))) in app
+        .live_rows()
+        .enumerate()
+        .skip(start)
+        .take(end - start)
+        .enumerate()
+    {
+        hit(
+            app,
+            Rect::new(
+                list_area.x + 1,
+                list_area.y + 1 + row as u16,
+                list_area.width.saturating_sub(2),
+                1,
+            ),
+            Hit::Row(n - 1 - idx),
+        );
+        let kinds: Vec<String> = e.counts.iter().map(|(k, n)| format!("{k}×{n}")).collect();
+        let ms = e.latency_ms.map(|m| format!(" {m}ms")).unwrap_or_default();
+        let style = if e.level == "warn" {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(format!("{} ", clock(e.ts_ms)), dim()),
+            Span::styled(
+                format!("{:<9} ", e.surface),
+                Style::default().fg(surface_color(&e.surface)),
+            ),
+            Span::styled(e.summary.clone(), style),
+            Span::raw(format!("{ms} {}", kinds.join(" "))),
+        ])));
+    }
+    let empty = items.is_empty();
+    let mut state = ListState::default();
+    if mark && !empty {
+        state.select(Some(sel_idx - start));
+    }
+    let list = if empty {
+        List::new(vec![ListItem::new(Span::styled(
+            if app.events.is_empty() {
+                "no events yet — they appear here as agents, AI sites and the clipboard are filtered"
+            } else {
+                "no events match the filters (c clears them)"
+            },
+            dim(),
+        ))])
+    } else {
+        List::new(items)
+    };
+    f.render_stateful_widget(
+        list.block(block(&live_title(app, hidden)))
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+        list_area,
+        &mut state,
+    );
+    if let Some(d) = detail_area {
+        event_detail(app, f, d);
+    }
+}
+
+// ── Inspector ───────────────────────────────────────────────────────────
+
+pub fn inspector(app: &App, f: &mut Frame, area: Rect) {
     let ins = &app.inspector;
+    let replace_h = if area.height >= 20 { 8 } else { 5 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5),
             Constraint::Min(3),
-            Constraint::Length(8),
+            Constraint::Length(replace_h),
         ])
         .split(area);
-    let cursor = if ins.editing { "▏" } else { "" };
+    let cursor = if ins.editing { app.theme.cursor() } else { "" };
     let title = if ins.editing {
         "Input (editing — Enter to run, Esc to stop)"
     } else {
@@ -497,18 +818,29 @@ fn inspector(app: &App, f: &mut Frame, area: Rect) {
         rows[0],
     );
     hit(app, rows[0], Hit::Input);
+    for r in rows.iter() {
+        protect(app, *r);
+    }
     let (out_title, out) = match (&ins.error, ins.show_restore) {
-        (Some(e), _) => ("Error", e.clone()),
-        (None, false) => ("Sent to the AI", ins.redacted.clone().unwrap_or_default()),
+        (Some(e), _) => ("Error".to_string(), e.clone()),
+        (None, false) => (
+            "Sent to the AI".to_string(),
+            ins.redacted.clone().unwrap_or_default(),
+        ),
         (None, true) => (
-            "Restored (what you would see back)",
+            "Restored (what you would see back)".to_string(),
             ins.restored.clone().unwrap_or_default(),
         ),
+    };
+    let out_title = if ins.busy {
+        format!("{out_title} {} redacting…", app.theme.spinner(app.spin))
+    } else {
+        out_title
     };
     f.render_widget(
         Paragraph::new(out)
             .wrap(Wrap { trim: false })
-            .block(block(out_title)),
+            .block(block(&out_title)),
         rows[1],
     );
     let rows_t: Vec<Row> = ins
@@ -534,36 +866,92 @@ fn inspector(app: &App, f: &mut Frame, area: Rect) {
             Constraint::Percentage(25),
         ],
     )
-    .header(
-        Row::new(vec!["kind", "replaced with", "found by"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
+    .header(Row::new(vec!["kind", "replaced with", "found by"]).style(bold()))
     .block(block("Replacements"));
     f.render_widget(table, rows[2]);
 }
 
-fn rules(app: &App, f: &mut Frame, area: Rect) {
-    let rows = app.rule_rows();
-    let title = "Rules (people & terms always masked · allow-list never masked)";
-    if rows.is_empty() {
+// ── Rules ───────────────────────────────────────────────────────────────
+
+fn rule_detail(app: &App, i: usize) -> Vec<Line<'static>> {
+    let np = app.rules.person.len();
+    let nt = app.rules.term.len();
+    if let Some(p) = app.rules.person.get(i) {
+        vec![
+            Line::from(format!("person   {}", p.name)),
+            Line::from(format!(
+                "also     {} alias(es) · {} email(s) · {} handle(s) — name variants are added \
+                 automatically",
+                p.aliases.len(),
+                p.emails.len(),
+                p.handles.len()
+            )),
+            Line::from(Span::styled(
+                "always masked; edit the details with `parda rules edit`",
+                dim(),
+            )),
+        ]
+    } else if let Some(t) = i.checked_sub(np).and_then(|j| app.rules.term.get(j)) {
+        vec![
+            Line::from(format!("term     {}", t.text)),
+            Line::from(format!("kind     {}", t.kind)),
+            Line::from(Span::styled("always masked as this kind", dim())),
+        ]
+    } else if let Some(a) = i.checked_sub(np + nt).and_then(|j| app.rules.allow.get(j)) {
+        vec![
+            Line::from(format!("allow    {a}")),
+            Line::from(Span::styled(
+                "never masked, even when a rule matches",
+                dim(),
+            )),
+        ]
+    } else {
+        vec![]
+    }
+}
+
+pub fn rules(app: &App, f: &mut Frame, area: Rect) {
+    let area = filter_bar(app, f, area, &app.rules_filter, "filter rules");
+    let all = app.rule_rows();
+    let view = app.rules_view();
+    let title = if app.rules_filter.active() {
+        format!(
+            "Rules ({} of {}) · always masked · allow-list never masked",
+            view.len(),
+            all.len()
+        )
+    } else {
+        "Rules (people & terms always masked · allow-list never masked)".to_string()
+    };
+    let (list_area, detail_area) = if app.rules_detail && !view.is_empty() {
+        let [a, b] = Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).areas(area);
+        (a, Some(b))
+    } else {
+        (area, None)
+    };
+    if view.is_empty() {
+        let msg = if all.is_empty() {
+            "no rules yet — press a to add a person to always mask"
+        } else {
+            "no rules match the filter (Esc clears it)"
+        };
         f.render_widget(
-            List::new(vec![ListItem::new(
-                "no rules yet — press a to add a person to always mask",
-            )])
-            .block(block(title)),
-            area,
+            List::new(vec![ListItem::new(msg)]).block(block(&title)),
+            list_area,
         );
         return;
     }
-    let height = area.height.saturating_sub(2) as usize;
-    let sel = app.rules_sel.min(rows.len() - 1);
+    let height = list_area.height.saturating_sub(2) as usize;
+    app.page.set(height.max(1));
+    let sel = app.rules_sel.min(view.len() - 1);
     let start = window_start(sel, height);
-    let items: Vec<ListItem> = rows
+    let items: Vec<ListItem> = view
         .iter()
         .enumerate()
         .skip(start)
         .take(height)
-        .map(|(i, (section, t))| {
+        .map(|(vi, ri)| {
+            let (section, t) = &all[*ri];
             let color = match *section {
                 "person" => Color::Green,
                 "term" => Color::Magenta,
@@ -572,12 +960,12 @@ fn rules(app: &App, f: &mut Frame, area: Rect) {
             hit(
                 app,
                 Rect::new(
-                    area.x + 1,
-                    area.y + 1 + (i - start) as u16,
-                    area.width.saturating_sub(2),
+                    list_area.x + 1,
+                    list_area.y + 1 + (vi - start) as u16,
+                    list_area.width.saturating_sub(2),
                     1,
                 ),
-                Hit::Row(i),
+                Hit::Row(vi),
             );
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{section:<7}"), Style::default().fg(color)),
@@ -588,19 +976,67 @@ fn rules(app: &App, f: &mut Frame, area: Rect) {
     let mut state = ListState::default();
     state.select(Some(sel - start));
     let list = List::new(items)
-        .block(block(title))
+        .block(block(&title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    f.render_stateful_widget(list, area, &mut state);
+    f.render_stateful_widget(list, list_area, &mut state);
+    protect(app, list_area);
+    if let Some(d) = detail_area {
+        f.render_widget(
+            Paragraph::new(rule_detail(app, view[sel]))
+                .wrap(Wrap { trim: true })
+                .block(block("Rule")),
+            d,
+        );
+        protect(app, d);
+    }
 }
 
-fn vault(app: &App, f: &mut Frame, area: Rect) {
-    let rows: Vec<Row> = app
-        .vault
-        .iter()
-        .map(|r| Row::new(vec![text(&r["scope"]), text(&r["kind"]), text(&r["count"])]))
-        .collect();
+// ── Vault ───────────────────────────────────────────────────────────────
+
+pub fn vault(app: &App, f: &mut Frame, area: Rect) {
+    let area = filter_bar(app, f, area, &app.vault_filter, "search scope / kind");
+    let view = app.vault_view();
     let total: u64 = app.vault.iter().filter_map(|r| r["count"].as_u64()).sum();
-    let title = format!("Vault — {total} mappings (encrypted at rest)");
+    let title = if app.vault_filter.active() {
+        format!(
+            "Vault — {total} mappings (encrypted at rest) · {} of {} rows",
+            view.len(),
+            app.vault.len()
+        )
+    } else {
+        format!("Vault — {total} mappings (encrypted at rest)")
+    };
+    let (list_area, detail_area) = if app.vault_detail && !view.is_empty() {
+        let [a, b] = Layout::vertical([Constraint::Min(4), Constraint::Length(6)]).areas(area);
+        (a, Some(b))
+    } else {
+        (area, None)
+    };
+    let height = list_area.height.saturating_sub(3) as usize;
+    app.page.set(height.max(1));
+    let sel = app.vault_sel.min(view.len().saturating_sub(1));
+    let start = window_start(sel, height);
+    let rows: Vec<Row> = view
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(height)
+        .map(|(vi, i)| {
+            hit(
+                app,
+                Rect::new(
+                    list_area.x + 1,
+                    list_area.y + 2 + (vi - start) as u16,
+                    list_area.width.saturating_sub(2),
+                    1,
+                ),
+                Hit::Row(vi),
+            );
+            let r = &app.vault[*i];
+            Row::new(vec![text(&r["scope"]), text(&r["kind"]), text(&r["count"])])
+        })
+        .collect();
+    let empty = rows.is_empty();
     let table = Table::new(
         rows,
         [
@@ -609,44 +1045,95 @@ fn vault(app: &App, f: &mut Frame, area: Rect) {
             Constraint::Percentage(20),
         ],
     )
-    .header(
-        Row::new(vec!["scope", "kind", "mappings"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .block(block(&title));
-    f.render_widget(table, area);
+    .header(Row::new(vec!["scope", "kind", "mappings"]).style(bold()))
+    .block(block(&title))
+    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut state = TableState::default();
+    if !empty {
+        state.select(Some(sel - start));
+    }
+    f.render_stateful_widget(table, list_area, &mut state);
+    protect(app, list_area);
+    if let (Some(d), Some(r)) = (detail_area, app.vault_selected()) {
+        let scope = text(&r["scope"]);
+        let (scope_total, kinds) = app
+            .vault
+            .iter()
+            .filter(|x| x["scope"] == r["scope"])
+            .fold((0u64, 0usize), |(t, k), x| (t + num(&x["count"]), k + 1));
+        let lines = vec![
+            Line::from(format!("scope    {scope}")),
+            Line::from(format!(
+                "kind     {} · {} mapping(s)",
+                text(&r["kind"]),
+                text(&r["count"])
+            )),
+            Line::from(format!(
+                "in scope {scope_total} mapping(s) across {kinds} kind(s)"
+            )),
+            Line::from(Span::styled(
+                "x forgets this whole scope · w wipes everything (both ask first)",
+                dim(),
+            )),
+        ];
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: true })
+                .block(block("Mappings")),
+            d,
+        );
+        protect(app, d);
+    }
 }
 
-fn settings_tab(app: &App, f: &mut Frame, area: Rect) {
+// ── Settings ────────────────────────────────────────────────────────────
+
+pub fn settings_tab(app: &App, f: &mut Frame, area: Rect) {
     let null = Value::Null;
     let st = app.status.as_ref().unwrap_or(&null);
     let url = st["proxy"]
         .as_str()
         .map(|a| format!("http://{a}"))
         .unwrap_or_else(|| "http://127.0.0.1:8787".into());
+    let roomy = area.height >= 26;
     let parts = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(if roomy { 5 } else { 1 }),
             Constraint::Min(4),
             Constraint::Length(4),
         ])
         .split(area);
-    let connect = vec![
-        Line::from(format!("Claude Code   export ANTHROPIC_BASE_URL={url}")),
-        Line::from(format!("Codex / SDKs  export OPENAI_BASE_URL={url}/v1")),
-        Line::from(format!(
-            "Chat apps     copy, then press the paste-safe hotkey ({}) instead of paste · config {}",
-            text(&st["hotkey"]),
-            text(s(st, &["paths", "config"]))
-        )),
-    ];
-    f.render_widget(
-        Paragraph::new(connect)
-            .block(block("Connect"))
-            .wrap(Wrap { trim: false }),
-        parts[0],
-    );
+    if roomy {
+        let connect = vec![
+            Line::from(format!(
+                "Agents    export ANTHROPIC_BASE_URL={url} OPENAI_BASE_URL={url}/v1"
+            )),
+            Line::from(format!(
+                "Chat apps copy, then press the paste-safe hotkey ({}) instead of paste",
+                text(&st["hotkey"]),
+            )),
+            Line::from(
+                "AI sites  parda ca create · parda ca install · parda intercept on · undo: parda intercept off",
+            ),
+        ];
+        f.render_widget(
+            Paragraph::new(connect)
+                .block(block("Connect"))
+                .wrap(Wrap { trim: false }),
+            parts[0],
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" agents ", dim()),
+                Span::raw(format!("ANTHROPIC_BASE_URL={url}")),
+                Span::styled("  AI sites ", dim()),
+                Span::raw("parda intercept on"),
+            ])),
+            parts[0],
+        );
+    }
 
     let Some(cfg) = &app.config else {
         f.render_widget(
@@ -660,9 +1147,11 @@ fn settings_tab(app: &App, f: &mut Frame, area: Rect) {
     let rows: Vec<settings::Row> = all.iter().map(|x| settings::row(x, cfg)).collect();
     let list_area = parts[1];
     let height = list_area.height.saturating_sub(2) as usize;
+    app.page.set(height.max(1));
     let sel = app.settings_sel.min(rows.len() - 1);
     let start = window_start(sel, height);
-    let label_w = list_area.width.saturating_sub(2).saturating_sub(12 + 26) as usize;
+    let label_w = (list_area.width.saturating_sub(2).saturating_sub(12 + 26) as usize).max(8);
+    let editor = app.editor.as_ref();
     let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
@@ -684,34 +1173,59 @@ fn settings_tab(app: &App, f: &mut Frame, area: Rect) {
                 (Some(true), false) => Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
-                (Some(false), _) => Style::default().fg(Color::DarkGray),
+                (Some(false), _) => dim(),
                 (None, _) => Style::default().fg(ACCENT),
             };
-            let value = match r.on {
-                Some(true) => format!("● {}", r.value),
-                Some(false) => format!("○ {}", r.value),
-                None => format!("◆ {}", r.value),
+            let editing = i == sel && editor.is_some();
+            if editing {
+                app.text_areas.borrow_mut().push(Rect::new(
+                    list_area.x + 1,
+                    list_area.y + 1 + (i - start) as u16,
+                    list_area.width.saturating_sub(2),
+                    1,
+                ));
+            }
+            let value = if editing {
+                format!(
+                    "[{}{}]",
+                    editor.map(|e| e.buf.as_str()).unwrap_or_default(),
+                    app.theme.cursor()
+                )
+            } else {
+                match (r.on, settings::edit_kind(&all[i])) {
+                    (Some(true), _) => format!("● {}", r.value),
+                    (Some(false), _) => format!("○ {}", r.value),
+                    (None, Edit::Number | Edit::Text) => format!("✎ {}", r.value),
+                    (None, _) => format!("◆ {}", r.value),
+                }
             };
-            let mut label: String = r.label.chars().take(label_w.max(8)).collect();
+            let mut label: String = r.label.chars().take(label_w).collect();
             if r.restart {
                 label.push_str(" ↻");
             }
             ListItem::new(Line::from(vec![
+                Span::styled(format!("{:<11} ", r.group), dim()),
+                Span::raw(format!("{label:<width$} ", width = label_w + 2)),
                 Span::styled(
-                    format!("{:<11} ", r.group),
-                    Style::default().fg(Color::DarkGray),
+                    value,
+                    if editing {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        value_style
+                    },
                 ),
-                Span::raw(format!("{label:<width$} ", width = label_w.max(8) + 2)),
-                Span::styled(value, value_style),
             ]))
         })
         .collect();
     let mut state = ListState::default();
     state.select(Some(sel - start));
     let title = format!(
-        "Settings ({}/{}) · ↻ = applies after a daemon restart",
+        "Settings ({}/{}) · ↻ = applies after a daemon restart · {}",
         sel + 1,
-        rows.len()
+        rows.len(),
+        text(s(st, &["paths", "config"]))
     );
     f.render_stateful_widget(
         List::new(items)
@@ -721,361 +1235,22 @@ fn settings_tab(app: &App, f: &mut Frame, area: Rect) {
         &mut state,
     );
     let r = &rows[sel];
+    let help = match editor.and_then(|e| e.error.as_deref()) {
+        Some(e) => Paragraph::new(Line::from(Span::styled(
+            format!("✗ {e}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))),
+        None if editor.is_some() => Paragraph::new(vec![
+            Line::from(r.help),
+            Line::from(Span::styled(
+                "Enter saves · Esc cancels · Ctrl-U clears",
+                dim(),
+            )),
+        ]),
+        None => Paragraph::new(r.help),
+    };
     f.render_widget(
-        Paragraph::new(r.help)
-            .wrap(Wrap { trim: true })
-            .block(block(&r.label)),
+        help.wrap(Wrap { trim: true }).block(block(&r.label)),
         parts[2],
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Backend;
-    use parda_ipc::{Event, Request};
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{
-        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-    };
-    use serde_json::json;
-
-    struct Fake {
-        rules: String,
-        config: String,
-        calls: Vec<String>,
-    }
-
-    impl Backend for Fake {
-        fn call(&mut self, req: Request) -> anyhow::Result<Value> {
-            self.calls.push(
-                format!("{req:?}")
-                    .split([' ', '{'])
-                    .next()
-                    .unwrap_or("")
-                    .to_string(),
-            );
-            Ok(match req {
-                Request::Status => json!({
-                    "pid": 42, "uptime_s": 7, "proxy": "127.0.0.1:8787", "clipboard": true,
-                    "hotkey": "default", "model": "gliner-pii-edge", "mode": "strict", "style": "surrogate",
-                    "stats": {"redactions": 3, "cache_hits": 1, "fragments": 4, "ml_calls": 2,
-                              "ml_ms_total": 18, "ml_failures": 0,
-                              "entities": {"Person": 2, "Email": 1},
-                              "by_source": {"model": 2, "rules": 1}},
-                    "activity": {"surfaces": {"proxy": {"events": 2, "redacted": 3, "warnings": 0, "kinds": {}}},
-                                 "latency_ms": {"samples": 2, "p50": 4, "p95": 9, "max": 9}},
-                    "paths": {"config": "/x/config.toml"}
-                }),
-                Request::Redact { text, .. } => json!({
-                    "text": text.replace("Ravi Kumar", "Arjun Mehta"),
-                    "replaced": [{"kind": "Person", "surrogate": "Arjun Mehta", "source": "Dictionary"}]
-                }),
-                Request::Restore { text, .. } => {
-                    json!({"text": text.replace("Arjun Mehta", "Ravi Kumar")})
-                }
-                Request::RulesGet => json!({"toml": self.rules}),
-                Request::RulesSet { rules_toml } => {
-                    self.rules = rules_toml;
-                    json!({})
-                }
-                Request::VaultStats => {
-                    json!({"stats": [{"scope": "global", "kind": "Person", "count": 5}]})
-                }
-                Request::ConfigGet => json!({"toml": self.config}),
-                Request::ConfigSet { toml } => {
-                    let old = parda_core::Config::from_toml_str(&self.config).unwrap();
-                    let new = parda_core::Config::from_toml_str(&toml).unwrap();
-                    self.config = toml;
-                    json!({"restart_required": old.proxy.enabled != new.proxy.enabled})
-                }
-                _ => json!({}),
-            })
-        }
-    }
-
-    fn fake() -> Fake {
-        Fake {
-            rules: "[[person]]\nname = \"Ravi Kumar\"\n".into(),
-            config: parda_core::Config::default().to_toml_string().unwrap(),
-            calls: vec![],
-        }
-    }
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
-
-    fn cfg(b: &Fake) -> parda_core::Config {
-        parda_core::Config::from_toml_str(&b.config).unwrap()
-    }
-
-    fn click_at(app: &mut App, b: &mut Fake, x: u16, y: u16, button: MouseButton) {
-        app.on_mouse(
-            MouseEvent {
-                kind: MouseEventKind::Down(button),
-                column: x,
-                row: y,
-                modifiers: KeyModifiers::NONE,
-            },
-            b,
-        );
-    }
-
-    fn wheel(app: &mut App, b: &mut Fake, down: bool) {
-        app.on_mouse(
-            MouseEvent {
-                kind: if down {
-                    MouseEventKind::ScrollDown
-                } else {
-                    MouseEventKind::ScrollUp
-                },
-                column: 10,
-                row: 10,
-                modifiers: KeyModifiers::NONE,
-            },
-            b,
-        );
-    }
-
-    /// Render, then return the cell position of `needle` (ASCII) on screen.
-    fn find(app: &App, needle: &str) -> (u16, u16) {
-        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        t.draw(|f| app.draw(f)).unwrap();
-        let buf = t.backend().buffer().clone();
-        let want: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
-        for y in 0..buf.area.height {
-            let row: Vec<String> = (0..buf.area.width)
-                .map(|x| buf[(x, y)].symbol().to_string())
-                .collect();
-            if let Some(x) = row.windows(want.len()).position(|w| w == want.as_slice()) {
-                return (x as u16, y);
-            }
-        }
-        panic!("{needle:?} not on screen");
-    }
-
-    fn render(app: &App) -> String {
-        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        t.draw(|f| app.draw(f)).unwrap();
-        let buf = t.backend().buffer().clone();
-        let mut s = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                s.push_str(buf[(x, y)].symbol());
-            }
-            s.push('\n');
-        }
-        s
-    }
-
-    #[test]
-    fn every_tab_renders_and_number_keys_switch() {
-        let mut b = fake();
-        let mut app = App::new();
-        app.refresh(&mut b);
-        app.on_event(Event::now(
-            "proxy",
-            "anthropic /v1/messages → 200 · 2 redacted",
-        ));
-        let screen = render(&app);
-        for t in Tab::ALL {
-            assert!(
-                screen.contains(t.title()),
-                "missing tab title {}",
-                t.title()
-            );
-        }
-        assert!(screen.contains("pid 42") && screen.contains("gliner-pii-edge"));
-        assert!(screen.contains("Person"));
-        assert!(screen.contains("3 values"), "{screen}");
-        assert!(screen.contains("p95 9 ms"));
-        assert!(screen.contains("model") && screen.contains("proxy (2 events)"));
-        assert!(screen.contains("9.0 ms avg") && screen.contains("25% hits"));
-        for (k, want) in [
-            ('2', "Live ("),
-            ('3', "Input"),
-            ('4', "Ravi Kumar"),
-            ('5', "global"),
-            ('6', "ANTHROPIC_BASE_URL"),
-        ] {
-            app.on_key(key(KeyCode::Char(k)), &mut b);
-            let screen = render(&app);
-            assert!(screen.contains(want), "tab {k} lacks {want:?}:\n{screen}");
-        }
-        app.on_key(key(KeyCode::Char('1')), &mut b);
-        assert_eq!(app.tab, Tab::Dashboard);
-    }
-
-    #[test]
-    fn inspector_shows_redacted_output_and_restore_preview() {
-        let mut b = fake();
-        let mut app = App::new();
-        app.on_key(key(KeyCode::Char('3')), &mut b);
-        app.on_key(key(KeyCode::Char('i')), &mut b);
-        for c in "hi Ravi Kumar".chars() {
-            app.on_key(key(KeyCode::Char(c)), &mut b);
-        }
-        // While editing, digits and q are text, not commands.
-        assert_eq!(app.tab, Tab::Inspector);
-        app.on_key(key(KeyCode::Enter), &mut b);
-        let screen = render(&app);
-        assert!(screen.contains("hi Arjun Mehta"), "{screen}");
-        assert!(screen.contains("Person"));
-        app.on_key(key(KeyCode::Char('r')), &mut b);
-        assert!(render(&app).contains("Restored"));
-    }
-
-    #[test]
-    fn rules_add_person_saves_through_backend() {
-        let mut b = fake();
-        let mut app = App::new();
-        app.on_key(key(KeyCode::Char('4')), &mut b);
-        app.on_key(key(KeyCode::Char('a')), &mut b);
-        for c in "Zubin Wadia".chars() {
-            app.on_key(key(KeyCode::Char(c)), &mut b);
-        }
-        app.on_key(key(KeyCode::Enter), &mut b);
-        assert!(b.rules.contains("Zubin Wadia") && b.rules.contains("Ravi Kumar"));
-        assert!(render(&app).contains("Zubin Wadia"));
-    }
-
-    #[test]
-    fn q_quits_and_live_feed_shows_events() {
-        let mut b = fake();
-        let mut app = App::new();
-        app.on_key(key(KeyCode::Char('2')), &mut b);
-        let mut e = Event::now("clipboard", "pasted with 1 value(s) redacted");
-        e.counts.insert("Person".into(), 1);
-        app.on_event(e);
-        let screen = render(&app);
-        assert!(screen.contains("pasted with 1 value(s) redacted") && screen.contains("Person×1"));
-        assert!(!app.should_quit());
-        app.on_key(key(KeyCode::Char('q')), &mut b);
-        assert!(app.should_quit());
-    }
-
-    #[test]
-    fn p_toggles_protection_and_header_shows_it() {
-        let mut b = fake();
-        let mut app = App::new();
-        app.refresh(&mut b);
-        assert!(render(&app).contains("PROTECTION ON"));
-        app.on_key(key(KeyCode::Char('p')), &mut b);
-        assert!(!cfg(&b).protection.enabled);
-        let screen = render(&app);
-        assert!(screen.contains("PROTECTION OFF"), "{screen}");
-        assert!(screen.contains("text is sent unfiltered"), "{screen}");
-        app.on_key(key(KeyCode::Char('p')), &mut b);
-        assert!(cfg(&b).protection.enabled);
-    }
-
-    #[test]
-    fn clicking_tabs_and_the_switch() {
-        let mut b = fake();
-        let mut app = App::new();
-        app.refresh(&mut b);
-        let (x, y) = find(&app, "3 Inspector");
-        click_at(&mut app, &mut b, x + 2, y, MouseButton::Left);
-        assert_eq!(app.tab, Tab::Inspector);
-        let (x, y) = find(&app, "6 Settings");
-        click_at(&mut app, &mut b, x, y, MouseButton::Left);
-        assert_eq!(app.tab, Tab::Settings);
-        let (x, y) = find(&app, "PROTECTION ON");
-        click_at(&mut app, &mut b, x + 3, y, MouseButton::Left);
-        assert!(!cfg(&b).protection.enabled);
-        // Clicking the inspector's input box starts editing.
-        app.on_key(key(KeyCode::Char('3')), &mut b);
-        let (x, y) = find(&app, "Input (press i to type)");
-        click_at(&mut app, &mut b, x, y + 1, MouseButton::Left);
-        assert!(app.inspector.editing);
-    }
-
-    #[test]
-    fn settings_tab_lists_options_and_changes_them() {
-        let mut b = fake();
-        let mut app = App::new();
-        app.on_key(key(KeyCode::Char('6')), &mut b);
-        let screen = render(&app);
-        for want in [
-            "protection",
-            "when the model fails",
-            "agent proxy",
-            "india (Aadhaar",
-            "ANTHROPIC_BASE_URL",
-        ] {
-            assert!(screen.contains(want), "missing {want:?}:\n{screen}");
-        }
-        // Down to "when the model fails", Enter switches strict → fast.
-        app.on_key(key(KeyCode::Down), &mut b);
-        app.on_key(key(KeyCode::Enter), &mut b);
-        assert_eq!(cfg(&b).detect.mode, parda_core::Mode::Fast);
-        // Tags are the default; clicking the style row changes it, right-click changes it back.
-        assert_eq!(cfg(&b).replace.style, parda_core::Style::Token);
-        let (x, y) = find(&app, "replacement style");
-        click_at(&mut app, &mut b, x, y, MouseButton::Left);
-        assert_eq!(cfg(&b).replace.style, parda_core::Style::Surrogate);
-        click_at(&mut app, &mut b, x, y, MouseButton::Right);
-        assert_eq!(cfg(&b).replace.style, parda_core::Style::Token);
-        // Restart-required settings say so.
-        let (x, y) = find(&app, "agent proxy");
-        click_at(&mut app, &mut b, x, y, MouseButton::Left);
-        assert!(!cfg(&b).proxy.enabled);
-        assert!(
-            app.message.as_deref().unwrap_or("").contains("restart"),
-            "{:?}",
-            app.message
-        );
-    }
-
-    #[test]
-    fn risky_setting_asks_first_and_wheel_moves_selection() {
-        let mut b = fake();
-        let mut app = App::new();
-        app.on_key(key(KeyCode::Char('6')), &mut b);
-        let i = crate::settings::all()
-            .iter()
-            .position(|s| *s == crate::settings::Setting::LogValues)
-            .unwrap();
-        for _ in 0..i {
-            wheel(&mut app, &mut b, true);
-        }
-        assert_eq!(app.settings_sel, i);
-        app.on_key(key(KeyCode::Enter), &mut b);
-        assert!(!cfg(&b).privacy.log_values, "must not change before y");
-        app.on_key(key(KeyCode::Char('n')), &mut b);
-        assert!(!cfg(&b).privacy.log_values);
-        app.on_key(key(KeyCode::Enter), &mut b);
-        app.on_key(key(KeyCode::Char('y')), &mut b);
-        assert!(cfg(&b).privacy.log_values);
-        // The selected row stays visible after scrolling far down.
-        let last = crate::settings::all().len() - 1;
-        for _ in 0..last + 5 {
-            wheel(&mut app, &mut b, true);
-        }
-        assert_eq!(app.settings_sel, last);
-        assert!(render(&app).contains("Organization"));
-    }
-
-    #[test]
-    fn live_feed_scrolls_with_wheel() {
-        let mut b = fake();
-        let mut app = App::new();
-        app.on_key(key(KeyCode::Char('2')), &mut b);
-        for i in 0..60 {
-            app.on_event(Event::now("proxy", format!("request number {i:02}")));
-        }
-        assert!(render(&app).contains("request number 59"));
-        for _ in 0..40 {
-            wheel(&mut app, &mut b, false);
-        }
-        let screen = render(&app);
-        assert!(
-            !screen.contains("request number 59") && screen.contains("newer hidden"),
-            "{screen}"
-        );
-        app.on_key(key(KeyCode::End), &mut b);
-        assert!(render(&app).contains("request number 59"));
-    }
 }

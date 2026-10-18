@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::header::{
     ACCEPT_ENCODING, ALLOW, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_TYPE, HOST, ORIGIN, UPGRADE, X_CONTENT_TYPE_OPTIONS,
+    CONTENT_TYPE, HOST, ORIGIN, REFERER, UPGRADE, X_CONTENT_TYPE_OPTIONS,
 };
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
@@ -25,7 +25,7 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio_rustls::TlsAcceptor;
 
 use crate::transform::RequestOutcome;
@@ -62,6 +62,8 @@ pub struct InterceptEvent {
 /// Everything a running intercept listener needs.
 pub struct InterceptState {
     pub ca: Arc<Ca>,
+    /// The hosts to decrypt, unless the transform keeps a live list
+    /// ([`BodyTransform::hosts`]); see [`InterceptState::listed_hosts`].
     pub hosts: HostList,
     pub transform: Arc<dyn BodyTransform>,
     pub events: broadcast::Sender<InterceptEvent>,
@@ -90,6 +92,12 @@ impl InterceptState {
             upstream_http1: upstream_client_builder().http1_only().build()?,
             timeouts: Timeouts::default(),
         })
+    }
+
+    /// The hosts decrypted right now: the transform's live list when it
+    /// keeps one, else [`InterceptState::hosts`].
+    pub fn listed_hosts(&self) -> HostList {
+        self.transform.hosts().unwrap_or_else(|| self.hosts.clone())
     }
 }
 
@@ -159,13 +167,35 @@ pub fn upstream_client_builder() -> reqwest::ClientBuilder {
 /// - `CONNECT` to any other host: a blind byte tunnel.
 /// - Plain `GET /parda.pac`: the PAC file. Any other plain request: 405.
 pub async fn serve(listener: TcpListener, state: Arc<InterceptState>) -> anyhow::Result<()> {
+    serve_with_shutdown(listener, state, std::future::pending()).await
+}
+
+/// [`serve`] until `shutdown` completes. Then the listener is closed at
+/// once, idle connections and blind tunnels are closed, requests in
+/// progress (a streamed answer included) finish first, and this returns
+/// when every connection has ended. Callers bound the wait if they need to
+/// (the daemon allows 5 s). Upgraded (WebSocket) streams to listed hosts are
+/// not waited for.
+pub async fn serve_with_shutdown(
+    listener: TcpListener,
+    state: Arc<InterceptState>,
+    shutdown: impl Future<Output = ()> + Send,
+) -> anyhow::Result<()> {
     let local = listener.local_addr()?;
     anyhow::ensure!(
         is_loopback(local.ip()),
         "parda intercept must listen on a loopback address, not {local}"
     );
+    // Every connection task holds a receiver: the sender sees when the last
+    // one is gone.
+    let (stop_tx, stop) = watch::channel(false);
+    let mut shutdown = std::pin::pin!(shutdown);
     loop {
-        let tcp = match listener.accept().await {
+        let accepted = tokio::select! {
+            r = listener.accept() => r,
+            () = &mut shutdown => break,
+        };
+        let tcp = match accepted {
             Ok((tcp, peer)) if is_loopback(peer.ip()) => tcp,
             Ok((_, peer)) => {
                 tracing::warn!(%peer, "intercept: dropped a non-loopback client");
@@ -179,21 +209,40 @@ pub async fn serve(listener: TcpListener, state: Arc<InterceptState>) -> anyhow:
             }
         };
         let state = state.clone();
+        let mut conn_stop = stop.clone();
         tokio::spawn(async move {
             let _ = tcp.set_nodelay(true);
             let header_read = state.timeouts.header_read;
-            let svc = service_fn(move |req| front(req, state.clone(), local));
-            if let Err(e) = http1::Builder::new()
+            let handler_stop = conn_stop.clone();
+            let svc = service_fn(move |req| front(req, state.clone(), local, handler_stop.clone()));
+            let conn = http1::Builder::new()
                 .timer(TokioTimer::new())
                 .header_read_timeout(header_read)
                 .serve_connection(TokioIo::new(tcp), svc)
-                .with_upgrades()
-                .await
-            {
+                .with_upgrades();
+            let mut conn = std::pin::pin!(conn);
+            let res = tokio::select! {
+                r = conn.as_mut() => r,
+                () = stopped(&mut conn_stop) => {
+                    conn.as_mut().graceful_shutdown();
+                    conn.await
+                }
+            };
+            if let Err(e) = res {
                 tracing::debug!(error = %e, "intercept: client connection ended");
             }
         });
     }
+    drop(listener);
+    drop(stop);
+    stop_tx.send_replace(true);
+    stop_tx.closed().await;
+    Ok(())
+}
+
+/// Completes once the listener shuts down (or the server is gone).
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    let _ = stop.wait_for(|s| *s).await;
 }
 
 /// A request on the plain (proxy-facing) side of the listener.
@@ -201,11 +250,13 @@ async fn front(
     req: Request<Incoming>,
     state: Arc<InterceptState>,
     local: SocketAddr,
+    stop: watch::Receiver<bool>,
 ) -> Result<Response<Body>, Infallible> {
     if req.method() == Method::CONNECT {
-        return Ok(connect(req, state).await);
+        return Ok(connect(req, state, stop).await);
     }
-    if let Some(res) = redirect_listed_http(&req, &state.hosts) {
+    let hosts = state.listed_hosts();
+    if let Some(res) = redirect_listed_http(&req, &hosts) {
         return Ok(res);
     }
     if req.method() == Method::GET && req.uri().path() == "/parda.pac" && is_local(req.uri()) {
@@ -224,7 +275,7 @@ async fn front(
                 "parda intercept: the PAC file is for this machine's proxy settings only\n",
             ));
         }
-        let mut res = Response::new(full(pac(&state.hosts, local)));
+        let mut res = Response::new(full(pac(&hosts, local)));
         let h = res.headers_mut();
         h.insert(
             CONTENT_TYPE,
@@ -289,14 +340,18 @@ fn is_local_host(h: &str) -> bool {
     h.eq_ignore_ascii_case("localhost") || h.parse::<std::net::IpAddr>().is_ok_and(is_loopback)
 }
 
-async fn connect(req: Request<Incoming>, state: Arc<InterceptState>) -> Response<Body> {
+async fn connect(
+    req: Request<Incoming>,
+    state: Arc<InterceptState>,
+    mut stop: watch::Receiver<bool>,
+) -> Response<Body> {
     let Some(authority) = req.uri().authority().cloned() else {
         return text(StatusCode::BAD_REQUEST, "CONNECT needs host:port\n");
     };
     let host = normalize_host(authority.host());
     let port = authority.port_u16().unwrap_or(443);
 
-    if state.hosts.matches(&host) {
+    if state.listed_hosts().matches(&host) {
         if port == 80 {
             // ws:// (or plain http tunnelled): parda only filters TLS
             // traffic, and must not let it pass unfiltered.
@@ -307,7 +362,7 @@ async fn connect(req: Request<Incoming>, state: Arc<InterceptState>) -> Response
         }
         tokio::spawn(async move {
             match hyper::upgrade::on(req).await {
-                Ok(io) => intercept_tls(TokioIo::new(io), host, port, state).await,
+                Ok(io) => intercept_tls(TokioIo::new(io), host, port, state, stop).await,
                 Err(e) => tracing::debug!(error = %e, "intercept: CONNECT upgrade failed"),
             }
         });
@@ -336,7 +391,11 @@ async fn connect(req: Request<Incoming>, state: Arc<InterceptState>) -> Response
             Ok(io) => {
                 let mut client = TokioIo::new(io);
                 let mut server = upstream;
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                // Ends with either side, or when the listener shuts down.
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {}
+                    () = stopped(&mut stop) => {}
+                }
             }
             Err(e) => tracing::debug!(error = %e, "intercept: CONNECT upgrade failed"),
         }
@@ -394,6 +453,7 @@ async fn intercept_tls(
     host: String,
     port: u16,
     state: Arc<InterceptState>,
+    mut stop: watch::Receiver<bool>,
 ) {
     let cfg = match server_config(state.ca.clone(), host.clone()) {
         Ok(c) => c,
@@ -423,13 +483,22 @@ async fn intercept_tls(
     // during a streamed response).
     let idle = state.timeouts.idle;
     let svc = service_fn(move |req| forward(req, state.clone(), target.clone()));
-    if let Err(e) = http1::Builder::new()
+    let conn = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(idle)
         .serve_connection(TokioIo::new(tls), svc)
-        .with_upgrades()
-        .await
-    {
+        .with_upgrades();
+    let mut conn = std::pin::pin!(conn);
+    // On shutdown, the request in progress finishes and the connection
+    // closes; an idle one closes at once.
+    let res = tokio::select! {
+        r = conn.as_mut() => r,
+        () = stopped(&mut stop) => {
+            conn.as_mut().graceful_shutdown();
+            conn.await
+        }
+    };
+    if let Err(e) = res {
         tracing::debug!(error = %e, "intercept: decrypted connection ended");
     }
 }
@@ -489,12 +558,34 @@ async fn forward(
             "parda intercept: Host does not match the CONNECT target\n",
         ));
     }
-    let url = format!(
-        "https://{}{}",
-        target.authority(),
-        req.uri().path_and_query().map_or("/", |p| p.as_str())
-    );
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map_or("/", |p| p.as_str())
+        .to_string();
     if is_upgrade(req.headers()) {
+        // Only the target can carry text here; the tunnel is not inspected.
+        let started = Instant::now();
+        let outcome = rewrite_request(
+            &state,
+            &target.host,
+            &path_and_query,
+            req.headers().clone(),
+            Bytes::new(),
+        )
+        .await;
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(refusal) => {
+                let added_ms = started.elapsed().as_millis() as u64;
+                return Ok(refuse(&state, &target, &path, added_ms, refusal));
+            }
+        };
+        let url = format!(
+            "https://{}{}",
+            target.authority(),
+            outcome.target.as_deref().unwrap_or(&path_and_query)
+        );
         return Ok(upgrade(req, &state, &target, path, url).await);
     }
 
@@ -531,33 +622,31 @@ async fn forward(
     };
 
     let started = Instant::now();
-    let outcome = if body.is_empty() {
+    let outcome = if body.is_empty() && !path_and_query.contains('?') {
         Ok(RequestOutcome::default())
     } else {
-        state
-            .transform
-            .request_outcome(&target.host, &path, &parts.headers, body)
+        rewrite_request(
+            &state,
+            &target.host,
+            &path_and_query,
+            parts.headers.clone(),
+            body,
+        )
+        .await
     };
     let added_ms = started.elapsed().as_millis() as u64;
     let outcome = match outcome {
         Ok(o) => o,
-        Err(refusal) => {
-            let status = StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::FORBIDDEN);
-            emit(
-                &state,
-                &target,
-                &path,
-                status.as_u16(),
-                Default::default(),
-                added_ms,
-                Some(refusal.message.clone()),
-                0,
-            );
-            return Ok(text(status, &format!("{}\n", refusal.message)));
-        }
+        Err(refusal) => return Ok(refuse(&state, &target, &path, added_ms, refusal)),
     };
+    let url = format!(
+        "https://{}{}",
+        target.authority(),
+        outcome.target.as_deref().unwrap_or(&path_and_query)
+    );
 
     let mut headers = end_to_end(&parts.headers);
+    strip_referer(&mut headers);
     headers.remove(HOST);
     headers.remove(CONTENT_LENGTH);
     headers.remove(CONTENT_ENCODING);
@@ -592,12 +681,8 @@ async fn forward(
     };
 
     let status = res.status();
-    let content_type = res
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    // Several Content-Type headers that disagree: passed through unrestored.
+    let content_type = crate::restore::response_content_type(res.headers());
     // reqwest decodes what it can; anything still encoded is passed through
     // untouched (the transform could not read it).
     let still_encoded = res
@@ -619,16 +704,17 @@ async fn forward(
         None,
         outcome.unscanned,
     );
-    let stream = res.bytes_stream();
-    let body = if still_encoded {
-        passthrough(stream)
-    } else {
-        transformed(
+    let stream = res
+        .bytes_stream()
+        .map(|r| r.map_err(|e| BoxError::from(e.without_url())));
+    let body = match content_type {
+        Some(content_type) if !still_encoded => transformed(
             stream,
             state
                 .transform
-                .response_stream(&target.host, &path, &content_type),
-        )
+                .response_stream(&parts.method, &target.host, &path, &content_type),
+        ),
+        _ => passthrough(stream),
     };
     let mut out = Response::new(body);
     *out.status_mut() = status;
@@ -636,41 +722,118 @@ async fn forward(
     Ok(out)
 }
 
-/// Stream `upstream` through `rewriter`, chunk by chunk, then flush it.
+/// Run [`BodyTransform::rewrite_request`] on the blocking pool: redaction
+/// may run the ML model, read the vault or wait on the engine's locks.
+async fn rewrite_request(
+    state: &InterceptState,
+    host: &str,
+    path_and_query: &str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<RequestOutcome, crate::Refusal> {
+    let transform = state.transform.clone();
+    let (host, path_and_query) = (host.to_string(), path_and_query.to_string());
+    tokio::task::spawn_blocking(move || {
+        transform.rewrite_request(&host, &path_and_query, &headers, body)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(crate::Refusal {
+            status: 500,
+            message: "parda_internal: parda failed to filter the request; it was not sent".into(),
+        })
+    })
+}
+
+/// Answer a refused request; nothing goes upstream.
+fn refuse(
+    state: &InterceptState,
+    target: &Target,
+    path: &str,
+    added_ms: u64,
+    refusal: crate::Refusal,
+) -> Response<Body> {
+    let status = StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::FORBIDDEN);
+    emit(
+        state,
+        target,
+        path,
+        status.as_u16(),
+        Default::default(),
+        added_ms,
+        Some(refusal.message.clone()),
+        0,
+    );
+    text(status, &format!("{}\n", refusal.message))
+}
+
+/// Stream `upstream` through `rewriter`, chunk by chunk, then flush it. The
+/// rewriter runs on the blocking pool (restoring may read the vault or wait
+/// on the engine's locks); the stream stays incremental. When the upstream
+/// fails, what the rewriter holds goes out first, then the error.
 fn transformed(
-    upstream: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    upstream: impl Stream<Item = Result<Bytes, BoxError>> + Send + 'static,
     rewriter: Box<dyn StreamTransform>,
 ) -> Body {
-    let frames =
-        futures::stream::unfold(Some((Box::pin(upstream), rewriter)), |state| async move {
-            let (mut upstream, mut rewriter) = state?;
+    if rewriter.is_passthrough() {
+        return passthrough(upstream);
+    }
+    enum State<S> {
+        Running(S, Box<dyn StreamTransform>),
+        /// The upstream failed after the held text went out.
+        Failed(BoxError),
+        Done,
+    }
+    let failed = || BoxError::from("parda intercept: failed to rewrite the response");
+    let frames = futures::stream::unfold(
+        State::Running(Box::pin(upstream), rewriter),
+        move |state| async move {
+            let (mut upstream, mut rw) = match state {
+                State::Running(upstream, rw) => (upstream, rw),
+                State::Failed(e) => return Some((Err(e), State::Done)),
+                State::Done => return None,
+            };
             loop {
                 match upstream.next().await {
                     Some(Ok(chunk)) => {
-                        let out = rewriter.push(&chunk);
+                        let Ok((back, out)) = tokio::task::spawn_blocking(move || {
+                            let out = rw.push(&chunk);
+                            (rw, out)
+                        })
+                        .await
+                        else {
+                            return Some((Err(failed()), State::Done));
+                        };
+                        rw = back;
                         if !out.is_empty() {
-                            return Some((Ok(Frame::data(out)), Some((upstream, rewriter))));
+                            return Some((Ok(Frame::data(out)), State::Running(upstream, rw)));
                         }
                     }
                     Some(Err(e)) => {
-                        return Some((Err(BoxError::from(e.without_url())), None));
+                        let Ok(out) = tokio::task::spawn_blocking(move || rw.finish()).await else {
+                            return Some((Err(e), State::Done));
+                        };
+                        if out.is_empty() {
+                            return Some((Err(e), State::Done));
+                        }
+                        return Some((Ok(Frame::data(out)), State::Failed(e)));
                     }
                     None => {
-                        let out = rewriter.finish();
-                        return (!out.is_empty()).then(|| (Ok(Frame::data(out)), None));
+                        let Ok(out) = tokio::task::spawn_blocking(move || rw.finish()).await else {
+                            return Some((Err(failed()), State::Done));
+                        };
+                        return (!out.is_empty()).then(|| (Ok(Frame::data(out)), State::Done));
                     }
                 }
             }
-        });
+        },
+    );
     BodyExt::boxed_unsync(StreamBody::new(frames))
 }
 
 /// Stream `upstream` unchanged.
-fn passthrough(upstream: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static) -> Body {
-    BodyExt::boxed_unsync(StreamBody::new(upstream.map(|r| {
-        r.map(Frame::data)
-            .map_err(|e| BoxError::from(e.without_url()))
-    })))
+fn passthrough(upstream: impl Stream<Item = Result<Bytes, BoxError>> + Send + 'static) -> Body {
+    BodyExt::boxed_unsync(StreamBody::new(upstream.map(|r| r.map(Frame::data))))
 }
 
 /// A WebSocket (or other) upgrade on a listed host: relay the handshake,
@@ -684,6 +847,7 @@ async fn upgrade(
 ) -> Response<Body> {
     let client_side = hyper::upgrade::on(&mut req);
     let mut headers = end_to_end(req.headers());
+    strip_referer(&mut headers);
     headers.remove(HOST);
     headers.remove(CONTENT_LENGTH);
     headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
@@ -725,7 +889,10 @@ async fn upgrade(
         );
         let mut out_headers = end_to_end(res.headers());
         out_headers.remove(CONTENT_LENGTH);
-        let mut out = Response::new(passthrough(res.bytes_stream()));
+        let mut out = Response::new(passthrough(
+            res.bytes_stream()
+                .map(|r| r.map_err(|e| BoxError::from(e.without_url()))),
+        ));
         *out.status_mut() = status;
         *out.headers_mut() = out_headers;
         return out;
@@ -751,7 +918,9 @@ async fn upgrade(
     out
 }
 
-fn is_upgrade(headers: &HeaderMap) -> bool {
+/// Does the request ask to switch protocols (a WebSocket)? Its frames are
+/// tunnelled raw, never read.
+pub(crate) fn is_upgrade(headers: &HeaderMap) -> bool {
     headers.contains_key(UPGRADE) && connection_tokens(headers).iter().any(|t| t == "upgrade")
 }
 
@@ -765,6 +934,27 @@ fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
         .map(|t| t.trim().to_ascii_lowercase())
         .filter(|t| !t.is_empty())
         .collect()
+}
+
+/// Cut the query and fragment off every `Referer`. A page opened with the
+/// prompt in its URL (`chatgpt.com/?q=…`, `claude.ai/new?q=…`) would
+/// otherwise send that text, unredacted, with every later request it makes.
+fn strip_referer(headers: &mut HeaderMap) {
+    let values: Vec<HeaderValue> = headers.get_all(REFERER).iter().cloned().collect();
+    if values.is_empty() {
+        return;
+    }
+    headers.remove(REFERER);
+    for v in values {
+        let b = v.as_bytes();
+        let cut = b
+            .iter()
+            .position(|&c| c == b'?' || c == b'#')
+            .unwrap_or(b.len());
+        if let Ok(v) = HeaderValue::from_bytes(&b[..cut]) {
+            headers.append(REFERER, v);
+        }
+    }
 }
 
 /// `headers` without hop-by-hop headers (fixed list plus any named in
@@ -932,6 +1122,80 @@ mod tests {
         .await
         .expect("read_body must give up on its own");
         assert_eq!(r.unwrap_err(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    /// Holds everything until the end (like a restorer holding events
+    /// behind a possible tag).
+    struct HoldAll(Vec<u8>);
+
+    impl StreamTransform for HoldAll {
+        fn push(&mut self, chunk: &[u8]) -> Bytes {
+            self.0.extend_from_slice(chunk);
+            Bytes::new()
+        }
+        fn finish(&mut self) -> Bytes {
+            Bytes::from(std::mem::take(&mut self.0))
+        }
+    }
+
+    /// Review finding (fix round 1b): an upstream error mid-stream first
+    /// sends what the rewriter holds, then the error.
+    #[tokio::test]
+    async fn an_upstream_error_sends_what_was_held_first() {
+        let upstream = futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"data: a\n\n")),
+            Ok(Bytes::from_static(b"data: b\n\n")),
+            Err(BoxError::from("connection reset")),
+            Ok(Bytes::from_static(b"never")),
+        ]);
+        let mut body = transformed(upstream, Box::new(HoldAll(Vec::new())));
+        let mut data = Vec::new();
+        let mut error = None;
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(f) => data.extend_from_slice(f.data_ref().unwrap()),
+                Err(e) => {
+                    error = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        assert_eq!(data, b"data: a\n\ndata: b\n\n");
+        assert_eq!(error.as_deref(), Some("connection reset"));
+        assert!(body.frame().await.is_none());
+    }
+
+    #[test]
+    fn referers_lose_query_and_fragment() {
+        let mut h = HeaderMap::new();
+        h.append(
+            REFERER,
+            HeaderValue::from_static("https://chatgpt.com/?q=Ravi#x"),
+        );
+        h.append(
+            REFERER,
+            HeaderValue::from_static("https://a.example/p#Ravi?y"),
+        );
+        h.append(REFERER, HeaderValue::from_static("https://a.example/p"));
+        h.insert(ORIGIN, HeaderValue::from_static("https://chatgpt.com"));
+        strip_referer(&mut h);
+        let got: Vec<_> = h
+            .get_all(REFERER)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "https://chatgpt.com/",
+                "https://a.example/p",
+                "https://a.example/p"
+            ]
+        );
+        assert_eq!(h.get(ORIGIN).unwrap(), "https://chatgpt.com");
+        let mut none = HeaderMap::new();
+        strip_referer(&mut none);
+        assert!(none.is_empty());
     }
 
     #[test]

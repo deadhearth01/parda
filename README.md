@@ -120,8 +120,20 @@ export OPENAI_BASE_URL=http://127.0.0.1:8787/v1     # Codex CLI, OpenAI SDKs
 #    (parda env claude | parda env codex prints the exact lines and the config-file equivalents)
 
 # 4. watch it work — dashboard with live feed and every setting (keyboard or mouse)
-parda tui
+parda            # alone in a terminal opens the dashboard (same as `parda tui`)
 ```
+
+**The dashboard.** `parda` opens it; if the daemon is not running it says so and `s` (only `s`) starts
+it in the background — the login service if `parda service install` set one up *for the same
+PARDA_HOME*, else a detached `parda daemon` for this home. A daemon that runs but does not answer, or
+speaks another protocol version, is shown as such (no start key).
+`:` or Ctrl-K opens a command palette with every action; `1`–`6` / Tab switch tabs; arrows or `hjkl`,
+`g`/`G`, PgUp/PgDn move; `/` filters Live, Rules and Vault; Enter opens details; Esc backs out; `?`
+lists every key; the bottom line always shows the keys that work right now. Live pauses with Space and
+filters by surface (`f`) and kind (`t`) — kinds and counts only, never values. Settings are edited in
+place: switches toggle, choices cycle, numbers and addresses open a validated inline editor. Mouse
+works throughout. `NO_COLOR=1` gives a monochrome screen, `PARDA_ASCII=1` plain ASCII borders, and
+`parda tui --dump` prints every tab as text.
 
 Try it without any AI:
 
@@ -225,7 +237,9 @@ Every finding has a kind and a tier. Per-kind actions (`redact`, `block`, `warn`
 - **Decryption:** for AI hosts, parda terminates TLS with a local root certificate that you approve once in your OS. It is generated on your machine and its private key never leaves it.
 - **Filtering:** request bodies are tagged and responses restored, including streams.
 - **Forwarding:** requests go to the real site with full certificate verification.
-- **Turning it off:** `parda intercept off` restores your previous network settings exactly.
+- **Turning it on:** `parda ca create`, then `parda ca install` (your OS asks you to approve the certificate), then `parda intercept on` — it checks the certificate is trusted, starts the listener in the daemon and points every enabled network service's automatic proxy setting at parda, printing what it changed. Firefox uses its own settings; `on` prints the two to set.
+- **Checking it:** `parda intercept status` shows the certificate, the listener, each network service's current setting and the site list, and changes nothing. `parda doctor` warns when the system still sends AI sites to parda while nothing listens.
+- **Turning it off:** `parda intercept off` restores your previous network settings exactly (it also works with the daemon stopped or after a crash). A setting you changed yourself meanwhile is left as it is; one that cannot be put back keeps parda filtering and makes the command fail, so you can run it again. Without saved settings (data folder cleaned, another `PARDA_HOME`) it switches off any parda automatic proxy setting it finds; if the saved file is damaged, `parda intercept off --forget` does that and moves the file aside.
 - **When parda isn't running:** the PAC file is unreachable and the system goes direct, so a stopped parda never breaks your internet. The dashboard shows whether protection is active.
 
 ### 7. Clipboard paste-safe
@@ -243,7 +257,7 @@ Stale requests (older than 2 s) are dropped, so a slow scan can never paste into
 ### 8. Daemon, dashboard and CLI
 
 - **One daemon process** hosts the proxy, interception, clipboard and engine.
-- **CLI and dashboard:** the `parda` CLI and the ratatui dashboard (`parda tui`: mouse, live feed, every setting) talk to it over a local socket — a `0700` Unix socket, or a per-user named pipe with an owner-only ACL on Windows.
+- **CLI and dashboard:** the `parda` CLI and the ratatui dashboard (`parda` alone, or `parda tui`: command palette, filterable live feed, every setting editable in place, mouse) talk to it over a local socket; the dashboard does its socket work on a background thread and redraws only when something changed — a `0700` Unix socket, or a per-user named pipe with an owner-only ACL on Windows.
 - **Logging:** events carry kinds, counts and timings, never values.
 - **Start at login:** `parda service install` sets this up with launchd (macOS), a systemd user unit (Linux) or Task Scheduler (Windows).
 
@@ -334,7 +348,8 @@ Full reference: [docs/configuration.md](docs/configuration.md). Every option is 
 ## Commands
 
 ```text
-parda setup | doctor | status | tui | on | off | stop
+parda                      # in a terminal: the dashboard (else this help)
+parda setup | doctor | status | tui [--dump] | on | off | stop
 parda redact | restore | scan [TEXT|-] [--scope S] [--json]
 parda paste-safe
 parda rules show | edit | add-person NAME | allow TERM
