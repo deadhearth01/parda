@@ -41,6 +41,11 @@ impl Theme {
         }
     }
 
+    /// The text cursor of an input.
+    pub fn cursor(&self) -> &'static str {
+        if self.ascii { "_" } else { "▏" }
+    }
+
     /// Spinner frames for work in progress.
     pub fn spinner(&self, tick: usize) -> &'static str {
         const UNI: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -52,12 +57,19 @@ impl Theme {
         }
     }
 
-    /// Apply the fallbacks to a drawn frame.
-    pub fn finish(&self, buf: &mut Buffer) {
+    /// Apply the fallbacks to a drawn frame. Cells inside `text` (user and
+    /// answer text) keep their characters in ASCII mode.
+    pub fn finish(&self, buf: &mut Buffer, text: &[ratatui::layout::Rect]) {
         if self.color && !self.ascii {
             return;
         }
-        for cell in buf.content.iter_mut() {
+        let area = buf.area;
+        for (i, cell) in buf.content.iter_mut().enumerate() {
+            let at = ratatui::layout::Position::new(
+                area.x + (i as u16 % area.width.max(1)),
+                area.y + (i as u16 / area.width.max(1)),
+            );
+            let keep_text = text.iter().any(|r| r.contains(at));
             if !self.color {
                 let mut m = cell.modifier;
                 if cell.bg != Color::Reset {
@@ -71,6 +83,7 @@ impl Theme {
                 cell.modifier = m;
             }
             if self.ascii
+                && !keep_text
                 && let Some(a) = ascii_for(cell.symbol())
             {
                 cell.set_symbol(a);
@@ -138,7 +151,7 @@ mod tests {
         buf[(0, 0)].set_style(Style::default().fg(Color::Black).bg(Color::Green));
         buf[(1, 0)].set_style(Style::default().fg(Color::Red));
         buf[(2, 0)].set_style(Style::default().fg(Color::Cyan));
-        Theme::from_vars(Some("1".into()), None).finish(&mut buf);
+        Theme::from_vars(Some("1".into()), None).finish(&mut buf, &[]);
         for x in 0..3 {
             assert_eq!(buf[(x, 0)].fg, Color::Reset);
             assert_eq!(buf[(x, 0)].bg, Color::Reset);
@@ -154,7 +167,7 @@ mod tests {
         for (x, s) in ["┌", "─", "●", "→", "é", "ज"].iter().enumerate() {
             buf[(x as u16, 0)].set_symbol(s);
         }
-        Theme::from_vars(None, Some("1".into())).finish(&mut buf);
+        Theme::from_vars(None, Some("1".into())).finish(&mut buf, &[]);
         let row: String = (0..6).map(|x| buf[(x, 0)].symbol().to_string()).collect();
         assert_eq!(row, "+-*>éज");
     }

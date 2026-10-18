@@ -267,6 +267,9 @@ pub struct App {
     dirty: bool,
     /// Clickable regions of the last frame (topmost last).
     pub hits: RefCell<Vec<(Rect, Hit)>>,
+    /// Areas of the last frame that hold user or answer text (the ASCII
+    /// fallback leaves them alone).
+    pub text_areas: RefCell<Vec<Rect>>,
     /// Rows of the list drawn last (PgUp / PgDn step).
     pub page: Cell<usize>,
 }
@@ -336,6 +339,7 @@ impl App {
             outbox: Vec::new(),
             dirty: true,
             hits: RefCell::new(Vec::new()),
+            text_areas: RefCell::new(Vec::new()),
             page: Cell::new(10),
         }
     }
@@ -435,8 +439,10 @@ impl App {
         self.dirty = true;
     }
 
+    /// A spinner is on screen (only then does it need ticks).
     fn busy(&self) -> bool {
-        self.inspector.busy || self.starting.is_some()
+        (self.inspector.busy && self.tab == Tab::Inspector && !self.offline())
+            || (self.starting.is_some() && self.offline())
     }
 
     /// Time-driven changes: toast expiry, spinner, giving up on a start.
@@ -941,9 +947,13 @@ impl App {
 
     fn rebuild_vault_view(&mut self) {
         let needle = self.vault_filter.needle();
-        self.vault_view = (0..self.vault.len())
-            .filter(|i| hay_matches(&needle, &Self::vault_hay(&self.vault[*i])))
-            .collect();
+        self.vault_view = if needle.is_empty() {
+            (0..self.vault.len()).collect()
+        } else {
+            (0..self.vault.len())
+                .filter(|i| hay_matches(&needle, &Self::vault_hay(&self.vault[*i])))
+                .collect()
+        };
         self.vault_sel = self.vault_sel.min(self.vault_view.len().saturating_sub(1));
         self.dirty = true;
     }
@@ -1129,7 +1139,12 @@ impl App {
             return;
         }
         if (ctrl && key.code == KeyCode::Char('k')) || key.code == KeyCode::Char(':') {
-            self.palette = Some(Palette::default());
+            // A snapshot: what is shown is what Enter / a click runs, even
+            // if the state behind the palette changes meanwhile.
+            self.palette = Some(Palette {
+                entries: self.palette_entries(),
+                ..Palette::default()
+            });
             return;
         }
         if self.offline() {
@@ -1327,9 +1342,13 @@ impl App {
         }
     }
 
+    /// Switch protection to the opposite of what this screen shows (not
+    /// of whatever the daemon has meanwhile), so a stale screen cannot
+    /// turn it back on (or off) by surprise.
     pub fn toggle_protection(&mut self) {
-        self.send(Cmd::SetConfig(Box::new(|c| {
-            c.protection.enabled = !c.protection.enabled
+        let target = !self.protection_on();
+        self.send(Cmd::SetConfig(Box::new(move |c| {
+            c.protection.enabled = target
         })));
     }
 
@@ -1360,6 +1379,9 @@ impl App {
         {
             self.confirm = Some(Confirm::Setting(s));
             return;
+        }
+        if s == Setting::Protection {
+            return self.toggle_protection();
         }
         self.send(Cmd::SetConfig(Box::new(move |c| {
             settings::step(&s, c, forward)
@@ -1481,11 +1503,16 @@ impl App {
         }
         v.extend([
             Entry::new("Inspector: try text", "3", Action::Inspect),
-            Entry::new("Rules: add a person to always mask", "a", Action::AddPerson),
-            Entry::new("Rules: allow a term (never mask)", "w", Action::AllowTerm),
+            // Tab-scoped keys show their tab: "4 w" is w on the Rules tab.
+            Entry::new(
+                "Rules: add a person to always mask",
+                "4 a",
+                Action::AddPerson,
+            ),
+            Entry::new("Rules: allow a term (never mask)", "4 w", Action::AllowTerm),
             Entry::new(
                 "Vault: wipe every mapping (asks first)",
-                "w",
+                "5 w",
                 Action::WipeVault,
             ),
             Entry::new(
@@ -1509,15 +1536,7 @@ impl App {
 
     fn palette_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let n = {
-            let entries = self.palette_entries();
-            let q = self
-                .palette
-                .as_ref()
-                .map(|p| p.query.clone())
-                .unwrap_or_default();
-            palette::filter(&entries, &q).len()
-        };
+        let n = self.palette_matches();
         let Some(p) = &mut self.palette else { return };
         match key.code {
             KeyCode::Esc => self.palette = None,
@@ -1541,10 +1560,16 @@ impl App {
         }
     }
 
+    /// How many palette entries match the query.
+    fn palette_matches(&self) -> usize {
+        self.palette
+            .as_ref()
+            .map_or(0, |p| palette::filter(&p.entries, &p.query).len())
+    }
+
     fn run_palette(&mut self, i: usize) {
-        let q = self.palette.take().map(|p| p.query).unwrap_or_default();
-        let entries = self.palette_entries();
-        let action = palette::filter(&entries, &q)
+        let Some(p) = self.palette.take() else { return };
+        let action = palette::filter(&p.entries, &p.query)
             .get(i)
             .map(|e| e.action.clone());
         if let Some(a) = action {
@@ -1640,7 +1665,8 @@ impl App {
                     1
                 };
                 if let Some(p) = &mut self.palette {
-                    p.sel = p.sel.saturating_add_signed(d);
+                    let n = palette::filter(&p.entries, &p.query).len();
+                    p.sel = p.sel.saturating_add_signed(d).min(n.saturating_sub(1));
                 } else if !self.help {
                     self.scroll(d);
                 }

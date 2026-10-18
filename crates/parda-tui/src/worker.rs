@@ -32,6 +32,8 @@ pub enum Cmd {
     Visible(Tab),
     /// Refresh status, config and the data of `tab`.
     Refresh(Tab),
+    /// Status and config only (the 1 s timer between data reloads).
+    Poll,
     /// Read the configuration, change it, save it (ConfigSet).
     SetConfig(ConfigEdit),
     SetRules(String),
@@ -47,6 +49,7 @@ impl std::fmt::Debug for Cmd {
         match self {
             Cmd::Visible(t) => write!(f, "Visible({t:?})"),
             Cmd::Refresh(t) => write!(f, "Refresh({t:?})"),
+            Cmd::Poll => write!(f, "Poll"),
             Cmd::SetConfig(_) => write!(f, "SetConfig"),
             Cmd::SetRules(_) => write!(f, "SetRules"),
             Cmd::VaultWipe(s) => write!(f, "VaultWipe({s:?})"),
@@ -180,6 +183,7 @@ fn load_vault(b: &mut dyn Backend, out: &mut Vec<Msg>) {
 pub fn exec(cmd: Cmd, b: &mut dyn Backend, out: &mut Vec<Msg>) {
     match cmd {
         Cmd::Visible(tab) | Cmd::Refresh(tab) => refresh(tab, b, out),
+        Cmd::Poll => refresh(Tab::Dashboard, b, out),
         Cmd::SetConfig(edit) => {
             let current = b
                 .call(Request::ConfigGet)
@@ -374,6 +378,24 @@ impl Backend for Live {
     }
 }
 
+/// How often the visible Rules / Vault data is reloaded by the timer (it
+/// is also loaded on entering the tab and after every change).
+pub const DATA_EVERY: Duration = Duration::from_secs(5);
+
+fn has_data(tab: Tab) -> bool {
+    matches!(tab, Tab::Rules | Tab::Vault)
+}
+
+/// What the 1 s timer runs on `tab`: status and config every time, the
+/// tab's data only when it was last loaded [`DATA_EVERY`] ago.
+pub fn timer_cmd(tab: Tab, last_data: Option<Instant>, now: Instant) -> Cmd {
+    if has_data(tab) && last_data.is_none_or(|t| now.duration_since(t) >= DATA_EVERY) {
+        Cmd::Refresh(tab)
+    } else {
+        Cmd::Poll
+    }
+}
+
 /// Which worker runs a command: Inspector redactions get their own, so a
 /// slow status refresh never holds them up (and the other way round).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,12 +440,13 @@ pub fn spawn_role(
         let _notice = DeathNotice(tx.clone(), role);
         let mut tab = Tab::Dashboard;
         let mut next = Instant::now();
+        let mut last_data: Option<Instant> = None;
         loop {
             let cmd = if role == Role::Main {
                 let wait = next.saturating_duration_since(Instant::now());
                 match cmd_rx.recv_timeout(wait) {
                     Ok(c) => c,
-                    Err(RecvTimeoutError::Timeout) => Cmd::Refresh(tab),
+                    Err(RecvTimeoutError::Timeout) => timer_cmd(tab, last_data, Instant::now()),
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             } else {
@@ -436,8 +459,15 @@ pub fn spawn_role(
                 Cmd::Visible(t) => {
                     tab = *t;
                     next = Instant::now() + REFRESH;
+                    last_data = Some(Instant::now());
                 }
-                Cmd::Refresh(_) => next = Instant::now() + REFRESH,
+                Cmd::Refresh(t) => {
+                    next = Instant::now() + REFRESH;
+                    if has_data(*t) {
+                        last_data = Some(Instant::now());
+                    }
+                }
+                Cmd::Poll => next = Instant::now() + REFRESH,
                 _ => {}
             }
             let mut out = Vec::new();

@@ -362,10 +362,22 @@ fn int_in<T: std::str::FromStr + PartialOrd + std::fmt::Display>(
     }
 }
 
-fn loopback(v: &str) -> Result<String, String> {
+/// A listen address: `IP:PORT` or `localhost:PORT`; loopback only unless
+/// `any_ip` (the agent proxy with `proxy.allow_non_loopback`).
+fn listen_addr(v: &str, any_ip: bool) -> Result<String, String> {
+    if let Some((host, port)) = v.rsplit_once(':')
+        && host.eq_ignore_ascii_case("localhost")
+    {
+        return match port.parse::<u16>() {
+            Ok(p) if p > 0 => Ok(v.to_string()),
+            _ => Err("enter a port number, e.g. localhost:8787".into()),
+        };
+    }
     match v.parse::<std::net::SocketAddr>() {
-        Ok(a) if a.ip().is_loopback() => Ok(a.to_string()),
-        Ok(_) => Err("use a loopback address (127.0.0.1:PORT or [::1]:PORT)".into()),
+        Ok(a) if any_ip || a.ip().is_loopback() => Ok(a.to_string()),
+        Ok(_) => {
+            Err("use a loopback address (127.0.0.1:PORT, [::1]:PORT or localhost:PORT)".into())
+        }
         Err(_) => Err("enter an address like 127.0.0.1:8787".into()),
     }
 }
@@ -390,8 +402,9 @@ pub fn apply_text(s: &Setting, c: &mut Config, input: &str) -> Result<(), String
             }
             c.detect.model = v.to_string();
         }
-        Setting::ProxyListen => c.proxy.listen = loopback(v)?,
-        Setting::InterceptListen => c.intercept.listen = loopback(v)?,
+        Setting::ProxyListen => c.proxy.listen = listen_addr(v, c.proxy.allow_non_loopback)?,
+        // The daemon binds the intercept listener on loopback only.
+        Setting::InterceptListen => c.intercept.listen = listen_addr(v, false)?,
         Setting::Hotkey => {
             if v.is_empty() || v.chars().any(char::is_whitespace) || v.len() > 40 {
                 return Err("enter `default` or keys joined by '+', e.g. ctrl+shift+v".into());
@@ -699,5 +712,29 @@ mod tests {
         c.vault.ttl_days = 400;
         step(&Setting::Ttl, &mut c, false);
         assert_eq!(c.vault.ttl_days, 365);
+    }
+
+    #[test]
+    fn listen_addresses_accept_localhost_and_the_non_loopback_opt_in() {
+        let mut c = Config::default();
+        assert_eq!(
+            apply_text(&Setting::ProxyListen, &mut c, "localhost:9001"),
+            Ok(())
+        );
+        assert_eq!(c.proxy.listen, "localhost:9001");
+        assert_eq!(
+            apply_text(&Setting::InterceptListen, &mut c, "LocalHost:8790"),
+            Ok(())
+        );
+        assert_eq!(c.intercept.listen, "LocalHost:8790");
+        assert!(apply_text(&Setting::ProxyListen, &mut c, "localhost:http").is_err());
+        assert!(apply_text(&Setting::ProxyListen, &mut c, "0.0.0.0:9000").is_err());
+        c.proxy.allow_non_loopback = true;
+        assert_eq!(
+            apply_text(&Setting::ProxyListen, &mut c, "0.0.0.0:9000"),
+            Ok(())
+        );
+        // The intercept listener is loopback only, whatever the proxy allows.
+        assert!(apply_text(&Setting::InterceptListen, &mut c, "0.0.0.0:9000").is_err());
     }
 }

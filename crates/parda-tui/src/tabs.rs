@@ -47,6 +47,13 @@ pub fn hit(app: &App, r: Rect, h: Hit) {
     app.hits.borrow_mut().push((r, h));
 }
 
+/// Mark the inside of a bordered box as user / answer text.
+pub fn protect(app: &App, r: Rect) {
+    app.text_areas
+        .borrow_mut()
+        .push(r.inner(ratatui::layout::Margin::new(1, 1)));
+}
+
 /// First visible row so that `sel` stays inside a window of `height` rows.
 pub fn window_start(sel: usize, height: usize) -> usize {
     if height == 0 || sel < height {
@@ -116,12 +123,16 @@ fn clock(ts_ms: u64) -> String {
 
 /// A one-line `/` filter bar on top of `area` when the filter is in use;
 /// returns the rest.
-fn filter_bar(f: &mut Frame, area: Rect, filter: &Filter, what: &str) -> Rect {
+fn filter_bar(app: &App, f: &mut Frame, area: Rect, filter: &Filter, what: &str) -> Rect {
     if !filter.active() && !filter.editing {
         return area;
     }
     let [bar, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
-    let cursor = if filter.editing { "▏" } else { "" };
+    let cursor = if filter.editing {
+        app.theme.cursor()
+    } else {
+        ""
+    };
     let hint = if filter.editing {
         "  Enter keep · Esc clear"
     } else {
@@ -135,6 +146,7 @@ fn filter_bar(f: &mut Frame, area: Rect, filter: &Filter, what: &str) -> Rect {
         ])),
         bar,
     );
+    app.text_areas.borrow_mut().push(bar);
     rest
 }
 
@@ -695,7 +707,7 @@ fn event_detail(app: &App, f: &mut Frame, area: Rect) {
 }
 
 pub fn live(app: &App, f: &mut Frame, area: Rect) {
-    let area = filter_bar(f, area, &app.live.filter, "filter events");
+    let area = filter_bar(app, f, area, &app.live.filter, "filter events");
     let (list_area, detail_area) = if app.live.detail {
         if area.width >= 110 {
             let [a, b] =
@@ -793,7 +805,7 @@ pub fn inspector(app: &App, f: &mut Frame, area: Rect) {
             Constraint::Length(replace_h),
         ])
         .split(area);
-    let cursor = if ins.editing { "▏" } else { "" };
+    let cursor = if ins.editing { app.theme.cursor() } else { "" };
     let title = if ins.editing {
         "Input (editing — Enter to run, Esc to stop)"
     } else {
@@ -806,6 +818,9 @@ pub fn inspector(app: &App, f: &mut Frame, area: Rect) {
         rows[0],
     );
     hit(app, rows[0], Hit::Input);
+    for r in rows.iter() {
+        protect(app, *r);
+    }
     let (out_title, out) = match (&ins.error, ins.show_restore) {
         (Some(e), _) => ("Error".to_string(), e.clone()),
         (None, false) => (
@@ -896,7 +911,7 @@ fn rule_detail(app: &App, i: usize) -> Vec<Line<'static>> {
 }
 
 pub fn rules(app: &App, f: &mut Frame, area: Rect) {
-    let area = filter_bar(f, area, &app.rules_filter, "filter rules");
+    let area = filter_bar(app, f, area, &app.rules_filter, "filter rules");
     let all = app.rule_rows();
     let view = app.rules_view();
     let title = if app.rules_filter.active() {
@@ -964,6 +979,7 @@ pub fn rules(app: &App, f: &mut Frame, area: Rect) {
         .block(block(&title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, list_area, &mut state);
+    protect(app, list_area);
     if let Some(d) = detail_area {
         f.render_widget(
             Paragraph::new(rule_detail(app, view[sel]))
@@ -971,13 +987,14 @@ pub fn rules(app: &App, f: &mut Frame, area: Rect) {
                 .block(block("Rule")),
             d,
         );
+        protect(app, d);
     }
 }
 
 // ── Vault ───────────────────────────────────────────────────────────────
 
 pub fn vault(app: &App, f: &mut Frame, area: Rect) {
-    let area = filter_bar(f, area, &app.vault_filter, "search scope / kind");
+    let area = filter_bar(app, f, area, &app.vault_filter, "search scope / kind");
     let view = app.vault_view();
     let total: u64 = app.vault.iter().filter_map(|r| r["count"].as_u64()).sum();
     let title = if app.vault_filter.active() {
@@ -1036,6 +1053,7 @@ pub fn vault(app: &App, f: &mut Frame, area: Rect) {
         state.select(Some(sel - start));
     }
     f.render_stateful_widget(table, list_area, &mut state);
+    protect(app, list_area);
     if let (Some(d), Some(r)) = (detail_area, app.vault_selected()) {
         let scope = text(&r["scope"]);
         let (scope_total, kinds) = app
@@ -1064,6 +1082,7 @@ pub fn vault(app: &App, f: &mut Frame, area: Rect) {
                 .block(block("Mappings")),
             d,
         );
+        protect(app, d);
     }
 }
 
@@ -1158,8 +1177,20 @@ pub fn settings_tab(app: &App, f: &mut Frame, area: Rect) {
                 (None, _) => Style::default().fg(ACCENT),
             };
             let editing = i == sel && editor.is_some();
+            if editing {
+                app.text_areas.borrow_mut().push(Rect::new(
+                    list_area.x + 1,
+                    list_area.y + 1 + (i - start) as u16,
+                    list_area.width.saturating_sub(2),
+                    1,
+                ));
+            }
             let value = if editing {
-                format!("[{}▏]", editor.map(|e| e.buf.as_str()).unwrap_or_default())
+                format!(
+                    "[{}{}]",
+                    editor.map(|e| e.buf.as_str()).unwrap_or_default(),
+                    app.theme.cursor()
+                )
             } else {
                 match (r.on, settings::edit_kind(&all[i])) {
                     (Some(true), _) => format!("● {}", r.value),

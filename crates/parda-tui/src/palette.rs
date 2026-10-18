@@ -47,6 +47,8 @@ pub struct Palette {
     pub query: String,
     /// Index into the filtered list.
     pub sel: usize,
+    /// The actions as they were when the palette opened.
+    pub entries: Vec<Entry>,
 }
 
 /// Score `query` as a case-insensitive subsequence of `label`: None if it

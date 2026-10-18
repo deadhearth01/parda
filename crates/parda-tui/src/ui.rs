@@ -16,6 +16,7 @@ use crate::worker::Down;
 
 pub fn draw(app: &App, f: &mut Frame) {
     app.hits.borrow_mut().clear();
+    app.text_areas.borrow_mut().clear();
     let area = f.area();
     let [bar, strip, body, foot] = Layout::vertical([
         Constraint::Length(1),
@@ -46,9 +47,10 @@ pub fn draw(app: &App, f: &mut Frame) {
             Prompt::AllowTerm => " Term never to mask (Enter adds · Esc cancels) ",
         };
         let r = centered(area, 64, 3);
+        tabs::protect(app, r);
         f.render_widget(Clear, r);
         f.render_widget(
-            Paragraph::new(format!("{buf}▏")).block(
+            Paragraph::new(format!("{buf}{}", app.theme.cursor())).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(ACCENT))
@@ -66,7 +68,8 @@ pub fn draw(app: &App, f: &mut Frame) {
     if app.help {
         help(app, f, area);
     }
-    app.theme.finish(f.buffer_mut());
+    let text = app.text_areas.borrow();
+    app.theme.finish(f.buffer_mut(), &text);
 }
 
 pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -522,8 +525,7 @@ fn palette_overlay(app: &App, f: &mut Frame, area: Rect) {
     if area.height < 3 {
         return;
     }
-    let entries = app.palette_entries();
-    let matches = palette::filter(&entries, &p.query);
+    let matches = palette::filter(&p.entries, &p.query);
     let w = area.width.saturating_sub(4).min(68);
     let h = area
         .height
@@ -544,10 +546,11 @@ fn palette_overlay(app: &App, f: &mut Frame, area: Rect) {
     }
     let [input, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    app.text_areas.borrow_mut().push(input);
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("› ", Style::default().fg(ACCENT)),
-            Span::styled(format!("{}▏", p.query), bold()),
+            Span::styled(format!("{}{}", p.query, app.theme.cursor()), bold()),
             Span::styled(format!("  {} match(es)", matches.len()), dim()),
         ])),
         input,

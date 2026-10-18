@@ -997,7 +997,10 @@ fn toasts_expire() {
     assert!(app.message().is_some());
     assert!(render_text(&app, 80, 24).contains("protection OFF"));
     let now = Instant::now();
-    assert!(app.next_wakeup(now).is_some(), "a toast is waiting to expire");
+    assert!(
+        app.next_wakeup(now).is_some(),
+        "a toast is waiting to expire"
+    );
     // Warnings stay up to 8 s; info toasts 4 s.
     app.tick(now + Duration::from_secs(9));
     assert!(app.message().is_none());
@@ -1203,14 +1206,35 @@ fn big_lists_render_quickly() {
     assert!(per < Duration::from_millis(100), "{per:?} per frame");
 }
 
-/// Release only: a full 160×48 frame with 500 events / 10k vault rows.
+/// A full 160×48 frame with 500 events / 10k vault rows, plus the
+/// Msg::Vault rebuild of all 10k rows each time: a few ms in release, a
+/// generous bound in debug.
 #[test]
-#[cfg_attr(debug_assertions, ignore = "timing is only meaningful in release")]
-fn big_lists_render_in_a_few_ms_release() {
+fn big_lists_render_and_rebuild_in_a_few_ms() {
+    use crate::worker::Msg;
     let mut app = big_app();
-    let per = time_frames(&mut app, &[Tab::Live, Tab::Vault, Tab::Dashboard], 50);
-    eprintln!("per frame: {per:?}");
-    assert!(per < Duration::from_millis(4), "{per:?} per frame");
+    let mut spare = app.vault.clone();
+    let mut t = Terminal::new(TestBackend::new(160, 48)).unwrap();
+    let n = 30u32;
+    let start = Instant::now();
+    for _ in 0..n {
+        let incoming = std::mem::take(&mut spare);
+        spare = std::mem::take(&mut app.vault);
+        app.on_msg(Msg::Vault(incoming));
+        assert_eq!(app.vault_view().len(), 10_000);
+        for tab in [Tab::Live, Tab::Vault, Tab::Dashboard] {
+            app.tab = tab;
+            t.draw(|f| app.draw(f)).unwrap();
+        }
+    }
+    let per = start.elapsed() / n;
+    let bound = if cfg!(debug_assertions) {
+        Duration::from_millis(300)
+    } else {
+        Duration::from_millis(4)
+    };
+    eprintln!("rebuild + 3 frames: {per:?}");
+    assert!(per < bound * 3, "{per:?} per rebuild and 3 frames");
 }
 
 #[test]
@@ -1747,4 +1771,129 @@ mod m5_workers {
         let took = wait_for(&rx, |e| matches!(e, UiEvent::Msg(Msg::Redacted(_))));
         assert!(took < Duration::from_secs(1), "{took:?}");
     }
+}
+
+#[test]
+fn m6_palette_runs_the_entry_that_was_shown() {
+    let mut b = fake();
+    let mut app = online(&mut b);
+    press(&mut app, &mut b, KeyCode::Char('2'));
+    press(&mut app, &mut b, KeyCode::Char(':'));
+    // The list behind it changes (going offline adds "Start the daemon"
+    // at the top); Enter still runs what was highlighted.
+    b.online = false;
+    app.request_refresh();
+    app.sync(&mut b);
+    press(&mut app, &mut b, KeyCode::Enter);
+    assert_eq!(app.tab, Tab::Dashboard, "ran Go to Dashboard");
+    assert_eq!(b.started, 0);
+    // The wheel cannot move the selection past the list.
+    press(&mut app, &mut b, KeyCode::Char(':'));
+    for _ in 0..200 {
+        wheel(&mut app, &mut b, true);
+    }
+    let p = app.palette.as_ref().unwrap();
+    assert!(p.sel < p.entries.len(), "{} of {}", p.sel, p.entries.len());
+}
+
+#[test]
+fn m7_p_sets_what_the_screen_shows_rather_than_flipping() {
+    let mut b = fake();
+    let mut app = online(&mut b);
+    assert!(render_text(&app, 80, 24).contains("PROTECTION ON"));
+    // Someone switched it off elsewhere (`parda off`); this screen has not
+    // refreshed yet and still says ON. `p` means "turn it off".
+    let mut c = cfg(&b);
+    c.protection.enabled = false;
+    b.config = c.to_toml_string().unwrap();
+    press(&mut app, &mut b, KeyCode::Char('p'));
+    assert!(
+        !cfg(&b).protection.enabled,
+        "p must not switch protection back on"
+    );
+}
+
+#[test]
+fn m8_ascii_mode_leaves_user_and_answer_text_alone() {
+    let mut b = fake();
+    let mut app = online(&mut b);
+    app.theme = crate::Theme::from_vars(None, Some("1".into()));
+    press(&mut app, &mut b, KeyCode::Char('3'));
+    press(&mut app, &mut b, KeyCode::Char('i'));
+    typ(&mut app, &mut b, "a → b · c — ●");
+    press(&mut app, &mut b, KeyCode::Enter);
+    let screen = render_text(&app, 80, 24);
+    let lines: Vec<&str> = screen
+        .lines()
+        .filter(|l| l.contains("a → b · c — ●"))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "input and output keep their text:\n{screen}"
+    );
+    assert!(
+        !screen.contains('┌') && !screen.contains('│'),
+        "chrome is ASCII:\n{screen}"
+    );
+    // Rule names are the user's text too.
+    b.rules = "allow = [\"Café → Bar\"]\n".into();
+    press(&mut app, &mut b, KeyCode::Char('4'));
+    assert!(render_text(&app, 80, 24).contains("Café → Bar"));
+}
+
+#[test]
+fn m9_palette_hints_tell_same_letter_actions_apart() {
+    let app = App::new();
+    let e = app.palette_entries();
+    let key = |a: crate::palette::Action| e.iter().find(|x| x.action == a).unwrap().key;
+    assert_ne!(
+        key(crate::palette::Action::AllowTerm),
+        key(crate::palette::Action::WipeVault)
+    );
+}
+
+#[test]
+fn m9_spinner_ticks_only_on_the_visible_inspector() {
+    let mut b = fake();
+    let mut app = online(&mut b);
+    press(&mut app, &mut b, KeyCode::Char('3'));
+    press(&mut app, &mut b, KeyCode::Char('i'));
+    typ(&mut app, &mut b, "x");
+    app.on_key(key(KeyCode::Enter)); // queued, not yet answered
+    press(&mut app, &mut b, KeyCode::Char('2'));
+    // `press` synced the redaction; make it pending again.
+    app.inspector.busy = true;
+    let _ = app.take_dirty();
+    let now = Instant::now();
+    app.tick(now + Duration::from_millis(200));
+    assert!(!app.take_dirty(), "no spinner redraws off the Inspector");
+    assert!(
+        app.next_wakeup(now)
+            .is_none_or(|t| t >= now + Duration::from_secs(2))
+    );
+}
+
+#[test]
+fn m9_vault_and_rules_reload_at_most_every_5s_while_visible() {
+    use crate::worker::{Cmd, timer_cmd};
+    let now = Instant::now();
+    let fresh = Some(now - Duration::from_secs(1));
+    let old = Some(now - Duration::from_secs(6));
+    assert!(matches!(timer_cmd(Tab::Vault, fresh, now), Cmd::Poll));
+    assert!(matches!(
+        timer_cmd(Tab::Vault, old, now),
+        Cmd::Refresh(Tab::Vault)
+    ));
+    assert!(matches!(
+        timer_cmd(Tab::Rules, None, now),
+        Cmd::Refresh(Tab::Rules)
+    ));
+    // Tabs without such data just poll.
+    assert!(matches!(timer_cmd(Tab::Live, old, now), Cmd::Poll));
+    // A poll reads status and config only.
+    let mut b = fake();
+    let mut out = Vec::new();
+    crate::worker::exec(Cmd::Poll, &mut b, &mut out);
+    assert_eq!(b.calls, ["Status", "ConfigGet"]);
 }
