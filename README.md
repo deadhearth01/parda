@@ -123,8 +123,10 @@ export OPENAI_BASE_URL=http://127.0.0.1:8787/v1     # Codex CLI, OpenAI SDKs
 parda            # alone in a terminal opens the dashboard (same as `parda tui`)
 ```
 
-**The dashboard.** `parda` opens it; if the daemon is not running it says so and `s` starts it in the
-background (the login service if `parda service install` set one up, else a detached `parda daemon`).
+**The dashboard.** `parda` opens it; if the daemon is not running it says so and `s` (only `s`) starts
+it in the background — the login service if `parda service install` set one up *for the same
+PARDA_HOME*, else a detached `parda daemon` for this home. A daemon that runs but does not answer, or
+speaks another protocol version, is shown as such (no start key).
 `:` or Ctrl-K opens a command palette with every action; `1`–`6` / Tab switch tabs; arrows or `hjkl`,
 `g`/`G`, PgUp/PgDn move; `/` filters Live, Rules and Vault; Enter opens details; Esc backs out; `?`
 lists every key; the bottom line always shows the keys that work right now. Live pauses with Space and

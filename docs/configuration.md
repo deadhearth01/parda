@@ -212,9 +212,11 @@ settings.
   mouse wheel selects. Switches toggle with Enter / Space / click; choices cycle with Enter / → / click
   and go back with ← or right-click; numbers (model threshold 0.30–0.95, model time budget 10–60000
   ms, vault TTL 1–3650 days) and text (model id, agent proxy and intercept listener addresses —
-  loopback only — and the paste-safe hotkey) open an inline editor on Enter: the value is checked
-  before it is sent, Esc cancels, and the daemon's answer appears as a message. ←/→ still step
-  numbers through presets. Options marked ↻ take effect after the daemon restarts (the AI-sites
+  `IP:PORT` or `localhost:PORT`, loopback only, except that the agent proxy takes any address
+  when `proxy.allow_non_loopback = true` — and the paste-safe hotkey) open an inline editor on
+  Enter: the value is checked before it is sent, Esc cancels, and the daemon's answer appears as a
+  message (pasting works too; a newline in a paste never submits). ←/→ step numbers to the next
+  larger / smaller preset. Options marked ↻ take effect after the daemon restarts (the AI-sites
   rows apply at once). Turning on `privacy.log_values` asks for confirmation. The command palette
   (`:` or Ctrl-K) also switches intercept, the agent proxy, the clipboard, mode and style by name.
 - **Protection switch**: `p` anywhere in the TUI, a click on the status-bar badge, or `parda off` /
