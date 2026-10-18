@@ -915,10 +915,8 @@ fn settings_numbers_edit_inline_with_validation() {
     assert!(app.editor.is_none());
     assert!((cfg(&b).detect.ml_threshold - 0.42).abs() < 1e-6);
     assert_eq!(app.message(), Some("saved and applied"));
-    // ←/→ still step through presets (a typed value snaps to the nearest
-    // one first); Esc cancels an edit.
-    press(&mut app, &mut b, KeyCode::Right);
-    assert!((cfg(&b).detect.ml_threshold - 0.40).abs() < 1e-6);
+    // ←/→ still step through presets, from the typed value to the next
+    // larger one; Esc cancels an edit.
     press(&mut app, &mut b, KeyCode::Right);
     assert!((cfg(&b).detect.ml_threshold - 0.45).abs() < 1e-6);
     press(&mut app, &mut b, KeyCode::Enter);

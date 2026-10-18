@@ -258,29 +258,39 @@ fn action_label(a: Action) -> &'static str {
     }
 }
 
-fn cycle<T: PartialEq + Copy>(list: &[T], current: T, forward: bool) -> T {
+/// The next (or previous) value of `list` after `current`, cycling. A value
+/// that is not in the list (typed in) moves to the nearest preset in that
+/// direction, never to the far end of the list.
+fn cycle<T: PartialOrd + Copy>(list: &[T], current: T, forward: bool) -> T {
     let n = list.len();
-    let i = list.iter().position(|x| *x == current);
-    let next = match (i, forward) {
+    let next = match (list.iter().position(|x| *x == current), forward) {
         (Some(i), true) => (i + 1) % n,
         (Some(i), false) => (i + n - 1) % n,
-        (None, true) => 0,
-        (None, false) => n - 1,
+        // Off the list: first preset above (below); past the end the
+        // cycle wraps as it does from the last (first) preset.
+        (None, true) => list.iter().position(|x| *x > current).unwrap_or(0),
+        (None, false) => list.iter().rposition(|x| *x < current).unwrap_or(n - 1),
     };
     list[next]
 }
 
+/// Cycle through choices that have no order.
+fn cycle_eq<T: PartialEq + Copy>(list: &[T], current: T, forward: bool) -> T {
+    let n = list.len();
+    let i = list.iter().position(|x| *x == current).unwrap_or(0);
+    list[if forward {
+        (i + 1) % n
+    } else {
+        (i + n - 1) % n
+    }]
+}
+
 fn cycle_f32(list: &[f32], current: f32, forward: bool) -> f32 {
-    // Snap to the nearest listed value first so hand-edited values cycle too.
-    let nearest = list
-        .iter()
-        .copied()
-        .min_by(|a, b| (a - current).abs().total_cmp(&(b - current).abs()))
-        .unwrap_or(current);
-    if (nearest - current).abs() > 1e-6 {
-        return nearest;
+    // Within rounding of a preset counts as that preset.
+    match list.iter().find(|x| (**x - current).abs() < 1e-4) {
+        Some(on) => cycle(list, *on, forward),
+        None => cycle(list, current, forward),
     }
-    cycle(list, nearest, forward)
 }
 
 /// How a setting is changed in place.
@@ -469,7 +479,7 @@ pub fn step(s: &Setting, c: &mut Config, forward: bool) {
         Setting::Ttl => c.vault.ttl_days = cycle(&TTL_DAYS, c.vault.ttl_days, forward),
         Setting::LogValues => c.privacy.log_values = !c.privacy.log_values,
         Setting::Action(k) => {
-            let next = cycle(&ACTIONS, c.action_for(k), forward);
+            let next = cycle_eq(&ACTIONS, c.action_for(k), forward);
             if next == Action::Redact {
                 c.detect.actions.remove(k);
             } else {
@@ -651,5 +661,43 @@ mod tests {
         assert!(!row(&Setting::InterceptListen, &c).restart);
         assert!(row(&Setting::Hotkey, &c).restart);
         assert_eq!(row(&Setting::ProxyListen, &c).value, "127.0.0.1:8787");
+    }
+
+    #[test]
+    fn stepping_a_typed_number_goes_to_the_neighbouring_preset() {
+        let mut c = Config::default();
+        c.vault.ttl_days = 14;
+        step(&Setting::Ttl, &mut c, true);
+        assert_eq!(c.vault.ttl_days, 30, "14 → the next larger preset, never 1");
+        c.vault.ttl_days = 14;
+        step(&Setting::Ttl, &mut c, false);
+        assert_eq!(
+            c.vault.ttl_days, 7,
+            "14 ← the next smaller preset, never 365"
+        );
+        c.detect.ml_timeout_ms = 750;
+        step(&Setting::Timeout, &mut c, true);
+        assert_eq!(c.detect.ml_timeout_ms, 1000);
+        c.detect.ml_timeout_ms = 750;
+        step(&Setting::Timeout, &mut c, false);
+        assert_eq!(c.detect.ml_timeout_ms, 500);
+        c.detect.ml_threshold = 0.42;
+        step(&Setting::Threshold, &mut c, true);
+        assert!(
+            (c.detect.ml_threshold - 0.45).abs() < 1e-6,
+            "{}",
+            c.detect.ml_threshold
+        );
+        c.detect.ml_threshold = 0.42;
+        step(&Setting::Threshold, &mut c, false);
+        assert!(
+            (c.detect.ml_threshold - 0.40).abs() < 1e-6,
+            "{}",
+            c.detect.ml_threshold
+        );
+        // Beyond the last preset the cycle goes on as it does from the last one.
+        c.vault.ttl_days = 400;
+        step(&Setting::Ttl, &mut c, false);
+        assert_eq!(c.vault.ttl_days, 365);
     }
 }
