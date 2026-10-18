@@ -20,13 +20,16 @@
 //!   TAB, LF, FF, CR and SPACE end an unquoted one, as for browsers. A tag
 //!   is read from every `<` + letter, even inside what another reading
 //!   takes for a value: that may be a comment, CDATA or code to a renderer.
-//! - A `<style>` element, whole (to `</style` and a delimiter; its tag's
-//!   attributes, and nested SVG ones, too).
+//! - A `<style>` element, whole (to `</style` and a delimiter, not one
+//!   inside a CDATA section or comment begun in it; its tag's attributes,
+//!   and nested SVG ones, too).
 //! - Elsewhere CSS `url(…)` and `image-set(…)` (quotes and escapes
 //!   honoured, to an unquoted `)`), what follows `@import` (to an unquoted
 //!   `;`, across line breaks), and, since CSS compares names after their
 //!   escapes (`u\72l(` is `url(`), the argument of any `(` that has a
-//!   backslash in the 16 characters before it.
+//!   backslash in the 32 characters before it, and an `@` with a backslash
+//!   in the 32 after it, read as `@import` (a CRLF counts once).
+//! - Depth counters saturate; a saturated one keeps guarding.
 //!
 //! Other URL-like plain text (`key=value`, a value right after a URL) is
 //! left to the engine's url-safe restore, which never restores a value
@@ -51,6 +54,10 @@ pub struct Part {
 const RECENT_CHARS: usize = 12;
 /// Longest autolink scheme (CommonMark: 2–32 characters).
 const MAX_SCHEME: u8 = 32;
+/// How far before a `(` a backslash makes it a CSS URL, and after an `@`
+/// one makes it `@import` (a 6-digit escape, CRLF and
+/// `-webkit-image-set` fit).
+const ESCAPE_WINDOW: u8 = 32;
 /// Markdown readings followed at once; more than this protects the rest of
 /// the line (a reading still waiting for its destination is kept).
 const MAX_THREADS: usize = 8;
@@ -111,8 +118,13 @@ enum Css {
     /// After `@import`: to an unquoted `;`.
     Import { quote: Option<char>, escaped: bool },
     /// A style element (all of it, its attributes too): to `</style`;
-    /// `depth` counts nested ones (SVG style elements are not raw text).
-    Style { depth: u32 },
+    /// `depth` counts nested ones (SVG style elements are not raw text),
+    /// and no `</style` ends it before `until`, the end of a CDATA section
+    /// or comment begun inside it.
+    Style {
+        depth: u32,
+        until: Option<&'static str>,
+    },
 }
 
 impl Css {
@@ -138,8 +150,10 @@ pub struct UrlGuard {
     /// CSS readings in progress (never `Free`; at most one per quote and
     /// escape state).
     css: Vec<Css>,
-    /// Characters since the last backslash, while fewer than 16.
+    /// Characters since the last backslash / `@`, while fewer than
+    /// `ESCAPE_WINDOW` (a CRLF counts once).
     backslash_gap: Option<u8>,
+    at_gap: Option<u8>,
     /// The last characters seen, lower-cased.
     recent: String,
     prev: Option<char>,
@@ -206,27 +220,56 @@ impl UrlGuard {
         let style_end = delimiter && self.recent.ends_with("</style");
         let style_start = delimiter && self.recent.ends_with("<style");
         // CSS compares names after escapes (`u\72l(` is `url(`): rather
-        // than decode them, any `(` shortly after a backslash is a URL.
+        // than decode them, any `(` shortly after a backslash is a URL,
+        // and any backslash shortly after an `@` starts `@import`.
         let escaped_fn = c == '(' && self.backslash_gap.is_some();
-        self.backslash_gap = match self.backslash_gap {
-            _ if c == '\\' => Some(0),
-            Some(gap) if gap < 15 => Some(gap + 1),
+        let escaped_at = c == '\\' && self.at_gap.is_some();
+        let crlf = c == '\n' && prev == Some('\r');
+        let gap = |gap: Option<u8>, start: bool| match gap {
+            _ if start => Some(0),
+            g if crlf => g,
+            Some(g) if g + 1 < ESCAPE_WINDOW => Some(g + 1),
             _ => None,
         };
+        self.backslash_gap = gap(self.backslash_gap, c == '\\');
+        self.at_gap = gap(self.at_gap, c == '@');
         let mut css: Vec<Css> = Vec::with_capacity(self.css.len() + 1);
         for state in std::mem::take(&mut self.css) {
             let (u, next) = match state {
-                Css::Style { depth: 0 } if style_end => (false, Css::Free),
-                Css::Style { depth } if style_end => (true, Css::Style { depth: depth - 1 }),
+                Css::Style {
+                    depth: 0,
+                    until: None,
+                } if style_end => (false, Css::Free),
+                // A saturated depth guards to the end of the stream.
+                Css::Style { depth, until: None } if style_end && depth < u32::MAX => (
+                    true,
+                    Css::Style {
+                        depth: depth - 1,
+                        until: None,
+                    },
+                ),
                 _ => css_step(state, c),
             };
             url |= u;
             add_css(&mut css, next);
         }
         self.remember(c);
+        for state in &mut css {
+            if let Css::Style { until, .. } = state {
+                *until = match *until {
+                    Some(end) if self.recent.ends_with(end) => None,
+                    None if self.recent.ends_with("<![cdata[") => Some("]]>"),
+                    None if self.recent.ends_with("<!--") => Some("-->"),
+                    keep => keep,
+                };
+            }
+        }
         // A CSS URL may start at any trigger, whatever else is going on: a
         // quote in text that is not CSS must not hide it.
         add_css(&mut css, self.css_trigger());
+        if escaped_at {
+            add_css(&mut css, Css::import(None));
+        }
         if escaped_fn {
             add_css(
                 &mut css,
@@ -238,7 +281,13 @@ impl UrlGuard {
             );
         }
         if style_start {
-            add_css(&mut css, Css::Style { depth: 0 });
+            add_css(
+                &mut css,
+                Css::Style {
+                    depth: 0,
+                    until: None,
+                },
+            );
         }
         self.css = css;
         // A tag may start at any `<` + letter, whatever else is going on:
@@ -408,11 +457,19 @@ fn bare(c: char, depth: u32) -> (bool, Md) {
         '(' => (
             true,
             Md::DestBare {
-                depth: depth + 1,
+                depth: depth.saturating_add(1),
                 escaped: false,
             },
         ),
         ')' if depth == 0 => (false, Md::Free),
+        // A saturated depth guards to the end of the line (whitespace).
+        ')' if depth == u32::MAX => (
+            true,
+            Md::DestBare {
+                depth,
+                escaped: false,
+            },
+        ),
         ')' => (
             true,
             Md::DestBare {
@@ -475,8 +532,9 @@ fn add_css(css: &mut Vec<Css>, new: Css) {
     if new == Css::Free {
         return;
     }
-    if new == (Css::Style { depth: 0 })
-        && let Some(Css::Style { depth }) = css.iter_mut().find(|s| matches!(s, Css::Style { .. }))
+    if let Css::Style { .. } = new
+        && let Some(Css::Style { depth, .. }) =
+            css.iter_mut().find(|s| matches!(s, Css::Style { .. }))
     {
         *depth = depth.saturating_add(1);
         return;
@@ -530,8 +588,10 @@ fn css_step(state: Css, c: char) -> (bool, Css) {
             } else {
                 match c {
                     '"' | '\'' => (true, next(depth, Some(c), false)),
-                    '(' => (true, next(depth + 1, None, false)),
+                    '(' => (true, next(depth.saturating_add(1), None, false)),
                     ')' if depth == 0 => (false, Css::Free),
+                    // A saturated depth guards to the end of the stream.
+                    ')' if depth == u32::MAX => (true, next(depth, None, false)),
                     ')' => (true, next(depth - 1, None, false)),
                     _ => (true, next(depth, None, false)),
                 }
@@ -1010,6 +1070,36 @@ mod tests {
         "p{background:\\75rl(⟨//e/[NAME_1]⟩)}",
         "p{background:URL(⟨//e/[NAME_1]⟩)}",
         "\\(x\\) and \\sin(⟨[NAME_1]⟩)",
+        // The window is 32 characters (a 6-digit escape, CRLF as one, and
+        // `-webkit-image-set` fit), CRLF counted once.
+        "p{b:\\000069\r\nmage-set(⟨\"//e/[NAME_1]\" 1x⟩)}",
+        "p{b:-webkit-\\000069\r\nmage-set(⟨'//e/[NAME_1]' 1x⟩)}",
+        "\\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa(⟨[NAME_1]⟩)",
+        "\\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n(⟨[NAME_1]⟩)",
+        // Escapes the a18c48a decoder read, outside a style element: 1 to
+        // 6 hex digits, space / tab / FF / LF / CRLF terminators, non-hex
+        // escapes, image-set.
+        "p{b:u\\72l(⟨//e/[NAME_1]⟩)}",
+        "p{b:u\\072l(⟨//e/[NAME_1]⟩)}",
+        "p{b:u\\0072l(⟨//e/[NAME_1]⟩)}",
+        "p{b:u\\00072l(⟨//e/[NAME_1]⟩)}",
+        "p{b:u\\000072l(⟨//e/[NAME_1]⟩)}",
+        "p{b:u\\72 l(⟨//e/[NAME_1]⟩)}",
+        "p{b:u\\72\tl(⟨//e/[NAME_1]⟩)}",
+        "p{b:u\\72\u{c}l(⟨//e/[NAME_1]⟩)}",
+        "p{b:\\75\\72\\6c(⟨//e/[NAME_1]⟩)}",
+        "p{b:ur\\l(⟨//e/[NAME_1]⟩)}",
+        "p{b:u\\R\\L(⟨//e/[NAME_1]⟩)}",
+        "p{b:image-s\\65t(\"⟨//e/[NAME_1]⟩\" 1x)}",
+        "p{b:\\69mage-set(\"⟨//e/[NAME_1]⟩\" 1x)}",
+        // An escaped at-keyword outside a style element: `@` with a
+        // backslash in the 32 characters after it reads as `@import`.
+        "@\\69mport '⟨//e/[NAME_1]⟩';",
+        "@\\000069\r\nmport \"⟨//e/;[NAME_1]⟩\";",
+        "@\\0069 mport '⟨//e/[NAME_1]⟩';",
+        "@impor\\74 '⟨//e/[NAME_1]⟩';",
+        "@impor\\74\r\n'⟨//e/;[NAME_1]⟩';",
+        "@\\49MPORT url(⟨//e/;[NAME_1]⟩);",
         // HTML §13.2.5.3 RAWTEXT: a style element is CSS up to `</style`
         // and a delimiter; all of it is guarded, with any attributes, in
         // SVG too, whatever it holds.
@@ -1021,6 +1111,13 @@ mod tests {
         "<style>⟨</stylex>[NAME_1]⟩</style>",
         "<svg><style>⟨<![CDATA[ [NAME_1] ]]>⟩</style></svg>",
         "<svg><style>⟨<style></style>[NAME_1]⟩</style></svg>",
+        // In SVG a CDATA section or comment hides `</style>`; in HTML it
+        // does not, but guarding to the later one is wider.
+        "<svg><style>⟨<![CDATA[ </style> [NAME_1] ]]>⟩</style>«[NAME_1]»</svg>",
+        "<svg><style>⟨<!-- </style> [NAME_1] -->⟩</style>«[NAME_1]»</svg>",
+        "<style>⟨<!-- </style> [NAME_1] -->⟩</style>",
+        // `<!-->` is a whole comment: the `</style>` after it ends it.
+        "<style>⟨<!--> ⟩</style> «[NAME_1]»",
         "<style>@font-face{src:url(⟨//e/[NAME_1].woff⟩)}</style>",
         // A url reading started in other text does not hide the next
         // one.
@@ -1267,6 +1364,61 @@ mod tests {
         ] {
             assert_eq!(tags_guarded(&pieces), [true, false], "{:?}", &pieces[1..]);
         }
+    }
+
+    /// `text` marked as `g` (in some state already) reads it.
+    fn marked_from(mut g: UrlGuard, text: &str) -> String {
+        let mut out = String::new();
+        let mut in_url = false;
+        for part in g.split(text) {
+            if part.url != in_url {
+                out.push(if part.url { '⟨' } else { '⟩' });
+                in_url = part.url;
+            }
+            out.push_str(&part.text);
+        }
+        if in_url {
+            out.push('⟩');
+        }
+        out
+    }
+
+    /// Depth counters saturate; a saturated one keeps guarding (to the end
+    /// of the line for a bare destination, of the stream for CSS).
+    #[test]
+    fn saturated_depths_keep_guarding() {
+        let near = u32::MAX - 1;
+        let g = UrlGuard {
+            md: vec![Md::DestBare {
+                depth: near,
+                escaped: false,
+            }],
+            ..UrlGuard::default()
+        };
+        assert_eq!(
+            marked_from(g, "(((()))))))[NAME_1] x\n[NAME_1]"),
+            "⟨(((()))))))[NAME_1]⟩ x\n[NAME_1]"
+        );
+        let g = UrlGuard {
+            css: vec![Css::Fn {
+                depth: near,
+                quote: None,
+                escaped: false,
+            }],
+            ..UrlGuard::default()
+        };
+        assert_eq!(marked_from(g, "(())))))\n[NAME_1]"), "⟨(())))))\n[NAME_1]⟩");
+        let g = UrlGuard {
+            css: vec![Css::Style {
+                depth: near,
+                until: None,
+            }],
+            ..UrlGuard::default()
+        };
+        assert_eq!(
+            marked_from(g, "<style> </style></style></style>\n[NAME_1]"),
+            "⟨<style> </style></style></style>\n[NAME_1]⟩"
+        );
     }
 
     #[test]
