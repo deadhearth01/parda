@@ -2,7 +2,9 @@
 
 mod commands;
 
-use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
+
+use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
@@ -11,11 +13,13 @@ use clap::{Parser, Subcommand};
     about = "Local PII filter for AI chats and agents",
     long_about = "parda replaces names, contacts, IDs and secrets with realistic stand-ins before \
 text reaches a cloud AI, and puts the real values back in the answers. Everything runs on this \
-machine.\n\nStart with `parda setup`, then point your agent at the proxy (`parda env claude`)."
+machine.\n\nStart with `parda setup`, then point your agent at the proxy (`parda env claude`). \
+Run `parda` alone in a terminal for the dashboard."
 )]
 struct Cli {
+    /// No subcommand: the dashboard in a terminal, this help otherwise.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -32,7 +36,7 @@ enum Command {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// Open the terminal dashboard.
+    /// Open the terminal dashboard (also: `parda` alone in a terminal).
     Tui {
         /// Print every tab once as plain text instead (for scripts and bug reports).
         #[arg(long)]
@@ -210,7 +214,21 @@ enum InterceptCmd {
 
 fn main() {
     let cli = Cli::parse();
-    let result = match cli.command {
+    let Some(command) = cli.command else {
+        // `parda` alone: the dashboard for a person at a terminal, the
+        // short help for scripts and pipes.
+        let result = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            commands::tui::run(false)
+        } else {
+            Cli::command().print_help().map_err(anyhow::Error::from)
+        };
+        if let Err(e) = result {
+            eprintln!("parda: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    };
+    let result = match command {
         Command::Daemon {
             no_clipboard,
             no_proxy,
